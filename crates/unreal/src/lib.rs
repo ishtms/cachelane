@@ -2,6 +2,137 @@ use std::{error::Error, fmt};
 
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectLogTail {
+    text: String,
+    truncated: bool,
+    invalid_utf8: bool,
+}
+
+impl ProjectLogTail {
+    #[must_use]
+    pub fn extract(input: &[u8], max_bytes: usize, max_lines: usize) -> Self {
+        if input.is_empty() {
+            return Self {
+                text: String::new(),
+                truncated: false,
+                invalid_utf8: false,
+            };
+        }
+
+        if max_bytes == 0 || max_lines == 0 {
+            return Self {
+                text: String::new(),
+                truncated: true,
+                invalid_utf8: false,
+            };
+        }
+
+        let requested_start = input.len().saturating_sub(max_bytes);
+        let source_start = next_utf8_boundary(input, requested_start);
+        let source = &input[source_start..];
+        let invalid_utf8 = std::str::from_utf8(source).is_err();
+        let decoded = String::from_utf8_lossy(source);
+        let byte_start = suffix_start(decoded.as_ref(), max_bytes);
+        let byte_bounded = &decoded[byte_start..];
+        let starts_mid_line = if byte_start > 0 {
+            decoded.as_bytes()[byte_start - 1] != b'\n'
+        } else {
+            source_start > 0 && input[source_start - 1] != b'\n'
+        };
+        let partial_line_start = if starts_mid_line {
+            byte_bounded
+                .find('\n')
+                .filter(|index| index + 1 < byte_bounded.len())
+                .map_or(0, |index| index + 1)
+        } else {
+            0
+        };
+        let complete_lines = &byte_bounded[partial_line_start..];
+        let line_start = last_lines_start(complete_lines, max_lines);
+
+        Self {
+            text: complete_lines[line_start..].to_owned(),
+            truncated: source_start > 0
+                || byte_start > 0
+                || partial_line_start > 0
+                || line_start > 0,
+            invalid_utf8,
+        }
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    #[must_use]
+    pub const fn had_invalid_utf8(&self) -> bool {
+        self.invalid_utf8
+    }
+}
+
+fn next_utf8_boundary(input: &[u8], start: usize) -> usize {
+    if start == 0 || start >= input.len() || input[start] & 0b1100_0000 != 0b1000_0000 {
+        return start;
+    }
+
+    for candidate in start.saturating_sub(3)..start {
+        let width = match input[candidate] {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => continue,
+        };
+        let end = candidate + width;
+
+        if end > start && end <= input.len() && std::str::from_utf8(&input[candidate..end]).is_ok()
+        {
+            return end;
+        }
+    }
+
+    start
+}
+
+fn suffix_start(value: &str, max_bytes: usize) -> usize {
+    if value.len() <= max_bytes {
+        return 0;
+    }
+
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+fn last_lines_start(value: &str, max_lines: usize) -> usize {
+    let bytes = value.as_bytes();
+    let scan_end = if bytes.last() == Some(&b'\n') {
+        bytes.len().saturating_sub(1)
+    } else {
+        bytes.len()
+    };
+    let mut lines = 1;
+
+    for index in (0..scan_end).rev() {
+        if bytes[index] == b'\n' {
+            lines += 1;
+            if lines > max_lines {
+                return index + 1;
+            }
+        }
+    }
+
+    0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseErrorKind {
     InvalidXml,
@@ -169,6 +300,7 @@ impl<'document> CrashContextField<'document, '_> {
 mod tests {
     use super::{
         CrashContext, CrashContextField, CrashContextParser, CrashContextSection, ParseErrorKind,
+        ProjectLogTail,
     };
 
     fn parse(xml: &str) -> CrashContext<'_> {
@@ -325,5 +457,109 @@ mod tests {
             .unwrap_or_else(|| panic!("node limit must fail"));
 
         assert_eq!(error.kind(), ParseErrorKind::NodeLimitExceeded);
+    }
+
+    #[test]
+    fn keeps_a_project_log_that_fits_the_limits() {
+        let input = b"LogInit: Display: ready\nLogGame: Error: crashed\n";
+        let tail = ProjectLogTail::extract(input, 1_024, 10);
+
+        assert_eq!(tail.text(), String::from_utf8_lossy(input));
+        assert!(!tail.truncated());
+        assert!(!tail.had_invalid_utf8());
+    }
+
+    #[test]
+    fn keeps_the_newest_lines_in_source_order() {
+        let tail = ProjectLogTail::extract(b"one\ntwo\nthree\n", 1_024, 2);
+
+        assert_eq!(tail.text(), "two\nthree\n");
+        assert!(tail.truncated());
+    }
+
+    #[test]
+    fn drops_a_partial_old_line_after_byte_truncation() {
+        let input = b"ignored prefix\nkept one\nkept two\n";
+        let max_bytes = input.len() - 3;
+        let tail = ProjectLogTail::extract(input, max_bytes, 10);
+
+        assert_eq!(tail.text(), "kept one\nkept two\n");
+        assert!(tail.text().len() <= max_bytes);
+        assert!(tail.truncated());
+    }
+
+    #[test]
+    fn keeps_a_capped_suffix_of_an_overlong_final_line() {
+        let tail = ProjectLogTail::extract(b"header\nabcdefghijklmnopqrstuvwxyz", 8, 10);
+
+        assert_eq!(tail.text(), "stuvwxyz");
+        assert!(tail.truncated());
+    }
+
+    #[test]
+    fn preserves_crlf_in_the_newest_lines() {
+        let tail = ProjectLogTail::extract(b"one\r\ntwo\r\nthree\r\n", 1_024, 2);
+
+        assert_eq!(tail.text(), "two\r\nthree\r\n");
+        assert!(tail.truncated());
+    }
+
+    #[test]
+    fn does_not_replace_a_valid_unicode_character_cut_by_the_byte_window() {
+        let input = "prefix\n🙂étail";
+        let max_bytes = "🙂étail".len() - 1;
+        let tail = ProjectLogTail::extract(input.as_bytes(), max_bytes, 10);
+
+        assert_eq!(tail.text(), "étail");
+        assert!(tail.truncated());
+        assert!(!tail.had_invalid_utf8());
+    }
+
+    #[test]
+    fn replaces_and_reports_invalid_utf8() {
+        let tail = ProjectLogTail::extract(b"old\nbad:\xfftail", 1_024, 10);
+
+        assert_eq!(tail.text(), "old\nbad:�tail");
+        assert!(!tail.truncated());
+        assert!(tail.had_invalid_utf8());
+    }
+
+    #[test]
+    fn empty_limits_return_an_empty_truncated_tail() {
+        for tail in [
+            ProjectLogTail::extract(b"content", 0, 10),
+            ProjectLogTail::extract(b"content", 10, 0),
+        ] {
+            assert_eq!(tail.text(), "");
+            assert!(tail.truncated());
+            assert!(!tail.had_invalid_utf8());
+        }
+    }
+
+    #[test]
+    fn empty_input_is_not_reported_as_truncated() {
+        let tail = ProjectLogTail::extract(b"", 0, 0);
+
+        assert_eq!(tail.text(), "");
+        assert!(!tail.truncated());
+        assert!(!tail.had_invalid_utf8());
+    }
+
+    #[test]
+    fn lossy_output_stays_within_the_byte_limit() {
+        let tail = ProjectLogTail::extract(b"\xff\xff", 2, 10);
+
+        assert!(tail.text().len() <= 2);
+        assert!(tail.truncated());
+        assert!(tail.had_invalid_utf8());
+    }
+
+    #[test]
+    fn lossy_byte_truncation_still_prefers_complete_lines() {
+        let tail = ProjectLogTail::extract(b"\xff\xff\nkept\n", 8, 10);
+
+        assert_eq!(tail.text(), "kept\n");
+        assert!(tail.truncated());
+        assert!(tail.had_invalid_utf8());
     }
 }
