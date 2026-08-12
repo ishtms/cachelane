@@ -1,0 +1,15 @@
+<FGenericCrashContext>
+  <RuntimeProperties>
+    <CrashGUID>UECC-Synthetic-150</CrashGUID>
+    <CrashType>Assert</CrashType>
+    <PlatformName>Win64</PlatformName>
+    <CommandLine>-token=do-not-print</CommandLine>
+    <FutureField>kept</FutureField>
+  </RuntimeProperties>
+  <GameData>
+    <MapName>Arena</MapName>
+  </GameData>
+  <FutureProperties>
+    <Zulu>value</Zulu>
+  </FutureProperties>
+</FGenericCrashContext>
