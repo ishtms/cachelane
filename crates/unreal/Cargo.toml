@@ -11,5 +11,8 @@ repository.workspace = true
 cachelane-domain = { path = "../domain" }
 roxmltree.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

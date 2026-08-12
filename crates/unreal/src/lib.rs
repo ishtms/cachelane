@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use cachelane_domain::{CrashType, NormalizedValue};
 
@@ -40,6 +40,7 @@ pub struct CrashContextData {
     pub system_metadata: Vec<CrashContextProperty>,
     pub user_comment: Option<String>,
     pub game_data: Vec<CrashContextProperty>,
+    pub unknown_fields: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,6 +326,7 @@ impl<'input> CrashContext<'input> {
             system_metadata,
             user_comment: first_field_value(runtime, &["UserDescription", "UserComment"]),
             game_data: section_properties(self.section("GameData")),
+            unknown_fields: extract_unknown_fields(self),
         }
     }
 
@@ -414,6 +416,56 @@ fn property(field: CrashContextField<'_, '_>) -> CrashContextProperty {
 
 fn section_properties(section: Option<CrashContextSection<'_, '_>>) -> Vec<CrashContextProperty> {
     section.map_or_else(Vec::new, |section| section.fields().map(property).collect())
+}
+
+fn extract_unknown_fields(
+    context: &CrashContext<'_>,
+) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
+    let mut unknown_fields: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+
+    for section in context.sections() {
+        for field in section.fields() {
+            if is_known_field(section.name(), field.name()) {
+                continue;
+            }
+
+            unknown_fields
+                .entry(section.name().to_owned())
+                .or_default()
+                .entry(field.name().to_owned())
+                .or_default()
+                .push(field.value().unwrap_or_default().to_owned());
+        }
+    }
+
+    unknown_fields
+}
+
+fn is_known_field(section: &str, field: &str) -> bool {
+    match section {
+        "GameData" | "PlatformProperties" => true,
+        "RuntimeProperties" => {
+            matches!(
+                field,
+                "CrashGUID"
+                    | "CrashType"
+                    | "ErrorMessage"
+                    | "BuildVersion"
+                    | "EngineVersion"
+                    | "PlatformName"
+                    | "Architecture"
+                    | "PlatformArchitecture"
+                    | "BuildConfiguration"
+                    | "CommandLine"
+                    | "Modules"
+                    | "Threads"
+                    | "UserDescription"
+                    | "UserComment"
+            ) || field.starts_with("Misc.")
+                || field.starts_with("MemoryStats.")
+        }
+        _ => false,
+    }
 }
 
 fn extract_threads(runtime: Option<CrashContextSection<'_, '_>>) -> Vec<CrashContextThread> {
@@ -713,6 +765,59 @@ C:\Engine\Core.DLL</Modules>
                 value: "Arena".to_owned(),
             }]
         );
+        assert!(data.unknown_fields.is_empty());
+    }
+
+    #[test]
+    fn extracts_unknown_fields_in_stable_namespaced_json() {
+        let data = parse(
+            r"<FGenericCrashContext>
+  <RuntimeProperties>
+    <Zeta>first</Zeta>
+    <CrashGUID>UECC-Windows-123</CrashGUID>
+    <Alpha></Alpha>
+    <Zeta />
+    <CommandLine>-token=sensitive</CommandLine>
+    <Modules>Project.exe</Modules>
+    <Threads><Thread><ThreadID>42</ThreadID></Thread></Threads>
+    <Misc.OSVersionMajor>Windows 11</Misc.OSVersionMajor>
+    <MemoryStats.TotalPhysical>34359738368</MemoryStats.TotalPhysical>
+    <UserDescription>private comment</UserDescription>
+  </RuntimeProperties>
+  <PlatformProperties>
+    <PlatformIsRunningWindows>1</PlatformIsRunningWindows>
+  </PlatformProperties>
+  <GameData>
+    <AccountID>private account</AccountID>
+  </GameData>
+  <FutureProperties>
+    <Zulu>last</Zulu>
+    <Alpha />
+    <Zulu>again</Zulu>
+  </FutureProperties>
+  <AnotherSection>
+    <Beta>value</Beta>
+  </AnotherSection>
+</FGenericCrashContext>",
+        )
+        .extract(CrashContextExtractionOptions::default());
+
+        let json = serde_json::to_string(&data.unknown_fields)
+            .unwrap_or_else(|error| panic!("unknown fields must serialize: {error}"));
+
+        assert_eq!(
+            json,
+            r#"{"AnotherSection":{"Beta":["value"]},"FutureProperties":{"Alpha":[""],"Zulu":["last","again"]},"RuntimeProperties":{"Alpha":[""],"Zeta":["first",""]}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&data.unknown_fields)
+                .unwrap_or_else(|error| panic!("unknown fields must serialize: {error}")),
+            json
+        );
+        assert!(!json.contains("sensitive"));
+        assert!(!json.contains("private"));
+        assert!(!json.contains("PlatformProperties"));
+        assert!(!json.contains("GameData"));
     }
 
     #[test]
