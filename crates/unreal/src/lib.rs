@@ -1,21 +1,23 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use cachelane_domain::{CrashType, NormalizedValue};
+use serde::Serialize;
 
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";
+pub const CRASH_CONTEXT_PARSER_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CrashContextExtractionOptions {
     pub include_command_line: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CrashContextProperty {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CrashContextThread {
     pub call_stack: Option<String>,
     pub crash_marker: Option<String>,
@@ -24,8 +26,9 @@ pub struct CrashContextThread {
     pub thread_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CrashContextData {
+    pub parser_version: u32,
     pub crash_guid: Option<String>,
     pub crash_type: CrashType,
     pub error_message: Option<String>,
@@ -34,6 +37,7 @@ pub struct CrashContextData {
     pub platform: Option<NormalizedValue>,
     pub architecture: Option<String>,
     pub build_configuration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command_line: Option<String>,
     pub modules: Vec<NormalizedValue>,
     pub threads: Vec<CrashContextThread>,
@@ -308,6 +312,7 @@ impl<'input> CrashContext<'input> {
         }
 
         CrashContextData {
+            parser_version: CRASH_CONTEXT_PARSER_VERSION,
             crash_guid: field_value(runtime, "CrashGUID"),
             crash_type: field_text(runtime, "CrashType")
                 .map_or(CrashType::Unknown, CrashType::classify),
@@ -500,9 +505,9 @@ mod tests {
     use cachelane_domain::{CrashType, NormalizedValue};
 
     use super::{
-        CrashContext, CrashContextExtractionOptions, CrashContextField, CrashContextParser,
-        CrashContextProperty, CrashContextSection, CrashContextThread, ParseErrorKind,
-        ProjectLogTail,
+        CRASH_CONTEXT_PARSER_VERSION, CrashContext, CrashContextExtractionOptions,
+        CrashContextField, CrashContextParser, CrashContextProperty, CrashContextSection,
+        CrashContextThread, ParseErrorKind, ProjectLogTail,
     };
 
     const COMPLETE_CRASH_CONTEXT: &str = r"<FGenericCrashContext>
@@ -705,6 +710,7 @@ C:\Engine\Core.DLL</Modules>
     fn extracts_complete_crash_context_data() {
         let data = parse(COMPLETE_CRASH_CONTEXT).extract(CrashContextExtractionOptions::default());
 
+        assert_eq!(data.parser_version, CRASH_CONTEXT_PARSER_VERSION);
         assert_eq!(data.crash_guid.as_deref(), Some("UECC-Windows-123"));
         assert_eq!(data.crash_type, CrashType::Assert);
         assert_eq!(data.error_message.as_deref(), Some("Fatal error"));
@@ -769,6 +775,23 @@ C:\Engine\Core.DLL</Modules>
     }
 
     #[test]
+    fn serializes_versioned_crash_context_data_deterministically() {
+        let data = parse(COMPLETE_CRASH_CONTEXT).extract(CrashContextExtractionOptions::default());
+        let first = serde_json::to_string(&data)
+            .unwrap_or_else(|error| panic!("crash context data must serialize: {error}"));
+        let second = serde_json::to_string(&data)
+            .unwrap_or_else(|error| panic!("crash context data must serialize: {error}"));
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            r#"{"parser_version":1,"crash_guid":"UECC-Windows-123","crash_type":"assert","error_message":"Fatal error","build_version":"++Project+Release","engine_version":"5.4.4-123456","platform":{"original":"Win64","normalized":"windows"},"architecture":"x86_64","build_configuration":"Shipping","modules":[{"original":"C:\\Game\\Project.exe","normalized":"project"},{"original":"C:\\Engine\\Core.DLL","normalized":"core"}],"threads":[{"call_stack":"Project 0x10","crash_marker":"true","registers":"","thread_id":"42","thread_name":"GameThread"},{"call_stack":"Core 0x20","crash_marker":"false","registers":null,"thread_id":"7","thread_name":"RenderThread"}],"system_metadata":[{"name":"PlatformIsRunningWindows","value":"1"},{"name":"Misc.OSVersionMajor","value":"Windows 11"},{"name":"MemoryStats.TotalPhysical","value":"34359738368"}],"user_comment":"crashed after loading","game_data":[{"name":"MapName","value":"Arena"}],"unknown_fields":{}}"#
+        );
+        assert!(!first.contains("command_line"));
+        assert!(!first.contains("do-not-store"));
+    }
+
+    #[test]
     fn extracts_unknown_fields_in_stable_namespaced_json() {
         let data = parse(
             r"<FGenericCrashContext>
@@ -804,6 +827,8 @@ C:\Engine\Core.DLL</Modules>
 
         let json = serde_json::to_string(&data.unknown_fields)
             .unwrap_or_else(|error| panic!("unknown fields must serialize: {error}"));
+        let record_json = serde_json::to_value(&data)
+            .unwrap_or_else(|error| panic!("crash context data must serialize: {error}"));
 
         assert_eq!(
             json,
@@ -818,6 +843,10 @@ C:\Engine\Core.DLL</Modules>
         assert!(!json.contains("private"));
         assert!(!json.contains("PlatformProperties"));
         assert!(!json.contains("GameData"));
+        assert_eq!(
+            record_json["unknown_fields"]["FutureProperties"]["Zulu"],
+            serde_json::json!(["last", "again"])
+        );
     }
 
     #[test]
@@ -843,6 +872,13 @@ C:\Engine\Core.DLL</Modules>
                 .as_deref(),
             Some("-token=sensitive")
         );
+
+        let json = serde_json::to_string(&context.extract(CrashContextExtractionOptions {
+            include_command_line: true,
+        }))
+        .unwrap_or_else(|error| panic!("crash context data must serialize: {error}"));
+
+        assert!(json.contains(r#""command_line":"-token=sensitive""#));
     }
 
     #[test]
