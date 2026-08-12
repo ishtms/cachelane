@@ -62,7 +62,7 @@ Roll back by reverting the parser-version field, serialization derives, dependen
 
 ## Final state
 
-Issue #49 closes and moves to Done after the pull request merges. The M0 roadmap remains open and records #49 as complete. Issues #53 and #150 remain Backlog because they are separate symbol and end-to-end outcomes.
+The pull request references issue #49 without closing it. Issue #49 remains In Progress until the future event persistence and reprocessing path stores and reads the parser version. The M0 roadmap keeps #49 incomplete. Issues #53 and #150 remain Backlog because they are separate symbol and end-to-end outcomes.
 
 ## Unresolved decisions
 
