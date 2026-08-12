@@ -28,3 +28,25 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - run: ./scripts/check
+
+  windows-check:
+    name: windows check
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: verify Rust host
+        run: |
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "Rust host: $rust_host"
+          test "$rust_host" = x86_64-pc-windows-msvc
+      - run: ./scripts/check
