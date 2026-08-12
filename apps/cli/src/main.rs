@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(version, about = "CacheLane command line tools")]
+#[command(name = "cachelane", version, about = "CacheLane command line tools")]
 struct Cli {}
 
 fn main() {
