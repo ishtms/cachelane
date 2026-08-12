@@ -22,6 +22,14 @@ Sentry Symbolicator provides useful primary evidence from a mature native symbol
 
 CacheLane has a different storage model because customer uploads are authoritative rather than transient downloads. The timing and separation lessons still apply.
 
+## Alternatives
+
+Generate every derived cache after upload: this minimizes first-event conversion latency and identifies conversion failures early. It also spends worker time and storage on artifacts that may never serve a crash, couples every processor or cache-format upgrade to bulk regeneration, and repeats the lifecycle problems documented by Symbolicator. Prompt metadata indexing provides early validation without paying that full cost.
+
+Delay all artifact inspection until a crash needs the file: this minimizes upload work. It leaves CacheLane unable to validate uploads, advertise release coverage, match exact identities, or discover that a newly uploaded artifact should requeue waiting events. Filename and upload order cannot safely fill that gap.
+
+Split metadata indexing from derived-cache generation: this preserves exact matching and early validation while deferring the expensive capability-specific work until demand exists. It is the smallest option that satisfies the current artifact identity, reprocessing, and isolation requirements.
+
 ## Decision
 
 Use a split metadata and derived-cache pipeline.
