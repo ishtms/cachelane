@@ -56,13 +56,22 @@ No runtime smoke check is required because no application entry point changes.
 
 ## Rollout and rollback
 
-Rollout is the normal library merge after checks and independent review. Move this plan to `docs/plans/completed/49-parser-version/README.md` after the feature is verified on `main`.
+Rollout is the normal library merge after checks and independent review. This plan moves to completed in the same reviewed pull request so merged `main` does not retain a finished stage under active plans.
 
 Roll back by reverting the parser-version field, serialization derives, dependency change, and tests. No data migration or operational cleanup is required.
 
 ## Final state
 
 The pull request references issue #49 without closing it. Issue #49 remains In Progress until the future event persistence and reprocessing path stores and reads the parser version. The M0 roadmap keeps #49 incomplete. Issues #53 and #150 remain Backlog because they are separate symbol and end-to-end outcomes.
+
+## Result
+
+- Every extracted `CrashContextData` record carries parser version `1` from one public constant.
+- Complete records, properties, threads, normalized values, and unknown fields serialize deterministically.
+- Command-line data is absent by default and only serializes with explicit extraction permission.
+- `cargo test -p cachelane-unreal`, `./scripts/check-fast`, and `./scripts/check` passed locally.
+- Pull request CI, dependency review, and dependency audit passed.
+- Independent review found one issue-closing scope error. The plan and pull request now keep persistence and reprocessing work open in issue #49.
 
 ## Unresolved decisions
 
