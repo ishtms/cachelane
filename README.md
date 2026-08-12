@@ -40,6 +40,12 @@ Requirements:
 
 The web app runs at `http://127.0.0.1:3000` and the API runs at `http://127.0.0.1:8080` by default. Edit the development-only `.env` file to isolate ports and the Compose project name for another worktree.
 
+Run the command-line application locally with:
+
+```bash
+cargo run -p cachelane-cli -- --help
+```
+
 ## Verification
 
 ```bash
