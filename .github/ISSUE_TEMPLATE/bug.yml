@@ -1,0 +1,52 @@
+name: Bug
+description: Report reproducible incorrect CacheLane behavior
+title: ""
+labels:
+  - bug
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What happened, including the visible error or wrong result?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest reliable sequence, fixture, or request that reproduces the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the CacheLane version, Unreal version, platform, architecture, and build configuration when relevant.
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Proposed risk
+      description: Classify by blast radius and reversibility.
+      options:
+        - R0: trivial
+        - R1: normal
+        - R2: systemic
+        - R3: critical
+        - R4: exceptional
+    validations:
+      required: true
+  - type: textarea
+    id: sensitive_data
+    attributes:
+      label: Sensitive data check
+      description: Confirm that no customer dump, symbol, credential, personal data, or licensed private fixture is attached.
+    validations:
+      required: true

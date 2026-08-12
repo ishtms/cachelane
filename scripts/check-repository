@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+required_files=(
+  README.md
+  Cargo.toml
+  package.json
+  deploy/docker-compose/compose.yml
+  openapi/cachelane.yaml
+  scripts/setup
+  scripts/doctor
+  scripts/dev
+  scripts/check-fast
+  scripts/check
+  scripts/smoke
+)
+
+for file in "${required_files[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    echo "missing required repository file: $file" >&2
+    exit 1
+  fi
+done
+
+for script in scripts/*; do
+  if [[ -f "$script" ]]; then
+    bash -n "$script"
+  fi
+done
+
+for package_file in package.json apps/web/package.json apps/web/tsconfig.json; do
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$package_file"
+done
+
+for yaml_file in \
+  pnpm-workspace.yaml \
+  deploy/docker-compose/compose.yml \
+  openapi/cachelane.yaml \
+  .github/dependabot.yml \
+  .github/ISSUE_TEMPLATE/bug.yml \
+  .github/ISSUE_TEMPLATE/config.yml \
+  .github/ISSUE_TEMPLATE/feature.yml \
+  .github/workflows/ci.yml \
+  .github/workflows/security.yml; do
+  node -e 'require("yaml").parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$yaml_file"
+done
+
+forbidden_dash=$'\xE2\x80\x94'
+found_dash=0
+
+while IFS= read -r -d '' file; do
+  if grep -Iq . "$file" && grep -nF "$forbidden_dash" "$file"; then
+    found_dash=1
+  fi
+done < <(git ls-files -z)
+
+if ((found_dash > 0)); then
+  echo "em dash found in repository content" >&2
+  exit 1
+fi
+
+echo "repository checks passed"

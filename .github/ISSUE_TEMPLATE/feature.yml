@@ -1,0 +1,53 @@
+name: Feature
+description: Propose a focused CacheLane product change
+title: ""
+labels:
+  - feature
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem or missing capability needs to be addressed?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Expected outcome
+      description: Describe the observable result without prescribing unnecessary implementation details.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List measurable behaviors, including important failure cases.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Proposed risk
+      description: Classify by blast radius and reversibility.
+      options:
+        - R0: trivial
+        - R1: normal
+        - R2: systemic
+        - R3: critical
+        - R4: exceptional
+    validations:
+      required: true
+  - type: textarea
+    id: effects
+    attributes:
+      label: Data, security, and operations
+      description: Note affected data, tenant boundaries, untrusted inputs, integrations, deployment, or rollback.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope
+      description: State nearby work that this issue should not include.

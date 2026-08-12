@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ ! -f .env ]]; then
+  echo "missing .env; run ./scripts/setup" >&2
+  exit 1
+fi
+
+set -a
+source .env
+set +a
+
+docker compose \
+  --project-name "${CACHELANE_COMPOSE_PROJECT:-cachelane}" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait
+
+cargo run --package cachelane-server -- api &
+api_pid=$!
+
+PORT="${CACHELANE_WEB_PORT:-3000}" pnpm --filter @cachelane/web dev &
+web_pid=$!
+
+cleanup() {
+  kill "$api_pid" "$web_pid" >/dev/null 2>&1 || true
+  wait "$api_pid" "$web_pid" >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT INT TERM
+
+echo "{\"event\":\"started\",\"api\":\"http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_API_PORT:-8080}\",\"web\":\"http://127.0.0.1:${CACHELANE_WEB_PORT:-3000}\"}"
+wait "$api_pid" "$web_pid"

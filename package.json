@@ -1,0 +1,17 @@
+{
+  "name": "cachelane",
+  "private": true,
+  "packageManager": "pnpm@10.21.0",
+  "engines": {
+    "node": ">=24.13.1",
+    "pnpm": ">=10.21.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @cachelane/web build",
+    "check": "pnpm --filter @cachelane/web check",
+    "dev": "pnpm --filter @cachelane/web dev"
+  },
+  "devDependencies": {
+    "yaml": "2.9.0"
+  }
+}
