@@ -1,6 +1,46 @@
 use std::{error::Error, fmt};
 
+use cachelane_domain::{CrashType, NormalizedValue};
+
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CrashContextExtractionOptions {
+    pub include_command_line: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashContextProperty {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashContextThread {
+    pub call_stack: Option<String>,
+    pub crash_marker: Option<String>,
+    pub registers: Option<String>,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashContextData {
+    pub crash_guid: Option<String>,
+    pub crash_type: CrashType,
+    pub error_message: Option<String>,
+    pub build_version: Option<String>,
+    pub engine_version: Option<String>,
+    pub platform: Option<NormalizedValue>,
+    pub architecture: Option<String>,
+    pub build_configuration: Option<String>,
+    pub command_line: Option<String>,
+    pub modules: Vec<NormalizedValue>,
+    pub threads: Vec<CrashContextThread>,
+    pub system_metadata: Vec<CrashContextProperty>,
+    pub user_comment: Option<String>,
+    pub game_data: Vec<CrashContextProperty>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectLogTail {
@@ -241,6 +281,53 @@ pub struct CrashContext<'input> {
 }
 
 impl<'input> CrashContext<'input> {
+    #[must_use]
+    pub fn extract(&self, options: CrashContextExtractionOptions) -> CrashContextData {
+        let runtime = self.section("RuntimeProperties");
+        let platform_properties = self.section("PlatformProperties");
+        let platform =
+            field_value(runtime, "PlatformName").map(|value| NormalizedValue::platform(&value));
+        let module_text = field_value(runtime, "Modules");
+        let modules = module_text.as_deref().map_or_else(Vec::new, |value| {
+            value
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(NormalizedValue::module)
+                .collect()
+        });
+        let mut system_metadata = section_properties(platform_properties);
+
+        if let Some(runtime) = runtime {
+            system_metadata.extend(runtime.fields().filter_map(|field| {
+                let name = field.name();
+                (name.starts_with("Misc.") || name.starts_with("MemoryStats."))
+                    .then(|| property(field))
+            }));
+        }
+
+        CrashContextData {
+            crash_guid: field_value(runtime, "CrashGUID"),
+            crash_type: field_text(runtime, "CrashType")
+                .map_or(CrashType::Unknown, CrashType::classify),
+            error_message: field_value(runtime, "ErrorMessage"),
+            build_version: field_value(runtime, "BuildVersion"),
+            engine_version: field_value(runtime, "EngineVersion"),
+            platform,
+            architecture: first_field_value(runtime, &["Architecture", "PlatformArchitecture"]),
+            build_configuration: field_value(runtime, "BuildConfiguration"),
+            command_line: options
+                .include_command_line
+                .then(|| field_value(runtime, "CommandLine"))
+                .flatten(),
+            modules,
+            threads: extract_threads(runtime),
+            system_metadata,
+            user_comment: first_field_value(runtime, &["UserDescription", "UserComment"]),
+            game_data: section_properties(self.section("GameData")),
+        }
+    }
+
     pub fn sections(&self) -> impl Iterator<Item = CrashContextSection<'_, 'input>> + '_ {
         self.document
             .root_element()
@@ -296,12 +383,115 @@ impl<'document> CrashContextField<'document, '_> {
     }
 }
 
+fn field_text<'document>(
+    section: Option<CrashContextSection<'document, '_>>,
+    name: &str,
+) -> Option<&'document str> {
+    section
+        .and_then(|section| section.field(name))
+        .and_then(CrashContextField::value)
+}
+
+fn field_value(section: Option<CrashContextSection<'_, '_>>, name: &str) -> Option<String> {
+    section
+        .and_then(|section| section.field(name))
+        .map(|field| field.value().unwrap_or_default().to_owned())
+}
+
+fn first_field_value(
+    section: Option<CrashContextSection<'_, '_>>,
+    names: &[&str],
+) -> Option<String> {
+    names.iter().find_map(|name| field_value(section, name))
+}
+
+fn property(field: CrashContextField<'_, '_>) -> CrashContextProperty {
+    CrashContextProperty {
+        name: field.name().to_owned(),
+        value: field.value().unwrap_or_default().to_owned(),
+    }
+}
+
+fn section_properties(section: Option<CrashContextSection<'_, '_>>) -> Vec<CrashContextProperty> {
+    section.map_or_else(Vec::new, |section| section.fields().map(property).collect())
+}
+
+fn extract_threads(runtime: Option<CrashContextSection<'_, '_>>) -> Vec<CrashContextThread> {
+    runtime
+        .and_then(|section| section.field("Threads"))
+        .map_or_else(Vec::new, |threads| {
+            threads
+                .node
+                .children()
+                .filter(roxmltree::Node::is_element)
+                .filter(|node| node.tag_name().name() == "Thread")
+                .map(|node| CrashContextThread {
+                    call_stack: child_value(node, "CallStack"),
+                    crash_marker: child_value(node, "IsCrashed"),
+                    registers: child_value(node, "Registers"),
+                    thread_id: child_value(node, "ThreadID"),
+                    thread_name: child_value(node, "ThreadName"),
+                })
+                .collect()
+        })
+}
+
+fn child_value(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    node.children()
+        .filter(roxmltree::Node::is_element)
+        .find(|child| child.tag_name().name() == name)
+        .map(|child| child.text().unwrap_or_default().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    use cachelane_domain::{CrashType, NormalizedValue};
+
     use super::{
-        CrashContext, CrashContextField, CrashContextParser, CrashContextSection, ParseErrorKind,
+        CrashContext, CrashContextExtractionOptions, CrashContextField, CrashContextParser,
+        CrashContextProperty, CrashContextSection, CrashContextThread, ParseErrorKind,
         ProjectLogTail,
     };
+
+    const COMPLETE_CRASH_CONTEXT: &str = r"<FGenericCrashContext>
+  <RuntimeProperties>
+    <CrashGUID>UECC-Windows-123</CrashGUID>
+    <CrashType>Assert</CrashType>
+    <ErrorMessage>Fatal error</ErrorMessage>
+    <BuildVersion>++Project+Release</BuildVersion>
+    <EngineVersion>5.4.4-123456</EngineVersion>
+    <PlatformName>Win64</PlatformName>
+    <PlatformArchitecture>x86_64</PlatformArchitecture>
+    <BuildConfiguration>Shipping</BuildConfiguration>
+    <CommandLine>-auth=do-not-store</CommandLine>
+    <Modules>C:\Game\Project.exe
+C:\Engine\Core.DLL</Modules>
+    <Threads>
+      <Thread>
+        <CallStack>Project 0x10</CallStack>
+        <IsCrashed>true</IsCrashed>
+        <Registers></Registers>
+        <ThreadID>42</ThreadID>
+        <ThreadName>GameThread</ThreadName>
+      </Thread>
+      <Thread>
+        <CallStack>Core 0x20</CallStack>
+        <IsCrashed>false</IsCrashed>
+        <ThreadID>7</ThreadID>
+        <ThreadName>RenderThread</ThreadName>
+      </Thread>
+    </Threads>
+    <Misc.OSVersionMajor>Windows 11</Misc.OSVersionMajor>
+    <MemoryStats.TotalPhysical>34359738368</MemoryStats.TotalPhysical>
+    <UserDescription>crashed after loading</UserDescription>
+  </RuntimeProperties>
+  <PlatformProperties>
+    <PlatformIsRunningWindows>1</PlatformIsRunningWindows>
+  </PlatformProperties>
+  <GameData>
+    <MapName>Arena</MapName>
+  </GameData>
+</FGenericCrashContext>";
 
     fn parse(xml: &str) -> CrashContext<'_> {
         CrashContextParser::new(128)
@@ -457,6 +647,136 @@ mod tests {
             .unwrap_or_else(|| panic!("node limit must fail"));
 
         assert_eq!(error.kind(), ParseErrorKind::NodeLimitExceeded);
+    }
+
+    #[test]
+    fn extracts_complete_crash_context_data() {
+        let data = parse(COMPLETE_CRASH_CONTEXT).extract(CrashContextExtractionOptions::default());
+
+        assert_eq!(data.crash_guid.as_deref(), Some("UECC-Windows-123"));
+        assert_eq!(data.crash_type, CrashType::Assert);
+        assert_eq!(data.error_message.as_deref(), Some("Fatal error"));
+        assert_eq!(data.build_version.as_deref(), Some("++Project+Release"));
+        assert_eq!(data.engine_version.as_deref(), Some("5.4.4-123456"));
+        assert_eq!(data.platform, Some(NormalizedValue::platform("Win64")));
+        assert_eq!(data.architecture.as_deref(), Some("x86_64"));
+        assert_eq!(data.build_configuration.as_deref(), Some("Shipping"));
+        assert_eq!(data.command_line, None);
+        assert_eq!(
+            data.modules,
+            [
+                NormalizedValue::module(r"C:\Game\Project.exe"),
+                NormalizedValue::module(r"C:\Engine\Core.DLL"),
+            ]
+        );
+        assert_eq!(
+            data.threads,
+            [
+                CrashContextThread {
+                    call_stack: Some("Project 0x10".to_owned()),
+                    crash_marker: Some("true".to_owned()),
+                    registers: Some(String::new()),
+                    thread_id: Some("42".to_owned()),
+                    thread_name: Some("GameThread".to_owned()),
+                },
+                CrashContextThread {
+                    call_stack: Some("Core 0x20".to_owned()),
+                    crash_marker: Some("false".to_owned()),
+                    registers: None,
+                    thread_id: Some("7".to_owned()),
+                    thread_name: Some("RenderThread".to_owned()),
+                },
+            ]
+        );
+        assert_eq!(
+            data.system_metadata,
+            [
+                CrashContextProperty {
+                    name: "PlatformIsRunningWindows".to_owned(),
+                    value: "1".to_owned(),
+                },
+                CrashContextProperty {
+                    name: "Misc.OSVersionMajor".to_owned(),
+                    value: "Windows 11".to_owned(),
+                },
+                CrashContextProperty {
+                    name: "MemoryStats.TotalPhysical".to_owned(),
+                    value: "34359738368".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(data.user_comment.as_deref(), Some("crashed after loading"));
+        assert_eq!(
+            data.game_data,
+            [CrashContextProperty {
+                name: "MapName".to_owned(),
+                value: "Arena".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn command_line_requires_explicit_inclusion() {
+        let context = parse(
+            r"<FGenericCrashContext><RuntimeProperties>
+  <CommandLine>-token=sensitive</CommandLine>
+</RuntimeProperties></FGenericCrashContext>",
+        );
+
+        assert_eq!(
+            context
+                .extract(CrashContextExtractionOptions::default())
+                .command_line,
+            None
+        );
+        assert_eq!(
+            context
+                .extract(CrashContextExtractionOptions {
+                    include_command_line: true,
+                })
+                .command_line
+                .as_deref(),
+            Some("-token=sensitive")
+        );
+    }
+
+    #[test]
+    fn extraction_tolerates_missing_empty_reordered_and_repeated_data() {
+        let data = parse(
+            r"<FGenericCrashContext>
+  <GameData>
+    <Mode>solo</Mode>
+    <Mode>coop</Mode>
+  </GameData>
+  <RuntimeProperties>
+    <ErrorMessage></ErrorMessage>
+    <CrashGUID>first</CrashGUID>
+    <CrashGUID>second</CrashGUID>
+  </RuntimeProperties>
+</FGenericCrashContext>",
+        )
+        .extract(CrashContextExtractionOptions::default());
+
+        assert_eq!(data.crash_guid.as_deref(), Some("first"));
+        assert_eq!(data.crash_type, CrashType::Unknown);
+        assert_eq!(data.error_message.as_deref(), Some(""));
+        assert_eq!(data.platform, None);
+        assert!(data.modules.is_empty());
+        assert!(data.threads.is_empty());
+        assert!(data.system_metadata.is_empty());
+        assert_eq!(
+            data.game_data,
+            [
+                CrashContextProperty {
+                    name: "Mode".to_owned(),
+                    value: "solo".to_owned(),
+                },
+                CrashContextProperty {
+                    name: "Mode".to_owned(),
+                    value: "coop".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
