@@ -157,6 +157,7 @@ dependencies = [
 name = "cachelane-unreal"
 version = "0.1.0"
 dependencies = [
+ "cachelane-domain",
  "roxmltree",
 ]
 
