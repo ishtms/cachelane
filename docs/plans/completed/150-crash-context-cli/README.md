@@ -70,6 +70,15 @@ Roll back by reverting the CLI dependency edges, command implementation, tests, 
 - Persistence, HTTP ingestion, uploads, tenant data, and deployment
 - Closing issue #150 or marking the M0 roadmap item complete
 
+## Result
+
+- `cachelane crash parse <path>` emits the existing parser-versioned normalized JSON with command-line data excluded.
+- File input is capped at 4 MiB and XML parsing is capped at 100,000 nodes.
+- Safe non-zero failures cover missing files, oversized input, invalid UTF-8, malformed XML, DTD declarations, wrong roots, and the node limit.
+- Nine CLI behavior tests pass, including exact JSON and repeated byte-for-byte output checks.
+- `cargo test -p cachelane-cli`, `./scripts/check-fast`, and `./scripts/check` passed locally.
+- The runtime proof command produced the expected deterministic JSON from the synthetic fixture.
+
 ## Unresolved decisions
 
 None. Later real Windows fixture evidence may justify a compatible limit change in its own reviewed stage.
