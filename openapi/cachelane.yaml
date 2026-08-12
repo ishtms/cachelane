@@ -1,0 +1,63 @@
+openapi: 3.1.1
+info:
+  title: CacheLane API
+  version: 0.1.0
+  description: Versioned control and health contract for CacheLane.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development
+paths:
+  /health/live:
+    get:
+      operationId: getLiveness
+      summary: Report whether the process is alive
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: Report whether the role can receive work
+      responses:
+        "200":
+          description: Role is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /api/v1/health:
+    get:
+      operationId: getApiHealth
+      summary: Report API health through the versioned namespace
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+components:
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+        - service
+        - status
+        - version
+      properties:
+        role:
+          type: string
+        service:
+          type: string
+          const: cachelane-server
+        status:
+          type: string
+          const: ok
+        version:
+          type: string

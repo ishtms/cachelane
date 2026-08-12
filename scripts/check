@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+./scripts/check-fast
+cargo build --workspace --release
+pnpm --filter @cachelane/web build
+./scripts/check-repository

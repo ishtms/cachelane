@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
+api_url="${CACHELANE_API_URL:-http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_API_PORT:-8080}}"
+web_url="${CACHELANE_WEB_URL:-http://127.0.0.1:${CACHELANE_WEB_PORT:-3000}}"
+
+api_response="$(curl --fail --silent --show-error "$api_url/health/ready")"
+web_response="$(curl --fail --silent --show-error "$web_url")"
+
+if [[ "$api_response" != *'"status":"ok"'* ]]; then
+  echo "API readiness response is invalid" >&2
+  exit 1
+fi
+
+if [[ "$web_response" != *"Crash reports"* ]]; then
+  echo "web response is invalid" >&2
+  exit 1
+fi
+
+echo "smoke checks passed"

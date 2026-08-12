@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+failures=0
+
+check_command() {
+  local command="$1"
+  local install_hint="$2"
+
+  if command -v "$command" >/dev/null 2>&1; then
+    echo "ok: $command"
+  else
+    echo "missing: $command ($install_hint)" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_port() {
+  local name="$1"
+  local port="$2"
+
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "in use: $name port $port"
+  else
+    echo "available: $name port $port"
+  fi
+}
+
+check_command cargo "install Rust with rustup"
+check_command corepack "install Node.js 24"
+check_command curl "install curl"
+check_command docker "install Docker Desktop or Docker Engine"
+check_command git "install Git"
+check_command node "install Node.js 24"
+check_command pnpm "run corepack enable"
+check_command rustup "install Rust with rustup"
+
+if ((failures > 0)); then
+  exit 1
+fi
+
+if [[ ! -f .env ]]; then
+  echo "missing: .env (run ./scripts/setup)" >&2
+  exit 1
+fi
+
+set -a
+source .env
+set +a
+
+echo "rust: $(rustc --version)"
+echo "node: $(node --version)"
+echo "pnpm: $(pnpm --version)"
+echo "docker: $(docker --version)"
+
+if ! docker info >/dev/null 2>&1; then
+  echo "unavailable: Docker daemon (start Docker Desktop or Docker Engine)" >&2
+  failures=$((failures + 1))
+else
+  echo "ok: Docker daemon"
+fi
+
+if ! docker compose --env-file .env -f deploy/docker-compose/compose.yml config --quiet; then
+  echo "invalid: Docker Compose configuration" >&2
+  failures=$((failures + 1))
+else
+  echo "ok: Docker Compose configuration"
+fi
+
+check_port api "${CACHELANE_API_PORT:-8080}"
+check_port web "${CACHELANE_WEB_PORT:-3000}"
+check_port postgres "${CACHELANE_POSTGRES_PORT:-5432}"
+check_port minio "${CACHELANE_MINIO_PORT:-9000}"
+check_port minio-console "${CACHELANE_MINIO_CONSOLE_PORT:-9001}"
+
+if ((failures > 0)); then
+  exit 1
+fi
+
+echo "environment ready"
