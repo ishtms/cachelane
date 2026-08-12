@@ -12,7 +12,9 @@ name = "cachelane"
 path = "src/main.rs"
 
 [dependencies]
+cachelane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
