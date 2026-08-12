@@ -93,3 +93,11 @@ Remove the `windows check` job. The existing Linux check, security workflows, an
 None for the non-required hosted Windows lane.
 
 The authoritative UE x64 execution machine, private fixture storage, reset strategy, and approval boundary remain decisions for the R3 fixture and end-to-end plan.
+
+## Result
+
+- The Linux and Windows jobs passed in pull request and manual-dispatch runs.
+- The Windows log reported `x86_64-pc-windows-msvc` and executed all Rust test suites as Windows binaries.
+- The canonical check passed after disabling checkout line-ending conversion on Windows.
+- The workflow kept read-only repository permission and did not use secrets, private fixtures, or self-hosted runners.
+- The required check contexts remained `check`, `dependency audit`, and `dependency review`.
