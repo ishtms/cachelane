@@ -1,0 +1,69 @@
+# Versioned crash context records
+
+Issue: [#49](https://github.com/ishtms/cachelane/issues/49)
+
+## Outcome
+
+Every extracted crash context record carries a stable parser version and can be serialized as deterministic normalized JSON for later reprocessing.
+
+This advances the M0 exit criterion by making parser output versioned and reproducible before the real report and readable stack proof in issue #150.
+
+## Scope
+
+Included:
+
+- Add one public crash context parser version constant.
+- Store that version on every `CrashContextData` value created by extraction.
+- Make extracted crash context records, properties, and thread data serializable.
+- Prove deterministic full-record JSON with synthetic tests.
+
+Excluded:
+
+- Issue #150, which requires a real Windows report, matching artifacts, and a readable stack.
+- Symbol scanning, artifact matching, minidump processing, ingestion, persistence, and reprocessing jobs.
+- Command-line or HTTP behavior.
+- Database schemas, migrations, and stored production data.
+
+## Dependency order and delivery
+
+The parser adapter and extraction work from issues #42, #43, #44, #45, #47, and #48 are complete. This feature has no unresolved dependency.
+
+One pull request stage will update `crates/unreal/Cargo.toml`, `crates/unreal/src/lib.rs`, and `Cargo.lock` only if dependency metadata changes it. No API schema, migration, service, or external resource changes are expected.
+
+## Acceptance criteria
+
+- `CrashContextData` includes a parser version set by extraction from one public version constant.
+- Extracted records, properties, and thread data serialize with stable field names and ordering.
+- JSON preserves source and normalized values, repeated ordered data, and namespaced unknown fields.
+- Identical XML and extraction options produce byte-identical JSON.
+- Command-line data remains excluded by default and only appears when explicitly enabled.
+- Synthetic tests cover the version, deterministic full-record JSON, unknown fields, and command-line policy.
+- No HTTP API, database, authorization, deployment, or user-facing behavior changes.
+
+## Risk and gates
+
+Risk is R2 because this adds an additive serialization contract at the Unreal and shared-domain boundary. The existing workspace `serde` dependency is sufficient. There is no authentication, authorization, tenant, infrastructure, deployment, or production-data change, so no R3 approval or staging gate applies.
+
+Extracted text remains sensitive untrusted input. Serialization must not log it or enable command-line extraction by default.
+
+## Verification
+
+- `cargo test -p cachelane-unreal`
+- `./scripts/check-fast`
+- `./scripts/check`
+
+No runtime smoke check is required because no application entry point changes.
+
+## Rollout and rollback
+
+Rollout is the normal library merge after checks and independent review. Move this plan to `docs/plans/completed/49-parser-version/README.md` after the feature is verified on `main`.
+
+Roll back by reverting the parser-version field, serialization derives, dependency change, and tests. No data migration or operational cleanup is required.
+
+## Final state
+
+Issue #49 closes and moves to Done after the pull request merges. The M0 roadmap remains open and records #49 as complete. Issues #53 and #150 remain Backlog because they are separate symbol and end-to-end outcomes.
+
+## Unresolved decisions
+
+None.
