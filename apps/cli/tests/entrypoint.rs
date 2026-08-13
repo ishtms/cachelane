@@ -14,6 +14,7 @@ mod symbol_support;
 use symbol_support::{GUID, TestDirectory, write_pdb, write_pe};
 
 const MAX_CRASH_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PREVIOUS_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 
 struct TempInput {
     path: PathBuf,
@@ -24,6 +25,14 @@ impl TempInput {
         let path =
             std::env::temp_dir().join(format!("cachelane-cli-{}-{name}", std::process::id()));
         fs::write(&path, contents)?;
+        Ok(Self { path })
+    }
+
+    fn with_size(name: &str, size: u64) -> Result<Self, std::io::Error> {
+        let path =
+            std::env::temp_dir().join(format!("cachelane-cli-{}-{name}", std::process::id()));
+        let file = fs::File::create(&path)?;
+        file.set_len(size)?;
         Ok(Self { path })
     }
 }
@@ -62,6 +71,26 @@ fn run_symbolicate(dump: &Path, symbols: &Path) -> Result<Output, std::io::Error
         .arg("--symbols")
         .arg(symbols)
         .output()
+}
+
+fn run_process(
+    dump: &Path,
+    crash_context: &Path,
+    symbols: &Path,
+    previous: Option<&Path>,
+) -> Result<Output, std::io::Error> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cachelane"));
+    command
+        .args(["crash", "process"])
+        .arg(dump)
+        .arg("--crash-context")
+        .arg(crash_context)
+        .arg("--symbols")
+        .arg(symbols);
+    if let Some(previous) = previous {
+        command.arg("--previous").arg(previous);
+    }
+    command.output()
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -484,5 +513,209 @@ fn symbolication_errors_do_not_echo_private_inputs() -> Result<(), Box<dyn Error
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("invalid minidump"));
     assert!(!stderr.contains("private-do-not-echo"));
+    Ok(())
+}
+
+#[test]
+fn reprocesses_a_partial_crash_after_symbols_arrive() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = directory.join("cachelane-symbolication.dmp");
+    let crash_context = fixture("crash-context.xml");
+    let empty_symbols = TestDirectory::new("process-empty")?;
+    let first = run_process(&dump, &crash_context, empty_symbols.path(), None)?;
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    let partial: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(partial["schema_version"], 1);
+    assert_eq!(partial["crash_guid"], "UECC-Synthetic-150");
+    assert_eq!(partial["crash_context"]["parser_version"], 1);
+    assert_eq!(partial["current"]["processing_version"], 1);
+    assert_eq!(partial["current"]["parser_version"], 1);
+    assert!(partial["history"].as_array().is_some_and(Vec::is_empty));
+    assert!(
+        partial["current"]["symbolication"]["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.iter().any(|module| {
+                module["module"] == "cachelane-symbolication.exe"
+                    && module["status"] == "missing_pe"
+                    && module["code_id"] == "823B128D8000"
+                    && module["debug_id"] == "80AC8B00-5C85-685B-8EF9-2D757F9A2125-3"
+            }))
+    );
+    assert!(
+        partial["current"]["symbolication"]["threads"][0]["frames"]
+            .as_array()
+            .is_some_and(|frames| !frames.is_empty())
+    );
+
+    let previous = TempInput::new("process-partial.json", &first.stdout)?;
+    let second = run_process(&dump, &crash_context, &directory, Some(&previous.path))?;
+    let repeated = run_process(&dump, &crash_context, &directory, Some(&previous.path))?;
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.stderr.is_empty());
+    assert_eq!(second.stdout, repeated.stdout);
+    let resolved: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    let history = resolved["history"].as_array().ok_or("missing history")?;
+    assert_eq!(history, &[partial["current"].clone()]);
+    assert_eq!(
+        history[0]["symbolication"]["symbolicator_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        history[0]["symbolication"]["minidump_processor_version"],
+        "0.27.0"
+    );
+    assert!(
+        resolved["current"]["symbolication"]["threads"][0]["frames"]
+            .as_array()
+            .is_some_and(|frames| frames
+                .iter()
+                .any(|frame| frame["function"] == "CrashFixture()"))
+    );
+
+    let resolved_input = TempInput::new("process-resolved.json", &second.stdout)?;
+    let unchanged = run_process(
+        &dump,
+        &crash_context,
+        &directory,
+        Some(&resolved_input.path),
+    )?;
+    assert!(unchanged.status.success());
+    assert_eq!(unchanged.stdout, second.stdout);
+    Ok(())
+}
+
+#[test]
+fn rejects_invalid_previous_results_without_echoing_input() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = directory.join("cachelane-symbolication.dmp");
+    let crash_context = fixture("crash-context.xml");
+    let attempt = serde_json::json!({
+        "processing_version": 1,
+        "parser_version": 1,
+        "symbolication": {}
+    });
+    let valid = serde_json::json!({
+        "schema_version": 1,
+        "crash_guid": "UECC-Synthetic-150",
+        "crash_context": {},
+        "current": attempt,
+        "history": []
+    });
+    let mut unsupported_schema = valid.clone();
+    unsupported_schema["schema_version"] = 2.into();
+    let mut unsupported_processing = valid.clone();
+    unsupported_processing["current"]["processing_version"] = 2.into();
+    let mut mismatch = valid.clone();
+    mismatch["crash_guid"] = "private-do-not-echo".into();
+    let mut excessive_history = valid.clone();
+    excessive_history["history"] = serde_json::Value::Array(vec![attempt.clone(); 17]);
+    let mut nested_history = valid;
+    nested_history["current"]["history"] = serde_json::json!([]);
+
+    let cases = [
+        (
+            "malformed-previous.json",
+            b"private-do-not-echo".to_vec(),
+            "invalid previous processing result",
+        ),
+        (
+            "unsupported-schema.json",
+            serde_json::to_vec(&unsupported_schema)?,
+            "unsupported previous result schema version",
+        ),
+        (
+            "unsupported-processing.json",
+            serde_json::to_vec(&unsupported_processing)?,
+            "unsupported previous processing version",
+        ),
+        (
+            "identity-mismatch.json",
+            serde_json::to_vec(&mismatch)?,
+            "previous result crash identity does not match",
+        ),
+        (
+            "excessive-history.json",
+            serde_json::to_vec(&excessive_history)?,
+            "previous processing history limit exceeded",
+        ),
+        (
+            "nested-history.json",
+            serde_json::to_vec(&nested_history)?,
+            "invalid previous processing result",
+        ),
+    ];
+
+    for (name, contents, expected) in cases {
+        let previous = TempInput::new(name, &contents)?;
+        let output = run_process(&dump, &crash_context, &directory, Some(&previous.path))?;
+        let stderr = String::from_utf8(output.stderr)?;
+
+        assert!(!output.status.success(), "{name}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!stderr.contains("private-do-not-echo"));
+    }
+
+    let oversized = TempInput::with_size("oversized-previous.json", MAX_PREVIOUS_RESULT_BYTES + 1)?;
+    let output = run_process(&dump, &crash_context, &directory, Some(&oversized.path))?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)?.contains("67108864-byte limit"));
+    Ok(())
+}
+
+#[test]
+fn process_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = directory.join("cachelane-symbolication.dmp");
+    let missing_identity = TempInput::new(
+        "missing-identity.xml",
+        b"<FGenericCrashContext><RuntimeProperties/></FGenericCrashContext>",
+    )?;
+    let malformed_context = TempInput::new(
+        "malformed-process.xml",
+        b"<FGenericCrashContext><Secret>private-do-not-echo</FGenericCrashContext>",
+    )?;
+    let invalid_dump = TempInput::new("invalid-process.dmp", b"private-do-not-echo")?;
+
+    for (name, output, expected) in [
+        (
+            "missing identity",
+            run_process(&dump, &missing_identity.path, &directory, None)?,
+            "crash context has no usable crash identity",
+        ),
+        (
+            "malformed context",
+            run_process(&dump, &malformed_context.path, &directory, None)?,
+            "invalid crash context XML",
+        ),
+        (
+            "invalid minidump",
+            run_process(
+                &invalid_dump.path,
+                &fixture("crash-context.xml"),
+                &directory,
+                None,
+            )?,
+            "invalid minidump",
+        ),
+    ] {
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(!output.status.success(), "{name}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!stderr.contains("private-do-not-echo"));
+    }
     Ok(())
 }
