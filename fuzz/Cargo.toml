@@ -9,11 +9,19 @@ cargo-fuzz = true
 
 [dependencies]
 cachelane-symbols = { path = "../crates/symbols" }
+cachelane-unreal = { path = "../crates/unreal" }
 libfuzzer-sys = "0.4"
 
 [[bin]]
 name = "windows_artifact"
 path = "fuzz_targets/windows_artifact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crash_request"
+path = "fuzz_targets/crash_request.rs"
 test = false
 doc = false
 bench = false

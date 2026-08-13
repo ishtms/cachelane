@@ -14,6 +14,7 @@ repository = "https://github.com/ishtms/cachelane"
 [workspace.dependencies]
 axum = "0.8.9"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 object = { version = "0.40.0", default-features = false, features = ["pe", "read_core", "std"] }
 pdb = "0.8.0"
 roxmltree = "0.21.1"

@@ -3,6 +3,13 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use cachelane_domain::{CrashType, NormalizedValue};
 use serde::Serialize;
 
+mod request;
+
+pub use request::{
+    CrashRequestError, CrashRequestErrorKind, CrashRequestFile, CrashRequestFileKind,
+    CrashRequestLimits, CrashRequestManifest, inspect_crash_request,
+};
+
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";
 pub const CRASH_CONTEXT_PARSER_VERSION: u32 = 1;
 

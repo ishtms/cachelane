@@ -1,9 +1,12 @@
 use std::{
     error::Error,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+use flate2::{Compression, write::ZlibEncoder};
 
 #[path = "../../../crates/symbols/tests/support/mod.rs"]
 mod symbol_support;
@@ -38,6 +41,13 @@ fn run_parse(path: &Path) -> Result<Output, std::io::Error> {
         .output()
 }
 
+fn run_unpack(path: &Path) -> Result<Output, std::io::Error> {
+    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+        .args(["crash", "unpack"])
+        .arg(path)
+        .output()
+}
+
 fn run_scan(path: &Path) -> Result<Output, std::io::Error> {
     Command::new(env!("CARGO_BIN_EXE_cachelane"))
         .args(["symbols", "scan"])
@@ -49,6 +59,49 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+fn write_i32(output: &mut Vec<u8>, value: i32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_ansi_field(output: &mut Vec<u8>, value: &str) {
+    write_i32(output, 260);
+    output.extend_from_slice(value.as_bytes());
+    output.resize(output.len() + 260 - value.len(), 0);
+}
+
+fn crash_request(files: &[(&str, &[u8])]) -> Result<Vec<u8>, std::io::Error> {
+    let mut expanded = Vec::new();
+    expanded.extend_from_slice(b"CR1");
+    write_ansi_field(&mut expanded, "UECC-Windows-Synthetic");
+    write_ansi_field(&mut expanded, "UECC-Windows-Synthetic.uecrash");
+    let expanded_size_offset = expanded.len();
+    write_i32(&mut expanded, 0);
+    write_i32(
+        &mut expanded,
+        i32::try_from(files.len()).map_err(std::io::Error::other)?,
+    );
+
+    for (index, (name, contents)) in files.iter().enumerate() {
+        write_i32(
+            &mut expanded,
+            i32::try_from(index).map_err(std::io::Error::other)?,
+        );
+        write_ansi_field(&mut expanded, name);
+        write_i32(
+            &mut expanded,
+            i32::try_from(contents.len()).map_err(std::io::Error::other)?,
+        );
+        expanded.extend_from_slice(contents);
+    }
+
+    let expanded_size = i32::try_from(expanded.len()).map_err(std::io::Error::other)?;
+    expanded[expanded_size_offset..expanded_size_offset + 4]
+        .copy_from_slice(&expanded_size.to_le_bytes());
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&expanded)?;
+    encoder.finish()
 }
 
 #[test]
@@ -103,6 +156,90 @@ fn parses_crash_context_to_stable_json() -> Result<(), Box<dyn Error>> {
     assert_eq!(String::from_utf8(first.stdout.clone())?, expected);
     assert_eq!(first.stdout, second.stdout);
     assert!(!String::from_utf8(second.stdout)?.contains("do-not-print"));
+    Ok(())
+}
+
+#[test]
+fn unpacks_crash_request_to_stable_json() -> Result<(), Box<dyn Error>> {
+    let xml = b"<FGenericCrashContext/>";
+    let log = b"LogCacheLane: synthetic\n";
+    let unknown = b"future";
+    let request = crash_request(&[
+        ("CrashContext.runtime-xml", xml),
+        ("Synthetic.log", log),
+        ("Future.bin", unknown),
+    ])?;
+    let input = TempInput::new("valid.uecrash", &request)?;
+    let first = run_unpack(&input.path)?;
+    let second = run_unpack(&input.path)?;
+    let expected = format!(
+        concat!(
+            r#"{{"schema_version":1,"envelope":"cr1","directory_name":"UECC-Windows-Synthetic","archive_name":"UECC-Windows-Synthetic.uecrash","compressed_size":{},"expanded_size":{},"files":["#,
+            r#"{{"index":0,"name":"CrashContext.runtime-xml","size":{},"kind":"crash_context"}},"#,
+            r#"{{"index":1,"name":"Synthetic.log","size":{},"kind":"log"}},"#,
+            r#"{{"index":2,"name":"Future.bin","size":{},"kind":"unknown"}}]}}"#,
+            "\n"
+        ),
+        request.len(),
+        539 + (272 * 3) + xml.len() + log.len() + unknown.len(),
+        xml.len(),
+        log.len(),
+        unknown.len()
+    );
+
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty());
+    assert_eq!(String::from_utf8(first.stdout.clone())?, expected);
+    assert_eq!(first.stdout, second.stdout);
+    Ok(())
+}
+
+#[test]
+fn rejects_unsafe_crash_requests_without_echoing_input() -> Result<(), Box<dyn Error>> {
+    let dtd = crash_request(&[(
+        "CrashContext.runtime-xml",
+        br#"<!DOCTYPE FGenericCrashContext [<!ENTITY secret "do-not-echo">]><FGenericCrashContext/>"#,
+    )])?;
+    let traversal = crash_request(&[("../do-not-echo.txt", b"secret")])?;
+    let duplicate = crash_request(&[
+        ("CrashContext.runtime-xml", b"<FGenericCrashContext/>"),
+        ("CrashContext.runtime-xml", b"<FGenericCrashContext/>"),
+    ])?;
+    let mut truncated = crash_request(&[("CrashContext.runtime-xml", b"<FGenericCrashContext/>")])?;
+    truncated.truncate(truncated.len() / 2);
+
+    for (name, request, expected) in [
+        ("dtd.uecrash", dtd, "DTD is forbidden"),
+        (
+            "traversal.uecrash",
+            traversal,
+            "unsafe crash request filename",
+        ),
+        (
+            "duplicate.uecrash",
+            duplicate,
+            "duplicate critical crash file",
+        ),
+        (
+            "truncated.uecrash",
+            truncated,
+            "truncated crash request archive",
+        ),
+        (
+            "malformed.uecrash",
+            b"do-not-echo".to_vec(),
+            "invalid crash request compression",
+        ),
+    ] {
+        let input = TempInput::new(name, &request)?;
+        let output = run_unpack(&input.path)?;
+        let stderr = String::from_utf8(output.stderr)?;
+
+        assert!(!output.status.success(), "{name}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!stderr.contains("do-not-echo"));
+    }
     Ok(())
 }
 
