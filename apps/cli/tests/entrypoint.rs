@@ -272,6 +272,7 @@ fn handle_upload_request(
     address: &str,
     state: &Mutex<UploadServerState>,
 ) -> Result<(), std::io::Error> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let (method, path, headers, body) = read_http_request(&mut stream)?;
     if path.starts_with("/api/") {
