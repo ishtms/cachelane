@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+api_url="${CACHELANE_API_URL:-http://127.0.0.1:${CACHELANE_API_PORT:-8080}}"
+bootstrap_secret="${CACHELANE_BOOTSTRAP_SECRET:?CACHELANE_BOOTSTRAP_SECRET is required}"
+fixture_path="apps/cli/tests/fixtures/windows-symbolication"
+
+json_field() {
+  local path="$1"
+  node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const path = process.argv[1].split(".");
+      const value = path.reduce((current, field) => current[field], JSON.parse(input));
+      process.stdout.write(String(value));
+    });
+  ' "$path"
+}
+
+project_slug="${CACHELANE_PROOF_PROJECT_SLUG:-windows-game}"
+if [[ -n "${CACHELANE_PROOF_PROJECT_ID:-}" ]]; then
+  project_id="$CACHELANE_PROOF_PROJECT_ID"
+else
+  setup_response="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $bootstrap_secret" \
+    -H "Content-Type: application/json" \
+    --data '{"owner_email":"owner@example.com","organization_name":"CacheLane Symbol Staging","organization_slug":"cachelane-symbol-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
+    "$api_url/api/v1/setup")"
+  project_id="$(json_field setup.project.id <<<"$setup_response")"
+fi
+
+token_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $bootstrap_secret" \
+  "$api_url/api/v1/projects/$project_id/artifact-upload-tokens")"
+upload_token="$(json_field token <<<"$token_response")"
+
+run_upload() {
+  CACHELANE_TOKEN="$upload_token" cargo run --quiet --package cachelane-cli -- \
+    symbols upload "$fixture_path" \
+    --project "$project_slug" \
+    --release 1.0.0 \
+    --configuration shipping \
+    --revision fixture \
+    --channel staging \
+    --build-timestamp 2026-08-14T00:00:00Z \
+    --ci-job local-staging \
+    --api-url "$api_url"
+}
+
+first="$(run_upload)"
+second="$(run_upload)"
+
+FIRST="$first" SECOND="$second" node -e '
+  const first = JSON.parse(process.env.FIRST);
+  const second = JSON.parse(process.env.SECOND);
+  if (first.artifacts_scanned !== 2 || first.uploaded !== 2 || first.bytes_transferred <= 0) {
+    throw new Error("first symbol upload proof failed");
+  }
+  if (second.artifacts_scanned !== 2 || second.uploaded !== 0 || second.already_present !== 2 || second.bytes_transferred !== 0) {
+    throw new Error("second symbol upload proof failed");
+  }
+  if (JSON.stringify(first.release) !== JSON.stringify(second.release) || JSON.stringify(first.coverage) !== JSON.stringify(second.coverage)) {
+    throw new Error("release coverage changed between uploads");
+  }
+  if (!second.coverage.ready || second.coverage.available !== 2 || second.coverage.missing !== 0 || second.coverage.mismatch !== 0) {
+    throw new Error("release coverage is incomplete");
+  }
+  if (second.release.channel !== "staging" || second.release.build_timestamp !== "2026-08-14T00:00:00Z") {
+    throw new Error("release metadata is incomplete");
+  }
+  process.stdout.write(JSON.stringify({
+    release: second.release,
+    coverage: second.coverage,
+    first_bytes_transferred: first.bytes_transferred,
+    second_bytes_transferred: second.bytes_transferred,
+  }) + "\n");
+'

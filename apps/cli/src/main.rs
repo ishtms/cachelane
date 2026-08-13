@@ -15,9 +15,11 @@ use cachelane_unreal::{
     CrashRequestError, CrashRequestLimits, CrashRequestLog, CrashRequestManifest, ParseError,
     inspect_crash_request, read_crash_request,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
+
+mod symbol_upload;
 
 const MAX_CRASH_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CRASH_CONTEXT_READ_BYTES: u64 = 4 * 1024 * 1024 + 1;
@@ -70,6 +72,36 @@ enum CrashCommand {
 #[derive(Subcommand)]
 enum SymbolsCommand {
     Scan { path: PathBuf },
+    Upload(Box<SymbolUploadArgs>),
+}
+
+#[derive(Args)]
+struct SymbolUploadArgs {
+    path: PathBuf,
+    #[arg(long)]
+    project: String,
+    #[arg(long)]
+    release: String,
+    #[arg(
+        long,
+        env = "CACHELANE_API_URL",
+        default_value = "http://127.0.0.1:8080"
+    )]
+    api_url: String,
+    #[arg(long, env = "CACHELANE_TOKEN", hide_env_values = true)]
+    token: String,
+    #[arg(long)]
+    architecture: Option<String>,
+    #[arg(long)]
+    configuration: Option<String>,
+    #[arg(long)]
+    revision: Option<String>,
+    #[arg(long)]
+    channel: Option<String>,
+    #[arg(long)]
+    build_timestamp: Option<String>,
+    #[arg(long, env = "CACHELANE_CI_JOB")]
+    ci_job: Option<String>,
 }
 
 enum CliError {
@@ -92,6 +124,7 @@ enum CliError {
     Symbolicate(SymbolicationError),
     Scan(ScanError),
     Serialize(serde_json::Error),
+    Upload(symbol_upload::UploadError),
     Write(io::Error),
 }
 
@@ -135,6 +168,7 @@ impl fmt::Display for CliError {
             Self::Symbolicate(error) => error.fmt(formatter),
             Self::Scan(error) => error.fmt(formatter),
             Self::Serialize(error) => write!(formatter, "failed to serialize output: {error}"),
+            Self::Upload(error) => error.fmt(formatter),
             Self::Write(error) => write!(formatter, "failed to write output: {error}"),
         }
     }
@@ -145,7 +179,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            ExitCode::FAILURE
+            ExitCode::from(match &error {
+                CliError::Upload(error) => error.exit_code(),
+                _ => 1,
+            })
         }
     }
 }
@@ -169,6 +206,22 @@ fn run(cli: Cli) -> Result<(), CliError> {
             symbolicate_crash(&dump, &symbols)
         }
         Some(Command::Symbols(SymbolsCommand::Scan { path })) => scan_symbols(&path),
+        Some(Command::Symbols(SymbolsCommand::Upload(upload))) => {
+            symbol_upload::upload(&symbol_upload::UploadOptions {
+                path: upload.path,
+                project: upload.project,
+                release: upload.release,
+                api_url: upload.api_url,
+                token: upload.token,
+                architecture: upload.architecture,
+                configuration: upload.configuration,
+                revision: upload.revision,
+                channel: upload.channel,
+                build_timestamp: upload.build_timestamp,
+                ci_job: upload.ci_job,
+            })
+            .map_err(CliError::Upload)
+        }
         None => {
             println!("CacheLane CLI is ready");
             Ok(())

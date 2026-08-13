@@ -41,6 +41,8 @@ fi
 
 if [[ "${CACHELANE_SMOKE_DURABLE:-false}" == "true" ]]; then
   bash scripts/prove-durable-ingest >/dev/null
+elif [[ "${CACHELANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
+  bash scripts/prove-symbol-upload >/dev/null
 fi
 
 echo "smoke checks passed"

@@ -208,6 +208,211 @@ paths:
           $ref: "#/components/responses/IngestNotFound"
         "500":
           $ref: "#/components/responses/IngestInternalError"
+  /api/v1/projects/{project_id}/artifact-upload-tokens:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createArtifactUploadToken
+      summary: Create a project-scoped artifact upload token
+      description: The raw token is returned once and only its SHA-256 digest is stored.
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "201":
+          description: Artifact upload token created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedArtifactUploadToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/projects/{project_id}/artifact-upload-tokens/{token_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/UploadTokenId"
+    delete:
+      operationId: revokeArtifactUploadToken
+      summary: Revoke a project-scoped artifact upload token
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "204":
+          description: Artifact upload token revoked
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/projects/{project_slug}/artifact-uploads:
+    parameters:
+      - name: project_slug
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/Slug"
+    post:
+      operationId: negotiateArtifactUploads
+      summary: Create or update a release manifest and return only missing uploads
+      security:
+        - artifactUploadToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NegotiateArtifactUploads"
+      responses:
+        "200":
+          description: Release manifest and resumable upload state
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NegotiatedArtifactUploads"
+        "400":
+          $ref: "#/components/responses/InvalidUploadRequest"
+        "401":
+          $ref: "#/components/responses/UploadUnauthorized"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "409":
+          $ref: "#/components/responses/UploadConflict"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/artifact-uploads/{upload_id}/parts:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+    post:
+      operationId: signArtifactUploadPart
+      summary: Sign one exact R2 or MinIO multipart part
+      security:
+        - artifactUploadToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignArtifactPart"
+      responses:
+        "200":
+          description: Short-lived direct upload request
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignedArtifactPart"
+        "400":
+          $ref: "#/components/responses/InvalidUploadRequest"
+        "401":
+          $ref: "#/components/responses/UploadUnauthorized"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/artifact-uploads/{upload_id}/parts/{part_number}:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+      - name: part_number
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10000
+    patch:
+      operationId: recordArtifactUploadPart
+      summary: Verify and record a completed multipart part
+      security:
+        - artifactUploadToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordArtifactPart"
+      responses:
+        "204":
+          description: Completed part recorded
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+        "400":
+          $ref: "#/components/responses/InvalidUploadRequest"
+        "401":
+          $ref: "#/components/responses/UploadUnauthorized"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "409":
+          $ref: "#/components/responses/UploadConflict"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/artifact-uploads/{upload_id}/complete:
+    parameters:
+      - $ref: "#/components/parameters/UploadId"
+    post:
+      operationId: completeArtifactUpload
+      summary: Complete, verify, and publish one artifact upload
+      security:
+        - artifactUploadToken: []
+      responses:
+        "200":
+          description: Artifact published and release coverage updated
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletedArtifactUpload"
+        "401":
+          $ref: "#/components/responses/UploadUnauthorized"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "409":
+          $ref: "#/components/responses/UploadConflict"
+        "422":
+          $ref: "#/components/responses/UploadMismatch"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
+  /api/v1/releases/{release_id}/coverage:
+    parameters:
+      - $ref: "#/components/parameters/ReleaseId"
+    get:
+      operationId: getReleaseArtifactCoverage
+      summary: Get deterministic artifact coverage for one scoped release
+      security:
+        - artifactUploadToken: []
+      responses:
+        "200":
+          description: Current release artifact coverage
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReleaseCoverageResponse"
+        "401":
+          $ref: "#/components/responses/UploadUnauthorized"
+        "404":
+          $ref: "#/components/responses/UploadNotFound"
+        "503":
+          $ref: "#/components/responses/UploadUnavailable"
   /u/{key}:
     servers:
       - url: http://127.0.0.1:8081
@@ -305,6 +510,10 @@ components:
       in: header
       name: Authorization
       description: Loopback-only Authorization header using the value Bootstrap followed by the configured secret.
+    artifactUploadToken:
+      type: http
+      scheme: bearer
+      bearerFormat: CacheLane artifact upload token
   parameters:
     ProjectId:
       name: project_id
@@ -320,7 +529,33 @@ components:
       schema:
         type: string
         format: uuid
+    UploadTokenId:
+      name: token_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ReleaseId:
+      name: release_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   headers:
+    CacheControlNoStore:
+      description: Prevent storage of credential and artifact metadata responses.
+      schema:
+        type: string
+        const: no-store
     RateLimitLimit:
       description: The tighter applicable request limit.
       schema:
@@ -383,8 +618,44 @@ components:
       description: Crash ingestion is temporarily unavailable
       content:
         application/json:
+              schema:
+                $ref: "#/components/schemas/IngestError"
+    InvalidUploadRequest:
+      description: Artifact upload request validation failed
+      content:
+        application/json:
           schema:
-            $ref: "#/components/schemas/IngestError"
+            $ref: "#/components/schemas/UploadError"
+    UploadUnauthorized:
+      description: Artifact upload token is missing, malformed, revoked, or invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadError"
+    UploadNotFound:
+      description: The resource is absent or outside the upload token's project
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadError"
+    UploadConflict:
+      description: Multipart upload state changed and should be renegotiated
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadError"
+    UploadMismatch:
+      description: The stored bytes do not match the declared checksum and embedded identity
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadError"
+    UploadUnavailable:
+      description: PostgreSQL or object storage is temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadError"
   schemas:
     Health:
       type: object
@@ -673,6 +944,357 @@ components:
         updated_at:
           type: string
           format: date-time
+    CreatedArtifactUploadToken:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - project_id
+        - token
+        - display_suffix
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        token:
+          type: string
+          pattern: ^clsu_[a-f0-9]{64}$
+          readOnly: true
+        display_suffix:
+          type: string
+          pattern: ^[a-f0-9]{8}$
+        created_at:
+          type: string
+          format: date-time
+    ReleaseManifest:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - platform
+        - architecture
+        - configuration
+      properties:
+        version:
+          type: string
+          minLength: 1
+          maxLength: 128
+        platform:
+          type: string
+          const: windows
+        architecture:
+          $ref: "#/components/schemas/WindowsArchitecture"
+        configuration:
+          type: string
+          minLength: 1
+          maxLength: 32
+        revision:
+          type:
+            - string
+            - "null"
+          maxLength: 256
+        channel:
+          type:
+            - string
+            - "null"
+          maxLength: 64
+        build_timestamp:
+          type:
+            - string
+            - "null"
+          format: date-time
+    ReleaseView:
+      allOf:
+        - $ref: "#/components/schemas/ReleaseManifest"
+        - type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+              format: uuid
+    WindowsArchitecture:
+      type: string
+      enum:
+        - x86
+        - x86_64
+        - arm64
+    ArtifactManifestEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+        - module
+        - artifact_type
+        - architecture
+        - byte_size
+        - sha256
+        - debug_id
+        - code_id
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Scan-relative path with slash separators. Absolute and parent paths are rejected.
+        module:
+          type: string
+          minLength: 1
+          maxLength: 256
+        artifact_type:
+          type: string
+          enum:
+            - pe_executable
+            - pe_dynamic_library
+            - pdb
+        architecture:
+          $ref: "#/components/schemas/WindowsArchitecture"
+        byte_size:
+          type: integer
+          minimum: 1
+          maximum: 17179869184
+        sha256:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        debug_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        code_id:
+          type:
+            - string
+            - "null"
+          maxLength: 128
+    NegotiateArtifactUploads:
+      type: object
+      additionalProperties: false
+      required:
+        - release
+        - artifacts
+        - cli_version
+      properties:
+        release:
+          $ref: "#/components/schemas/ReleaseManifest"
+        artifacts:
+          type: array
+          minItems: 1
+          maxItems: 512
+          items:
+            $ref: "#/components/schemas/ArtifactManifestEntry"
+        cli_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        ci_job:
+          type:
+            - string
+            - "null"
+          maxLength: 256
+    CompletedPartState:
+      type: object
+      additionalProperties: false
+      required:
+        - part_number
+        - byte_size
+        - content_md5
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        byte_size:
+          type: integer
+          minimum: 1
+        content_md5:
+          type: string
+          description: Base64-encoded 128-bit MD5 digest.
+    ArtifactUploadState:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - part_size
+        - part_count
+        - completed_parts
+      properties:
+        id:
+          type: string
+          format: uuid
+        part_size:
+          type: integer
+          minimum: 5242880
+        part_count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        completed_parts:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompletedPartState"
+    NegotiatedArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+        - sha256
+        - status
+      properties:
+        path:
+          type: string
+        sha256:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        status:
+          type: string
+          enum:
+            - already_present
+            - upload_required
+            - identity_mismatch
+        upload:
+          $ref: "#/components/schemas/ArtifactUploadState"
+        correction:
+          type: string
+    ReleaseCoverage:
+      type: object
+      additionalProperties: false
+      required:
+        - total
+        - available
+        - missing
+        - mismatch
+        - ready
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        available:
+          type: integer
+          minimum: 0
+        missing:
+          type: integer
+          minimum: 0
+        mismatch:
+          type: integer
+          minimum: 0
+        ready:
+          type: boolean
+    NegotiatedArtifactUploads:
+      type: object
+      additionalProperties: false
+      required:
+        - release
+        - artifacts
+        - coverage
+      properties:
+        release:
+          $ref: "#/components/schemas/ReleaseView"
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/NegotiatedArtifact"
+        coverage:
+          $ref: "#/components/schemas/ReleaseCoverage"
+    SignArtifactPart:
+      type: object
+      additionalProperties: false
+      required:
+        - part_number
+        - byte_size
+        - content_md5
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        byte_size:
+          type: integer
+          minimum: 1
+        content_md5:
+          type: string
+    SignedArtifactPart:
+      type: object
+      additionalProperties: false
+      required:
+        - method
+        - url
+        - headers
+        - expires_in_seconds
+      properties:
+        method:
+          type: string
+          const: PUT
+        url:
+          type: string
+          format: uri
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        expires_in_seconds:
+          type: integer
+          const: 600
+    RecordArtifactPart:
+      type: object
+      additionalProperties: false
+      required:
+        - etag
+        - byte_size
+        - content_md5
+      properties:
+        etag:
+          type: string
+          minLength: 1
+          maxLength: 128
+        byte_size:
+          type: integer
+          minimum: 1
+        content_md5:
+          type: string
+    CompletedArtifactUpload:
+      type: object
+      additionalProperties: false
+      required:
+        - release_id
+        - artifact_status
+        - coverage
+      properties:
+        release_id:
+          type: string
+          format: uuid
+        artifact_status:
+          type: string
+          const: available
+        coverage:
+          $ref: "#/components/schemas/ReleaseCoverage"
+    ReleaseCoverageResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - release
+        - coverage
+      properties:
+        release:
+          $ref: "#/components/schemas/ReleaseView"
+        coverage:
+          $ref: "#/components/schemas/ReleaseCoverage"
+    UploadError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
     IngestError:
       type: object
       additionalProperties: false
