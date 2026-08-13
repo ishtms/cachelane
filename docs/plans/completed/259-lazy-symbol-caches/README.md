@@ -1,6 +1,6 @@
 # Lazy derived symbol caches
 
-Issue: [#259](https://github.com/ishtms/cachelane/issues/259)
+Issue: [#259](https://github.com/ishtms/faultlane/issues/259)
 
 ## Outcome
 
@@ -10,7 +10,7 @@ This resolves PRD open question 6 and advances the M0 symbol-processing path wit
 
 ## Context
 
-CacheLane must match Windows artifacts by embedded debug ID, code ID, architecture, and module metadata rather than by filename. It must also retain raw artifacts and processor versions so events can be reproduced after a parser or cache-format change.
+FaultLane must match Windows artifacts by embedded debug ID, code ID, architecture, and module metadata rather than by filename. It must also retain raw artifacts and processor versions so events can be reproduced after a parser or cache-format change.
 
 The existing architecture places original debug artifacts and derived symbol caches in private object storage. The artifact isolation decision requires every PDB and PE parse to run in a bounded worker with no outbound network. The repository does not yet contain an artifact parser, artifact schema, symbolication crate, upload path, or worker job for this behavior.
 
@@ -20,13 +20,13 @@ Sentry Symbolicator provides useful primary evidence from a mature native symbol
 - Its [caching model](https://getsentry.github.io/symbolicator/advanced/caching/) retains original debug files so derived caches can be rebuilt after format changes. It separates compact function and line caches from unwind caches and records failed conversions independently.
 - Its [system architecture](https://getsentry.github.io/symbolicator/advanced/system-architecture/) keeps object metadata separate from derived caches so candidate files can be ranked before a symbolication cache is generated.
 
-CacheLane has a different storage model because customer uploads are authoritative rather than transient downloads. The timing and separation lessons still apply.
+FaultLane has a different storage model because customer uploads are authoritative rather than transient downloads. The timing and separation lessons still apply.
 
 ## Alternatives
 
 Generate every derived cache after upload: this minimizes first-event conversion latency and identifies conversion failures early. It also spends worker time and storage on artifacts that may never serve a crash, couples every processor or cache-format upgrade to bulk regeneration, and repeats the lifecycle problems documented by Symbolicator. Prompt metadata indexing provides early validation without paying that full cost.
 
-Delay all artifact inspection until a crash needs the file: this minimizes upload work. It leaves CacheLane unable to validate uploads, advertise release coverage, match exact identities, or discover that a newly uploaded artifact should requeue waiting events. Filename and upload order cannot safely fill that gap.
+Delay all artifact inspection until a crash needs the file: this minimizes upload work. It leaves FaultLane unable to validate uploads, advertise release coverage, match exact identities, or discover that a newly uploaded artifact should requeue waiting events. Filename and upload order cannot safely fill that gap.
 
 Split metadata indexing from derived-cache generation: this preserves exact matching and early validation while deferring the expensive capability-specific work until demand exists. It is the smallest option that satisfies the current artifact identity, reprocessing, and isolation requirements.
 

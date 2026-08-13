@@ -1,6 +1,6 @@
 use std::{error::Error, io::Write};
 
-use cachelane_unreal::{
+use faultlane_unreal::{
     CrashRequestErrorKind, CrashRequestFile, CrashRequestFileKind, CrashRequestLimits,
     inspect_crash_envelope, inspect_crash_request, read_crash_request,
 };
@@ -71,7 +71,7 @@ fn assert_error(request: &[u8], limits: CrashRequestLimits, expected: CrashReque
 #[test]
 fn inspects_real_format_records_in_source_order() -> Result<(), Box<dyn Error>> {
     let xml = b"<FGenericCrashContext/>";
-    let log = b"LogCacheLane: synthetic\n";
+    let log = b"LogFaultLane: synthetic\n";
     let request = crash_request(&[
         ("CrashContext.runtime-xml", xml),
         ("Synthetic.log", log),

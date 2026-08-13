@@ -1,5 +1,5 @@
 [package]
-name = "cachelane-unreal"
+name = "faultlane-unreal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-cachelane-domain = { path = "../domain" }
+faultlane-domain = { path = "../domain" }
 flate2.workspace = true
 roxmltree.workspace = true
 serde.workspace = true

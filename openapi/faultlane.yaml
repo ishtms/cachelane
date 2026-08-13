@@ -1,8 +1,8 @@
 openapi: 3.1.1
 info:
-  title: CacheLane API
+  title: FaultLane API
   version: 0.1.0
-  description: Versioned control, setup, crash ingest, and health contract for CacheLane.
+  description: Versioned control, setup, crash ingest, and health contract for FaultLane.
 servers:
   - url: http://127.0.0.1:8080
     description: Local API development
@@ -513,7 +513,7 @@ components:
     artifactUploadToken:
       type: http
       scheme: bearer
-      bearerFormat: CacheLane artifact upload token
+      bearerFormat: FaultLane artifact upload token
   parameters:
     ProjectId:
       name: project_id
@@ -670,7 +670,7 @@ components:
           type: string
         service:
           type: string
-          const: cachelane-server
+          const: faultlane-server
         status:
           type: string
           const: ok

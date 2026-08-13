@@ -705,86 +705,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cachelane-cli"
-version = "0.1.0"
-dependencies = [
- "base64",
- "cachelane-symbols",
- "cachelane-unreal",
- "clap",
- "flate2",
- "md-5",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.11.0",
-]
-
-[[package]]
-name = "cachelane-domain"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "cachelane-server"
-version = "0.1.0"
-dependencies = [
- "aws-sdk-s3",
- "axum",
- "base64",
- "cachelane-domain",
- "cachelane-symbols",
- "cachelane-unreal",
- "clap",
- "flate2",
- "futures-util",
- "getrandom 0.4.3",
- "hmac",
- "ipnet",
- "md-5",
- "object_store",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sqlx",
- "subtle",
- "time",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "cachelane-symbols"
-version = "0.1.0"
-dependencies = [
- "minidump",
- "minidump-processor",
- "minidump-unwind",
- "object 0.40.0",
- "pdb",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cachelane-unreal"
-version = "0.1.0"
-dependencies = [
- "cachelane-domain",
- "flate2",
- "roxmltree",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "cachemap2"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1219,6 +1139,86 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "faultlane-cli"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "faultlane-symbols",
+ "faultlane-unreal",
+ "flate2",
+ "md-5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "faultlane-domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "faultlane-server"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "axum",
+ "base64",
+ "clap",
+ "faultlane-domain",
+ "faultlane-symbols",
+ "faultlane-unreal",
+ "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "ipnet",
+ "md-5",
+ "object_store",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "subtle",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "faultlane-symbols"
+version = "0.1.0"
+dependencies = [
+ "minidump",
+ "minidump-processor",
+ "minidump-unwind",
+ "object 0.40.0",
+ "pdb",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "faultlane-unreal"
+version = "0.1.0"
+dependencies = [
+ "faultlane-domain",
+ "flate2",
+ "roxmltree",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "find-msvc-tools"

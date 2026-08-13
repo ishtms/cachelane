@@ -8,9 +8,9 @@ Use private Cloudflare R2 buckets for hosted crash and symbol artifacts. Use Min
 
 The server uses the official AWS SDK for Rust for multipart symbol upload control and presigning. Hosted R2 configuration uses the account endpoint and region `auto`. MinIO uses a literal loopback endpoint and path-style requests.
 
-Multipart part requests bind the object key, upload ID, part number, content length, `Content-MD5`, and a ten-minute expiry. Automatic optional SDK checksum headers are disabled because R2 does not support every S3 checksum mode for `UploadPart`. CacheLane verifies the complete object size, SHA-256 checksum, and embedded PE or PDB identity before publication.
+Multipart part requests bind the object key, upload ID, part number, content length, `Content-MD5`, and a ten-minute expiry. Automatic optional SDK checksum headers are disabled because R2 does not support every S3 checksum mode for `UploadPart`. FaultLane verifies the complete object size, SHA-256 checksum, and embedded PE or PDB identity before publication.
 
-Buckets remain private. Clients receive only short-lived upload-part URLs. Object credentials, object keys, and raw artifact contents are not returned by CacheLane APIs or written to logs.
+Buckets remain private. Clients receive only short-lived upload-part URLs. Object credentials, object keys, and raw artifact contents are not returned by FaultLane APIs or written to logs.
 
 Hosted activation waits for issue #311 to move final PE and PDB verification into the bounded worker required by decision 0003. Until then, the upload feature fails startup unless the API binds to a literal loopback address.
 

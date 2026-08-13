@@ -14,8 +14,8 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use cachelane_domain::ProcessingState;
-use cachelane_unreal::{CrashRequestLimits, inspect_crash_envelope};
+use faultlane_domain::ProcessingState;
+use faultlane_unreal::{CrashRequestLimits, inspect_crash_envelope};
 use futures_util::StreamExt;
 use hmac::{Hmac, KeyInit, Mac};
 use ipnet::IpNet;
@@ -104,18 +104,18 @@ impl CrashIngest {
             )
             .build()
             .map_err(|_| StartupError::IngestConfiguration)?;
-        let spool_directory = env::var("CACHELANE_INGEST_SPOOL_DIR")
-            .map_or_else(|_| env::temp_dir().join("cachelane-ingest"), PathBuf::from);
+        let spool_directory = env::var("FAULTLANE_INGEST_SPOOL_DIR")
+            .map_or_else(|_| env::temp_dir().join("faultlane-ingest"), PathBuf::from);
         validate_spool_directory(&spool_directory)?;
         cleanup_stale_spools(&spool_directory)?;
-        let rate_secret = required_env("CACHELANE_RATE_LIMIT_SECRET")?;
+        let rate_secret = required_env("FAULTLANE_RATE_LIMIT_SECRET")?;
         if rate_secret.len() < 32 {
             return Err(StartupError::IngestConfiguration);
         }
-        let trusted_proxy_value = env::var("CACHELANE_TRUSTED_PROXY_CIDRS").ok();
+        let trusted_proxy_value = env::var("FAULTLANE_TRUSTED_PROXY_CIDRS").ok();
         let trusted_proxies = parse_cidrs(trusted_proxy_value.as_deref())?;
-        let project_limit = parse_limit("CACHELANE_PROJECT_RATE_LIMIT", DEFAULT_PROJECT_LIMIT)?;
-        let ip_limit = parse_limit("CACHELANE_IP_RATE_LIMIT", DEFAULT_IP_LIMIT)?;
+        let project_limit = parse_limit("FAULTLANE_PROJECT_RATE_LIMIT", DEFAULT_PROJECT_LIMIT)?;
+        let ip_limit = parse_limit("FAULTLANE_IP_RATE_LIMIT", DEFAULT_IP_LIMIT)?;
 
         Ok(Self {
             pool: Some(pool),
@@ -133,7 +133,7 @@ impl CrashIngest {
         Self {
             pool: None,
             objects: Arc::new(InMemory::new()),
-            spool_directory: Arc::new(env::temp_dir().join("cachelane-ingest-disabled")),
+            spool_directory: Arc::new(env::temp_dir().join("faultlane-ingest-disabled")),
             rate_secret: Arc::from(&b"disabled-disabled-disabled-disabled"[..]),
             trusted_proxies: Arc::new(Vec::new()),
             project_limit: DEFAULT_PROJECT_LIMIT,
@@ -356,7 +356,7 @@ pub(crate) async fn submit_crash(
     );
     let spool_path = ingest
         .spool_directory
-        .join(format!("cachelane-{event_id}.spool"));
+        .join(format!("faultlane-{event_id}.spool"));
 
     register_pending_object(ingest, &scope, &object_key).await?;
 
@@ -538,7 +538,7 @@ async fn store_request(
 
 async fn inspect_spool(
     path: &FilePath,
-) -> Result<cachelane_unreal::CrashRequestManifest, IngestError> {
+) -> Result<faultlane_unreal::CrashRequestManifest, IngestError> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(path).map_err(|_| IngestError::Unavailable)?;
@@ -991,7 +991,7 @@ fn cleanup_stale_spools(path: &FilePath) -> Result<(), StartupError> {
             .metadata()
             .map_err(|_| StartupError::IngestConfiguration)?;
         if metadata.is_file()
-            && name.starts_with("cachelane-")
+            && name.starts_with("faultlane-")
             && name.ends_with(".spool")
             && metadata
                 .modified()
@@ -1173,7 +1173,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn persists_one_object_and_job_for_duplicate_requests_when_configured()
     -> Result<(), Box<dyn Error>> {
-        let Ok(database_url) = std::env::var("CACHELANE_TEST_DATABASE_URL") else {
+        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
             return Ok(());
         };
         let _guard = DATABASE_TEST_LOCK.lock().await;
@@ -1391,19 +1391,19 @@ mod tests {
         );
         assert_eq!(count(&pool, "crash_events").await?, 3);
 
-        sqlx::query("DROP TRIGGER IF EXISTS cachelane_test_fail_job ON jobs")
+        sqlx::query("DROP TRIGGER IF EXISTS faultlane_test_fail_job ON jobs")
             .execute(&pool)
             .await?;
-        sqlx::query("DROP FUNCTION IF EXISTS cachelane_test_fail_job()")
+        sqlx::query("DROP FUNCTION IF EXISTS faultlane_test_fail_job()")
             .execute(&pool)
             .await?;
         sqlx::query(
-            "CREATE FUNCTION cachelane_test_fail_job() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced job failure'; END $$",
+            "CREATE FUNCTION faultlane_test_fail_job() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced job failure'; END $$",
         )
         .execute(&pool)
         .await?;
         sqlx::query(
-            "CREATE TRIGGER cachelane_test_fail_job BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION cachelane_test_fail_job()",
+            "CREATE TRIGGER faultlane_test_fail_job BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION faultlane_test_fail_job()",
         )
         .execute(&pool)
         .await?;
@@ -1416,10 +1416,10 @@ mod tests {
             )?,
         )
         .await;
-        sqlx::query("DROP TRIGGER cachelane_test_fail_job ON jobs")
+        sqlx::query("DROP TRIGGER faultlane_test_fail_job ON jobs")
             .execute(&pool)
             .await?;
-        sqlx::query("DROP FUNCTION cachelane_test_fail_job()")
+        sqlx::query("DROP FUNCTION faultlane_test_fail_job()")
             .execute(&pool)
             .await?;
         let database_failure = database_failure?;
@@ -1466,7 +1466,7 @@ mod tests {
         .fetch_one(pool)
         .await?;
         let organization_id = sqlx::query_scalar::<_, String>(
-            "INSERT INTO organizations (name, slug) VALUES ('CacheLane Test', 'cachelane-test') RETURNING id::text",
+            "INSERT INTO organizations (name, slug) VALUES ('FaultLane Test', 'faultlane-test') RETURNING id::text",
         )
         .fetch_one(pool)
         .await?;
@@ -1550,7 +1550,7 @@ mod tests {
 
     fn test_spool_directory() -> Result<PathBuf, Box<dyn Error>> {
         let path = std::env::temp_dir().join(format!(
-            "cachelane-296-{}",
+            "faultlane-296-{}",
             random_uuid().map_err(|_| "test spool id must generate")?
         ));
         std::fs::create_dir(&path)?;
@@ -1597,9 +1597,9 @@ mod tests {
             .and_then(|value| value.split('?').next())
             .unwrap_or_default();
         assert!(
-            database_name == "cachelane_296"
-                || database_name.starts_with("cachelane_296_")
-                || database_name == "cachelane_test"
+            database_name == "faultlane_296"
+                || database_name.starts_with("faultlane_296_")
+                || database_name == "faultlane_test"
         );
     }
 }

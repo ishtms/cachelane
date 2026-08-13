@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-api_url="${CACHELANE_API_URL:-http://127.0.0.1:${CACHELANE_API_PORT:-8080}}"
-bootstrap_secret="${CACHELANE_BOOTSTRAP_SECRET:?CACHELANE_BOOTSTRAP_SECRET is required}"
+api_url="${FAULTLANE_API_URL:-http://127.0.0.1:${FAULTLANE_API_PORT:-8080}}"
+bootstrap_secret="${FAULTLANE_BOOTSTRAP_SECRET:?FAULTLANE_BOOTSTRAP_SECRET is required}"
 fixture_path="apps/cli/tests/fixtures/windows-symbolication"
 
 json_field() {
@@ -18,14 +18,14 @@ json_field() {
   ' "$path"
 }
 
-project_slug="${CACHELANE_PROOF_PROJECT_SLUG:-windows-game}"
-if [[ -n "${CACHELANE_PROOF_PROJECT_ID:-}" ]]; then
-  project_id="$CACHELANE_PROOF_PROJECT_ID"
+project_slug="${FAULTLANE_PROOF_PROJECT_SLUG:-windows-game}"
+if [[ -n "${FAULTLANE_PROOF_PROJECT_ID:-}" ]]; then
+  project_id="$FAULTLANE_PROOF_PROJECT_ID"
 else
   setup_response="$(curl --fail --silent --show-error \
     -H "Authorization: Bootstrap $bootstrap_secret" \
     -H "Content-Type: application/json" \
-    --data '{"owner_email":"owner@example.com","organization_name":"CacheLane Symbol Staging","organization_slug":"cachelane-symbol-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
+    --data '{"owner_email":"owner@example.com","organization_name":"FaultLane Symbol Staging","organization_slug":"faultlane-symbol-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
     "$api_url/api/v1/setup")"
   project_id="$(json_field setup.project.id <<<"$setup_response")"
 fi
@@ -37,7 +37,7 @@ token_response="$(curl --fail --silent --show-error \
 upload_token="$(json_field token <<<"$token_response")"
 
 run_upload() {
-  CACHELANE_TOKEN="$upload_token" cargo run --quiet --package cachelane-cli -- \
+  FAULTLANE_TOKEN="$upload_token" cargo run --quiet --package faultlane-cli -- \
     symbols upload "$fixture_path" \
     --project "$project_slug" \
     --release 1.0.0 \

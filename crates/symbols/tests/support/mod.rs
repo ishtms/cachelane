@@ -18,7 +18,7 @@ impl TestDirectory {
     pub fn new(label: &str) -> io::Result<Self> {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "cachelane-symbols-{}-{sequence}-{label}",
+            "faultlane-symbols-{}-{sequence}-{label}",
             std::process::id()
         ));
         fs::create_dir(&path)?;

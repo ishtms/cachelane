@@ -1,6 +1,6 @@
 # Crash context XML adapter
 
-Issue: [#42](https://github.com/ishtms/cachelane/issues/42)
+Issue: [#42](https://github.com/ishtms/faultlane/issues/42)
 
 ## Context
 
@@ -40,7 +40,7 @@ The blast radius is limited to workspace builds and future callers of the new li
 
 ## Verification
 
-- `cargo test -p cachelane-unreal`
+- `cargo test -p faultlane-unreal`
 - `./scripts/check-fast`
 - `./scripts/check`
 
@@ -69,4 +69,4 @@ None. Future fixture evidence may tune the caller-provided node limit without ch
 
 ## Result
 
-The bounded, version-tolerant crash-context XML adapter shipped in [#276](https://github.com/ishtms/cachelane/pull/276). Synthetic tests cover supported input variations, unsafe XML, malformed input, unexpected roots, and node limits.
+The bounded, version-tolerant crash-context XML adapter shipped in [#276](https://github.com/ishtms/faultlane/pull/276). Synthetic tests cover supported input variations, unsafe XML, malformed input, unexpected roots, and node limits.

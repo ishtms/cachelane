@@ -9,7 +9,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use cachelane_symbols::{
+use faultlane_symbols::{
     Architecture, ArtifactScanLimits, ArtifactType, MatchState, scan_artifacts_with_limits,
 };
 use md5::Md5;

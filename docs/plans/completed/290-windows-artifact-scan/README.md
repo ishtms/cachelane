@@ -1,10 +1,10 @@
 # Windows artifact identity scanning
 
-Issue: [#290](https://github.com/ishtms/cachelane/issues/290)
+Issue: [#290](https://github.com/ishtms/faultlane/issues/290)
 
 ## Outcome
 
-Add `cachelane symbols scan <path>` so a developer can recursively inspect Windows PE and PDB artifacts and receive deterministic JSON containing relative path, artifact type, architecture, embedded debug identity, PE code identity, size, match state, and safe per-file errors.
+Add `faultlane symbols scan <path>` so a developer can recursively inspect Windows PE and PDB artifacts and receive deterministic JSON containing relative path, artifact type, architecture, embedded debug identity, PE code identity, size, match state, and safe per-file errors.
 
 ## Context
 
@@ -14,7 +14,7 @@ The authoritative source order also refers to relevant files under `docs/securit
 
 ## Decision
 
-Create a focused `cachelane-symbols` library used by the CLI. Use `object` 0.40 with only PE reading and standard library support, plus `pdb` 0.8 for PDB information and DBI architecture. Keep discovery and matching in the library so later upload and symbolication features can reuse the same identities without invoking the CLI.
+Create a focused `faultlane-symbols` library used by the CLI. Use `object` 0.40 with only PE reading and standard library support, plus `pdb` 0.8 for PDB information and DBI architecture. Keep discovery and matching in the library so later upload and symbolication features can reuse the same identities without invoking the CLI.
 
 - Read PE metadata through `object` and PDB metadata through `pdb`.
 - Format a debug identity as uppercase PDB GUID bytes followed by the hexadecimal age. This is the common Windows debug identifier form and is shared by both artifact types.
@@ -45,7 +45,7 @@ The change adds two parser dependencies, one reusable crate, a CLI command, and 
 
 - Unit tests cover identity formatting, match rules, stable ordering, extensions, symbolic links, malformed inputs, and safe error categories.
 - CLI behavior tests run the real executable against a synthetic artifact tree and compare byte-for-byte JSON across repeated scans.
-- `cargo run -p cachelane-cli -- symbols scan <synthetic-windows-artifact-dir>` proves the entrypoint.
+- `cargo run -p faultlane-cli -- symbols scan <synthetic-windows-artifact-dir>` proves the entrypoint.
 - `./scripts/check-fast` and `./scripts/check` must pass on the final commit.
 
 ## Security and compatibility
@@ -69,4 +69,4 @@ Ship the command as an additive local capability. Later upload and symbolication
 
 ## Result
 
-Windows PE and PDB identity scanning shipped in [#337](https://github.com/ishtms/cachelane/pull/337). The command matches artifacts by embedded identities, emits deterministic JSON, rejects unsafe artifact trees, and passes the synthetic CLI behavior tests and repository checks.
+Windows PE and PDB identity scanning shipped in [#337](https://github.com/ishtms/faultlane/pull/337). The command matches artifacts by embedded identities, emits deterministic JSON, rejects unsafe artifact trees, and passes the synthetic CLI behavior tests and repository checks.

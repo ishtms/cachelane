@@ -10,9 +10,9 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-api_url="${CACHELANE_API_URL:-http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_API_PORT:-8080}}"
-ingest_url="${CACHELANE_INGEST_URL:-http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_INGEST_PORT:-8081}}"
-web_url="${CACHELANE_WEB_URL:-http://127.0.0.1:${CACHELANE_WEB_PORT:-3000}}"
+api_url="${FAULTLANE_API_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_API_PORT:-8080}}"
+ingest_url="${FAULTLANE_INGEST_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_INGEST_PORT:-8081}}"
+web_url="${FAULTLANE_WEB_URL:-http://127.0.0.1:${FAULTLANE_WEB_PORT:-3000}}"
 
 api_response="$(curl --fail --silent --show-error "$api_url/health/ready")"
 ingest_response="$(curl --fail --silent --show-error "$ingest_url/health/ready")"
@@ -39,9 +39,9 @@ if [[ "$setup_response" != *"Set up your first project"* ]]; then
   exit 1
 fi
 
-if [[ "${CACHELANE_SMOKE_DURABLE:-false}" == "true" ]]; then
+if [[ "${FAULTLANE_SMOKE_DURABLE:-false}" == "true" ]]; then
   bash scripts/prove-durable-ingest >/dev/null
-elif [[ "${CACHELANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
+elif [[ "${FAULTLANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
   bash scripts/prove-symbol-upload >/dev/null
 fi
 

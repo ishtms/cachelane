@@ -1,10 +1,10 @@
 # Packaged UE 5.8 crash processing
 
-Issue: [#294](https://github.com/ishtms/cachelane/issues/294)
+Issue: [#294](https://github.com/ishtms/faultlane/issues/294)
 
 ## Outcome
 
-Extend `cachelane crash process` so a developer can pass one complete UE 5.8.1 Crash Report Client request plus a local artifact tree and receive deterministic normalized JSON containing request metadata, crash context, classification evidence, a bounded log tail, module identities, and readable faulting-thread frames.
+Extend `faultlane crash process` so a developer can pass one complete UE 5.8.1 Crash Report Client request plus a local artifact tree and receive deterministic normalized JSON containing request metadata, crash context, classification evidence, a bounded log tail, module identities, and readable faulting-thread frames.
 
 ## Context
 
@@ -14,7 +14,7 @@ The private proof is available in a dedicated directory outside Git. It contains
 
 ## Acceptance criteria
 
-- `cachelane crash process <request> --symbols <path> [--previous <result>]` processes the bounded `CR1` request through the real CLI entrypoint.
+- `faultlane crash process <request> --symbols <path> [--previous <result>]` processes the bounded `CR1` request through the real CLI entrypoint.
 - Output includes the versioned request manifest, normalized crash metadata and unknown safe fields, crash classification with fixed evidence codes and confidence, a bounded log tail, module diagnostics, all available threads, readable frames, trust, inline frames, and parser, processing, symbolicator, and minidump processor versions.
 - Structured `Crash`, `Assert`, and `Ensure` values retain high-confidence classification. Structured OOM fields, structured GPU crash values, and normalized error patterns produce separate likely OOM or GPU signals with explicit confidence and evidence codes.
 - Request decoding retains only one bounded crash context, one bounded minidump, and one bounded log suffix while consuming the complete compressed stream. Unknown files are never retained.
@@ -32,10 +32,10 @@ The main risks are retaining too much attacker-controlled data, changing existin
 
 ## Current behavior and evidence
 
-- `cachelane crash unpack <request>` validates the real UE 5.8.1 zlib `CR1` envelope and emits a stable manifest without file contents.
+- `faultlane crash unpack <request>` validates the real UE 5.8.1 zlib `CR1` envelope and emits a stable manifest without file contents.
 - `CrashContextParser` emits parser-versioned normalized data, preserves unknown fields, and excludes the command line by default.
 - `ProjectLogTail` produces bounded source-order text with truncation and invalid UTF-8 state.
-- `cachelane crash symbolicate` matches PE and PDB files by embedded identities and emits raw plus resolved frames with trust and processor versions.
+- `faultlane crash symbolicate` matches PE and PDB files by embedded identities and emits raw plus resolved frames with trust and processor versions.
 - PR #340 locally passes `scripts/check` for extracted-file processing, bounded prior attempts, and partial-to-readable reprocessing. It is the only direct dependency.
 - The private request and matching artifacts exist locally and previously passed the unpack and standalone symbolication stages.
 
@@ -51,13 +51,13 @@ The main risks are retaining too much attacker-controlled data, changing existin
 
 ## Verification
 
-- `cargo test -p cachelane-unreal`
-- `cargo test -p cachelane-symbols`
-- `cargo test -p cachelane-cli --test entrypoint`
+- `cargo test -p faultlane-unreal`
+- `cargo test -p faultlane-symbols`
+- `cargo test -p faultlane-cli --test entrypoint`
 - `cargo check --manifest-path fuzz/Cargo.toml --bins`
 - Synthetic request processing twice with byte-for-byte comparison
 - Synthetic missing-symbol processing followed by exact-symbol reprocessing with prior history
-- Private `cachelane crash process <ue58-request> --symbols <private-artifacts>` proof with readable frames
+- Private `faultlane crash process <ue58-request> --symbols <private-artifacts>` proof with readable frames
 - `bash scripts/check-fast`
 - `bash scripts/check`
 
@@ -86,7 +86,7 @@ Ship the request mode as an additive local CLI path after #293. Roll back by rev
 
 ## Result
 
-- `cachelane crash process <request> --symbols <path> [--previous <result>]` composes request decoding, normalized crash context, bounded log output, classification, and Windows symbolication through one command.
+- `faultlane crash process <request> --symbols <path> [--previous <result>]` composes request decoding, normalized crash context, bounded log output, classification, and Windows symbolication through one command.
 - Synthetic request tests prove exact module, function, source file, source line, inline frame, trust, processor versions, missing-symbol output, prior history, deterministic output, and fixed safe failures.
 - Classification tests cover structured Crash, Assert, Ensure, OOM, and GPU evidence plus medium-confidence normalized error patterns without copying source payloads into evidence.
 - The private UE 5.8.1 request produced four request records, a bounded log tail, six faulting frames, four readable frames, one matched module, and byte-identical output across repeated runs. The private files and output remained outside Git.

@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use cachelane_symbols::scan_artifacts;
+use faultlane_symbols::scan_artifacts;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
         "dll"
     };
     let path = std::env::temp_dir().join(format!(
-        "cachelane-artifact-fuzz-{}.{}",
+        "faultlane-artifact-fuzz-{}.{}",
         std::process::id(),
         extension
     ));

@@ -69,12 +69,12 @@ else
   echo "ok: Docker Compose configuration"
 fi
 
-check_port api "${CACHELANE_API_PORT:-8080}"
-check_port ingest "${CACHELANE_INGEST_PORT:-8081}"
-check_port web "${CACHELANE_WEB_PORT:-3000}"
-check_port postgres "${CACHELANE_POSTGRES_PORT:-5432}"
-check_port minio "${CACHELANE_MINIO_PORT:-9000}"
-check_port minio-console "${CACHELANE_MINIO_CONSOLE_PORT:-9001}"
+check_port api "${FAULTLANE_API_PORT:-8080}"
+check_port ingest "${FAULTLANE_INGEST_PORT:-8081}"
+check_port web "${FAULTLANE_WEB_PORT:-3000}"
+check_port postgres "${FAULTLANE_POSTGRES_PORT:-5432}"
+check_port minio "${FAULTLANE_MINIO_PORT:-9000}"
+check_port minio-console "${FAULTLANE_MINIO_CONSOLE_PORT:-9001}"
 
 if ((failures > 0)); then
   exit 1

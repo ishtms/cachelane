@@ -6,16 +6,16 @@ use std::{
     process::ExitCode,
 };
 
-use cachelane_symbols::{
+use clap::{Args, Parser, Subcommand};
+use faultlane_symbols::{
     ScanError, SymbolicationError, SymbolicationLimits, scan_artifacts, symbolicate_minidump,
     symbolicate_minidump_bytes,
 };
-use cachelane_unreal::{
+use faultlane_unreal::{
     CrashClassification, CrashContextData, CrashContextExtractionOptions, CrashContextParser,
     CrashRequestError, CrashRequestLimits, CrashRequestLog, CrashRequestManifest, ParseError,
     inspect_crash_request, read_crash_request,
 };
-use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -31,7 +31,7 @@ const LOCAL_RESULT_SCHEMA_VERSION: u32 = 1;
 const LOCAL_PROCESSING_VERSION: u32 = 1;
 
 #[derive(Parser)]
-#[command(name = "cachelane", version, about = "CacheLane command line tools")]
+#[command(name = "faultlane", version, about = "FaultLane command line tools")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -84,11 +84,11 @@ struct SymbolUploadArgs {
     release: String,
     #[arg(
         long,
-        env = "CACHELANE_API_URL",
+        env = "FAULTLANE_API_URL",
         default_value = "http://127.0.0.1:8080"
     )]
     api_url: String,
-    #[arg(long, env = "CACHELANE_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "FAULTLANE_TOKEN", hide_env_values = true)]
     token: String,
     #[arg(long)]
     architecture: Option<String>,
@@ -100,7 +100,7 @@ struct SymbolUploadArgs {
     channel: Option<String>,
     #[arg(long)]
     build_timestamp: Option<String>,
-    #[arg(long, env = "CACHELANE_CI_JOB")]
+    #[arg(long, env = "FAULTLANE_CI_JOB")]
     ci_job: Option<String>,
 }
 
@@ -223,7 +223,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             .map_err(CliError::Upload)
         }
         None => {
-            println!("CacheLane CLI is ready");
+            println!("FaultLane CLI is ready");
             Ok(())
         }
     }
@@ -233,7 +233,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
 struct ProcessingAttempt<'result> {
     processing_version: u32,
     parser_version: u32,
-    symbolication: &'result cachelane_symbols::SymbolicationResult,
+    symbolication: &'result faultlane_symbols::SymbolicationResult,
 }
 
 #[derive(Serialize)]
@@ -327,7 +327,7 @@ fn crash_guid(crash_context: &CrashContextData) -> Result<&str, CliError> {
 
 fn write_processing_result(
     crash_context: &CrashContextData,
-    symbolication: &cachelane_symbols::SymbolicationResult,
+    symbolication: &faultlane_symbols::SymbolicationResult,
     previous: Option<PreviousProcessing>,
     request: Option<&CrashRequestManifest>,
     classification: Option<&CrashClassification>,

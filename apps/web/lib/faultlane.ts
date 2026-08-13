@@ -56,8 +56,8 @@ export async function setupApi<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const apiUrl = process.env.CACHELANE_API_URL ?? "http://127.0.0.1:8080";
-  const secret = process.env.CACHELANE_BOOTSTRAP_SECRET;
+  const apiUrl = process.env.FAULTLANE_API_URL ?? "http://127.0.0.1:8080";
+  const secret = process.env.FAULTLANE_BOOTSTRAP_SECRET;
   if (!secret) {
     throw new SetupApiError("bootstrap_unavailable");
   }
@@ -98,7 +98,7 @@ export function setupErrorMessage(error: unknown): string {
     case "bootstrap_unavailable":
       return "Local bootstrap setup is not enabled.";
     case "service_unavailable":
-      return "The CacheLane API is unavailable.";
+      return "The FaultLane API is unavailable.";
     case "setup_conflict":
       return "Initial setup is already complete. Open the existing project instead.";
     case "not_found":

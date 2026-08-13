@@ -9,7 +9,7 @@ required_files=(
   Cargo.toml
   package.json
   deploy/docker-compose/compose.yml
-  openapi/cachelane.yaml
+  openapi/faultlane.yaml
   scripts/setup
   scripts/doctor
   scripts/dev
@@ -48,7 +48,7 @@ done
 for yaml_file in \
   pnpm-workspace.yaml \
   deploy/docker-compose/compose.yml \
-  openapi/cachelane.yaml \
+  openapi/faultlane.yaml \
   .github/dependabot.yml \
   .github/ISSUE_TEMPLATE/bug.yml \
   .github/ISSUE_TEMPLATE/config.yml \
@@ -71,5 +71,43 @@ if ((found_dash > 0)); then
   echo "em dash found in repository content" >&2
   exit 1
 fi
+
+node <<'NODE'
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+
+const token = "cache" + "lane";
+const ascii = Buffer.from(token);
+const utf16le = Buffer.from(token, "utf16le");
+const utf16be = Buffer.from(utf16le).swap16();
+const files = execFileSync("git", ["ls-files", "-z"])
+  .toString()
+  .split("\0")
+  .filter(Boolean);
+let found = false;
+
+for (const file of files) {
+  const bytes = fs.readFileSync(file);
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] >= 65 && bytes[index] <= 90) {
+      bytes[index] += 32;
+    }
+  }
+
+  if (
+    file.toLowerCase().includes(token) ||
+    bytes.includes(ascii) ||
+    bytes.includes(utf16le) ||
+    bytes.includes(utf16be)
+  ) {
+    console.error(`former product name found in tracked file: ${file}`);
+    found = true;
+  }
+}
+
+if (found) {
+  process.exit(1);
+}
+NODE
 
 echo "repository checks passed"

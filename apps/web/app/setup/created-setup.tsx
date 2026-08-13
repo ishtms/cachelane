@@ -1,4 +1,4 @@
-import type { CreatedSetup } from "../../lib/cachelane";
+import type { CreatedSetup } from "../../lib/faultlane";
 
 export function CreatedSetupResult({ created }: { created: CreatedSetup }) {
   return (
@@ -6,7 +6,7 @@ export function CreatedSetupResult({ created }: { created: CreatedSetup }) {
       <p className="setup-kicker">Project created</p>
       <h2 id="key-title">Save this key now</h2>
       <p className="setup-copy">
-        This write key is shown once. CacheLane stores only its hash and cannot
+        This write key is shown once. FaultLane stores only its hash and cannot
         show it again.
       </p>
       <code className="secret-value" data-testid="ingest-key">

@@ -19,7 +19,7 @@ __declspec(noinline) void CrashFixture()
 LONG WriteFixtureDump(EXCEPTION_POINTERS* exception)
 {
     HANDLE output = CreateFileW(
-        L"cachelane-symbolication.dmp",
+        L"faultlane-symbolication.dmp",
         GENERIC_WRITE,
         0,
         nullptr,

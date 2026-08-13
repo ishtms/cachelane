@@ -1,5 +1,5 @@
 [package]
-name = "cachelane-fuzz"
+name = "faultlane-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -8,8 +8,8 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-cachelane-symbols = { path = "../crates/symbols" }
-cachelane-unreal = { path = "../crates/unreal" }
+faultlane-symbols = { path = "../crates/symbols" }
+faultlane-unreal = { path = "../crates/unreal" }
 libfuzzer-sys = "0.4"
 minidump = "=0.27.0"
 

@@ -9,7 +9,7 @@ edition = "2024"
 rust-version = "1.97"
 license = "UNLICENSED"
 authors = ["Ishtmeet Singh"]
-repository = "https://github.com/ishtms/cachelane"
+repository = "https://github.com/ishtms/faultlane"
 
 [workspace.dependencies]
 aws-sdk-s3 = { version = "1.141.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }

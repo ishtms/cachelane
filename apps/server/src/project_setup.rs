@@ -43,9 +43,9 @@ impl ServerState {
     ) -> Result<Self, StartupError> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| StartupError::InvalidConfiguration("DATABASE_URL is required"))?;
-        let bootstrap_enabled = env::var("CACHELANE_BOOTSTRAP_ENABLED")
+        let bootstrap_enabled = env::var("FAULTLANE_BOOTSTRAP_ENABLED")
             .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
-        let bootstrap_secret = env::var("CACHELANE_BOOTSTRAP_SECRET").ok();
+        let bootstrap_secret = env::var("FAULTLANE_BOOTSTRAP_SECRET").ok();
         let ingest_base_url =
             env::var("INGEST_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned());
 
@@ -303,7 +303,7 @@ struct Health {
 
 fn health(role: &'static str) -> Json<Health> {
     Json(Health {
-        service: "cachelane-server",
+        service: "faultlane-server",
         role,
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -1475,8 +1475,8 @@ mod tests {
                             "owner_email": "owner@example.com",
                             "organization_name": "Example Studio",
                             "organization_slug": "example-studio",
-                            "project_name": "CacheLane Proof",
-                            "project_slug": "cachelane-proof"
+                            "project_name": "FaultLane Proof",
+                            "project_slug": "faultlane-proof"
                         })
                         .to_string(),
                     ))
@@ -1896,17 +1896,17 @@ mod tests {
             .and_then(|value| value.split('?').next())
             .unwrap_or_default();
         assert!(
-            database_name == "cachelane_295"
-                || database_name.starts_with("cachelane_295_")
-                || database_name == "cachelane_296"
-                || database_name.starts_with("cachelane_296_")
-                || database_name == "cachelane_test"
+            database_name == "faultlane_295"
+                || database_name.starts_with("faultlane_295_")
+                || database_name == "faultlane_296"
+                || database_name.starts_with("faultlane_296_")
+                || database_name == "faultlane_test"
         );
     }
 
     #[tokio::test]
     async fn postgres_persists_hashes_and_enforces_tenant_scope_when_configured() {
-        let Ok(database_url) = std::env::var("CACHELANE_TEST_DATABASE_URL") else {
+        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
             return;
         };
         let _guard = DATABASE_TEST_LOCK.lock().await;

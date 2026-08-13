@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-api_url="${CACHELANE_API_URL:-http://127.0.0.1:${CACHELANE_API_PORT:-8080}}"
-ingest_url="${CACHELANE_INGEST_URL:-http://127.0.0.1:${CACHELANE_INGEST_PORT:-8081}}"
-bootstrap_secret="${CACHELANE_BOOTSTRAP_SECRET:?CACHELANE_BOOTSTRAP_SECRET is required}"
+api_url="${FAULTLANE_API_URL:-http://127.0.0.1:${FAULTLANE_API_PORT:-8080}}"
+ingest_url="${FAULTLANE_INGEST_URL:-http://127.0.0.1:${FAULTLANE_INGEST_PORT:-8081}}"
+bootstrap_secret="${FAULTLANE_BOOTSTRAP_SECRET:?FAULTLANE_BOOTSTRAP_SECRET is required}"
 
 json_field() {
   local path="$1"
@@ -21,7 +21,7 @@ json_field() {
 setup_response="$(curl --fail --silent --show-error \
   -H "Authorization: Bootstrap $bootstrap_secret" \
   -H "Content-Type: application/json" \
-  --data '{"owner_email":"owner@example.com","organization_name":"CacheLane Staging","organization_slug":"cachelane-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
+  --data '{"owner_email":"owner@example.com","organization_name":"FaultLane Staging","organization_slug":"faultlane-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
   "$api_url/api/v1/setup")"
 project_id="$(json_field setup.project.id <<<"$setup_response")"
 key_id="$(json_field ingest_key.id <<<"$setup_response")"
@@ -99,8 +99,8 @@ FIRST="$first" SECOND="$second" STATE="$state" node -e '
   }) + "\n");
 '
 
-if [[ "${CACHELANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
-  CACHELANE_PROOF_PROJECT_ID="$project_id" \
-    CACHELANE_PROOF_PROJECT_SLUG="windows-game" \
+if [[ "${FAULTLANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
+  FAULTLANE_PROOF_PROJECT_ID="$project_id" \
+    FAULTLANE_PROOF_PROJECT_SLUG="windows-game" \
     bash scripts/prove-symbol-upload
 fi

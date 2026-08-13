@@ -1,10 +1,10 @@
 # Bounded UE 5.8 crash request unpacking
 
-Issue: [#291](https://github.com/ishtms/cachelane/issues/291)
+Issue: [#291](https://github.com/ishtms/faultlane/issues/291)
 
 ## Outcome
 
-Add `cachelane crash unpack <request>` so a developer can inspect a UE 5.8 Crash Report Client request and receive deterministic JSON containing the envelope metadata and accepted files. Invalid or unsafe requests return a nonzero exit code with a safe error category.
+Add `faultlane crash unpack <request>` so a developer can inspect a UE 5.8 Crash Report Client request and receive deterministic JSON containing the envelope metadata and accepted files. Invalid or unsafe requests return a nonzero exit code with a safe error category.
 
 ## Context
 
@@ -30,7 +30,7 @@ This adds a decompression dependency and executable parsing path at a sensitive 
 
 ## Current behavior and evidence
 
-- `cachelane crash parse` accepts only a standalone XML file.
+- `faultlane crash parse` accepts only a standalone XML file.
 - `crates/unreal` already rejects DTDs, malformed XML, unexpected roots, and excessive XML nodes with safe errors.
 - The architecture places Unreal request parsing in a capability crate below application entrypoints.
 - The threat model requires streaming reads plus compressed, expanded, ratio, count, per-file, traversal, duplicate-file, XML, and parser limits.
@@ -48,12 +48,12 @@ This adds a decompression dependency and executable parsing path at a sensitive 
 
 ## Verification
 
-- `cargo test -p cachelane-unreal`
-- `cargo test -p cachelane-cli`
+- `cargo test -p faultlane-unreal`
+- `cargo test -p faultlane-cli`
 - `cargo check --manifest-path fuzz/Cargo.toml --bin crash_request`
-- `cargo run -p cachelane-cli -- crash unpack <synthetic-ue58-request>` twice with byte-for-byte comparison
+- `cargo run -p faultlane-cli -- crash unpack <synthetic-ue58-request>` twice with byte-for-byte comparison
 - Adversarial CLI tests cover compressed and expanded limits, ratio, file count, per-file size, traversal, absolute paths, duplicates, malformed compression, truncation, unsafe XML, malformed XML, and trailing data.
-- `cachelane crash unpack <private-ue58-request>` validates the installed UE 5.8.1 capture locally without committing it.
+- `faultlane crash unpack <private-ue58-request>` validates the installed UE 5.8.1 capture locally without committing it.
 - `./scripts/check-fast`
 - `./scripts/check`
 
@@ -95,10 +95,10 @@ The private proof used a Blueprint-only packaged Development build created by in
 - Envelope: `CR1`
 - Compressed request: 134,839 bytes
 - Expanded archive: 708,878 bytes
-- Files: `CacheLaneProof.log` at 62,907 bytes, `CrashContext.runtime-xml` at 25,254 bytes, `CrashReportClient.ini` at 342 bytes, and `UEMinidump.dmp` at 618,748 bytes
+- Files: `FaultLaneProof.log` at 62,907 bytes, `CrashContext.runtime-xml` at 25,254 bytes, `CrashReportClient.ini` at 342 bytes, and `UEMinidump.dmp` at 618,748 bytes
 
 The command returned exit code 0 twice for the captured body and emitted byte-for-byte identical version 1 manifests containing one log, one crash context, one unknown file, and one minidump. The request and matching packaged artifacts remain in a dedicated private directory outside Git.
 
 ## Result
 
-Bounded UE 5.8 crash request decoding shipped in [#338](https://github.com/ishtms/cachelane/pull/338). The synthetic adversarial suite and private installed-engine proof passed, and the request decoder fuzz target compiles with the repository checks.
+Bounded UE 5.8 crash request decoding shipped in [#338](https://github.com/ishtms/faultlane/pull/338). The synthetic adversarial suite and private installed-engine proof passed, and the request decoder fuzz target compiles with the repository checks.
