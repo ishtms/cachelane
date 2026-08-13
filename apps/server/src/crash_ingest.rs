@@ -965,6 +965,13 @@ fn random_uuid() -> Result<String, IngestError> {
 
 fn validate_spool_directory(path: &FilePath) -> Result<(), StartupError> {
     std::fs::create_dir_all(path).map_err(|_| StartupError::IngestConfiguration)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| StartupError::IngestConfiguration)?;
+    }
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| StartupError::IngestConfiguration)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1062,6 +1069,8 @@ mod tests {
         sync::Arc,
     };
 
+    #[cfg(unix)]
+    use super::validate_spool_directory;
     use super::{CrashIngest, UnrealQuery, random_uuid, source_ip, usable_crash_guid};
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
     use axum::{
@@ -1144,6 +1153,20 @@ mod tests {
             UnrealQuery::parse(Some("UploadType=crashreports&UploadType=crashreports")).is_err()
         );
         assert!(UnrealQuery::parse(Some(&"a".repeat(super::MAX_QUERY_BYTES + 1))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secures_the_spool_directory() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_spool_directory()?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))?;
+        validate_spool_directory(&directory).map_err(|_| "spool directory must be valid")?;
+        let mode = std::fs::metadata(&directory)?.permissions().mode() & 0o777;
+        std::fs::remove_dir(&directory)?;
+        assert_eq!(mode, 0o700);
+        Ok(())
     }
 
     #[tokio::test]
