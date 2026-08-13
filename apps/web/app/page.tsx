@@ -22,7 +22,7 @@ export default function Home() {
       <nav className="nav">
         <a className="brand" href="#top" aria-label="FaultLane home">
           <span className="brand-mark" aria-hidden="true">
-            C
+            F
           </span>
           FaultLane
         </a>

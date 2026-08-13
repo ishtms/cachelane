@@ -62,7 +62,7 @@ export default async function SetupPage({
       <nav className="nav">
         <Link className="brand" href="/" aria-label="FaultLane home">
           <span className="brand-mark" aria-hidden="true">
-            C
+            F
           </span>
           FaultLane
         </Link>
