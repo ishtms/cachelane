@@ -1,0 +1,19 @@
+[package]
+name = "cachelane-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cachelane-symbols = { path = "../crates/symbols" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "windows_artifact"
+path = "fuzz_targets/windows_artifact.rs"
+test = false
+doc = false
+bench = false
