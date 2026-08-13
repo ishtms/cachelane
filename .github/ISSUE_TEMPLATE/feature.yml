@@ -1,21 +1,30 @@
 name: Feature
-description: Propose a focused CacheLane product change
+description: Propose executable CacheLane product behavior
 title: ""
 labels:
   - feature
 body:
   - type: textarea
-    id: problem
+    id: outcome
     attributes:
-      label: Problem
-      description: What user problem or missing capability needs to be addressed?
+      label: Executable outcome
+      description: Complete this sentence with a real command, API, UI, or runtime entrypoint.
+      placeholder: When <actor or input> uses <entrypoint>, CacheLane now <new observable result>.
     validations:
       required: true
   - type: textarea
-    id: outcome
+    id: code
     attributes:
-      label: Expected outcome
-      description: Describe the observable result without prescribing unnecessary implementation details.
+      label: Product code
+      description: Name the executable logic, state, API, command, or UI path that must change. Documentation, research, tests, fixtures, CI, dependencies, and refactors do not qualify alone.
+    validations:
+      required: true
+  - type: input
+    id: prd
+    attributes:
+      label: PRD coverage
+      description: Name the requirement IDs or milestone deliverable this feature implements.
+      placeholder: SYM-02 or M2 admin health view
     validations:
       required: true
   - type: textarea
@@ -26,6 +35,20 @@ body:
       placeholder: |
         - [ ] ...
         - [ ] ...
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: Behavior proof
+      description: Give the exact command, request, or interaction that proves the result through its product entrypoint.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Behavior tests
+      description: Name the lowest useful tests that fail without the implementation and pass with it.
     validations:
       required: true
   - type: dropdown
