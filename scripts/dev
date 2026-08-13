@@ -22,7 +22,7 @@ docker compose \
 cargo run --package cachelane-server -- api &
 api_pid=$!
 
-PORT="${CACHELANE_WEB_PORT:-3000}" pnpm --filter @cachelane/web dev &
+PORT="${CACHELANE_WEB_PORT:-3000}" corepack pnpm --filter @cachelane/web dev &
 web_pid=$!
 
 cleanup() {

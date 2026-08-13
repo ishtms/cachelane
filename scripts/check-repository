@@ -31,6 +31,16 @@ for script in scripts/*; do
   fi
 done
 
+if grep -Eq '^corepack enable([[:space:]]|$)' scripts/setup; then
+  echo "setup must not install Corepack shims globally" >&2
+  exit 1
+fi
+
+if ! grep -Fxq "corepack pnpm install --frozen-lockfile" scripts/setup; then
+  echo "setup must install packages through Corepack" >&2
+  exit 1
+fi
+
 for package_file in package.json apps/web/package.json apps/web/tsconfig.json; do
   node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$package_file"
 done

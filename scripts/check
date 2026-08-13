@@ -6,5 +6,5 @@ cd "$repo_root"
 
 ./scripts/check-fast
 cargo build --workspace --release
-pnpm --filter @cachelane/web build
+corepack pnpm --filter @cachelane/web build
 ./scripts/check-repository
