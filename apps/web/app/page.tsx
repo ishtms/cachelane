@@ -31,7 +31,7 @@ export default function Home() {
 
       <section className="hero" id="top">
         <div className="eyebrow">
-          <span className="pulse" /> Built for Unreal Engine 5.4+
+          <span className="pulse" /> Built for Unreal Engine 5.8
         </div>
         <h1>
           Crash reports,

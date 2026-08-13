@@ -82,7 +82,7 @@ fn parses_crash_context_to_stable_json() -> Result<(), Box<dyn Error>> {
     let first = run_parse(&input)?;
     let second = run_parse(&input)?;
     let expected = concat!(
-        r#"{"parser_version":1,"crash_guid":"UECC-Synthetic-150","crash_type":"assert","error_message":null,"build_version":null,"engine_version":null,"platform":{"original":"Win64","normalized":"windows"},"architecture":null,"build_configuration":null,"modules":[],"threads":[],"system_metadata":[],"user_comment":null,"game_data":[{"name":"MapName","value":"Arena"}],"unknown_fields":{"FutureProperties":{"Zulu":["value"]},"RuntimeProperties":{"FutureField":["kept"]}}}"#,
+        r#"{"parser_version":1,"crash_guid":"UECC-Synthetic-150","crash_type":"assert","error_message":null,"build_version":null,"engine_version":"5.8.1-56057345","platform":{"original":"Win64","normalized":"windows"},"architecture":null,"build_configuration":null,"modules":[],"threads":[],"system_metadata":[],"user_comment":null,"game_data":[{"name":"MapName","value":"Arena"}],"unknown_fields":{"FutureProperties":{"Zulu":["value"]},"RuntimeProperties":{"FutureField":["kept"]}}}"#,
         "\n"
     );
 

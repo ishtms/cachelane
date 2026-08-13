@@ -516,7 +516,7 @@ mod tests {
     <CrashType>Assert</CrashType>
     <ErrorMessage>Fatal error</ErrorMessage>
     <BuildVersion>++Project+Release</BuildVersion>
-    <EngineVersion>5.4.4-123456</EngineVersion>
+    <EngineVersion>5.8.1-56057345</EngineVersion>
     <PlatformName>Win64</PlatformName>
     <PlatformArchitecture>x86_64</PlatformArchitecture>
     <BuildConfiguration>Shipping</BuildConfiguration>
@@ -715,7 +715,7 @@ C:\Engine\Core.DLL</Modules>
         assert_eq!(data.crash_type, CrashType::Assert);
         assert_eq!(data.error_message.as_deref(), Some("Fatal error"));
         assert_eq!(data.build_version.as_deref(), Some("++Project+Release"));
-        assert_eq!(data.engine_version.as_deref(), Some("5.4.4-123456"));
+        assert_eq!(data.engine_version.as_deref(), Some("5.8.1-56057345"));
         assert_eq!(data.platform, Some(NormalizedValue::platform("Win64")));
         assert_eq!(data.architecture.as_deref(), Some("x86_64"));
         assert_eq!(data.build_configuration.as_deref(), Some("Shipping"));
@@ -785,7 +785,7 @@ C:\Engine\Core.DLL</Modules>
         assert_eq!(first, second);
         assert_eq!(
             first,
-            r#"{"parser_version":1,"crash_guid":"UECC-Windows-123","crash_type":"assert","error_message":"Fatal error","build_version":"++Project+Release","engine_version":"5.4.4-123456","platform":{"original":"Win64","normalized":"windows"},"architecture":"x86_64","build_configuration":"Shipping","modules":[{"original":"C:\\Game\\Project.exe","normalized":"project"},{"original":"C:\\Engine\\Core.DLL","normalized":"core"}],"threads":[{"call_stack":"Project 0x10","crash_marker":"true","registers":"","thread_id":"42","thread_name":"GameThread"},{"call_stack":"Core 0x20","crash_marker":"false","registers":null,"thread_id":"7","thread_name":"RenderThread"}],"system_metadata":[{"name":"PlatformIsRunningWindows","value":"1"},{"name":"Misc.OSVersionMajor","value":"Windows 11"},{"name":"MemoryStats.TotalPhysical","value":"34359738368"}],"user_comment":"crashed after loading","game_data":[{"name":"MapName","value":"Arena"}],"unknown_fields":{}}"#
+            r#"{"parser_version":1,"crash_guid":"UECC-Windows-123","crash_type":"assert","error_message":"Fatal error","build_version":"++Project+Release","engine_version":"5.8.1-56057345","platform":{"original":"Win64","normalized":"windows"},"architecture":"x86_64","build_configuration":"Shipping","modules":[{"original":"C:\\Game\\Project.exe","normalized":"project"},{"original":"C:\\Engine\\Core.DLL","normalized":"core"}],"threads":[{"call_stack":"Project 0x10","crash_marker":"true","registers":"","thread_id":"42","thread_name":"GameThread"},{"call_stack":"Core 0x20","crash_marker":"false","registers":null,"thread_id":"7","thread_name":"RenderThread"}],"system_metadata":[{"name":"PlatformIsRunningWindows","value":"1"},{"name":"Misc.OSVersionMajor","value":"Windows 11"},{"name":"MemoryStats.TotalPhysical","value":"34359738368"}],"user_comment":"crashed after loading","game_data":[{"name":"MapName","value":"Arena"}],"unknown_fields":{}}"#
         );
         assert!(!first.contains("command_line"));
         assert!(!first.contains("do-not-store"));

@@ -4,7 +4,7 @@ Issue: [#42](https://github.com/ishtms/cachelane/issues/42)
 
 ## Context
 
-M0 requires deterministic parsing of `CrashContext.runtime-xml` from supported UE 5.4+ Windows reports. The repository currently has shared crash classification and normalization types, but no Unreal parsing capability or XML dependency. Rust's standard library and the current workspace dependencies do not parse XML.
+M0 requires deterministic parsing of `CrashContext.runtime-xml` from UE 5.8 Windows reports. The repository currently has shared crash classification and normalization types, but no Unreal parsing capability or XML dependency. Rust's standard library and the current workspace dependencies do not parse XML.
 
 The architecture identifies Unreal report parsing as a capability boundary. A dedicated `crates/unreal` crate keeps the XML dependency and untrusted-input handling out of the shared domain crate.
 

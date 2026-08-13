@@ -4,11 +4,11 @@ Issue: https://github.com/ishtms/cachelane/issues/282
 
 ## Context
 
-CacheLane is developed on an Apple silicon Mac, while M0 targets packaged UE 5.4 through UE 5.8 Win64 reports, PDB and PE identity, and Windows minidump symbolication. The current CI workflow has one Ubuntu job that runs `./scripts/check`. The repository has no registered self-hosted runners.
+CacheLane was developed on an Apple silicon Mac when this plan was written. M0 now targets packaged UE 5.8 Win64 reports, validated with the installed UE 5.8.1 build, plus PDB and PE identity and Windows minidump symbolication. UE 5.4 through UE 5.7 compatibility is deferred until after M2. The current CI workflow has one Ubuntu job that runs `./scripts/check`. The repository has no registered self-hosted runners.
 
 The first change should add an ephemeral GitHub-hosted x64 Windows lane. This gives every Windows-sensitive Rust and CLI change a native Windows build and test result without adding a persistent machine, credentials, private fixtures, or Unreal Engine to public CI.
 
-This lane does not replace the separate real UE fixture and end-to-end work in issues #143 through #150, #235 through #237, and #254 through #260.
+This lane does not replace the separate real UE 5.8 fixture and end-to-end work in issues #147 through #150, #235 through #237, and #254 through #260. Issues #143 through #146 now belong to the late pre-launch compatibility pass.
 
 ## Acceptance criteria
 
