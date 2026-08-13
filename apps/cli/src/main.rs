@@ -233,12 +233,12 @@ fn process_crash_request(
         .crash_context
         .as_deref()
         .ok_or(CliError::MissingRequestCrashContext)?;
-    let crash_context = CrashContextParser::new(MAX_CRASH_CONTEXT_NODES)
+    let parsed = CrashContextParser::new(MAX_CRASH_CONTEXT_NODES)
         .parse(xml)
-        .map_err(CliError::Parse)?
-        .extract(CrashContextExtractionOptions::default());
+        .map_err(CliError::Parse)?;
+    let classification = parsed.classification();
+    let crash_context = parsed.extract(CrashContextExtractionOptions::default());
     let previous = load_previous_processing(&crash_context, previous)?;
-    let classification = crash_context.classification();
     let minidump = contents.minidump.ok_or(CliError::MissingRequestMinidump)?;
     let symbolication =
         symbolicate_minidump_bytes(minidump, symbols, SymbolicationLimits::default())
