@@ -2,7 +2,7 @@
 
 Issue: [#297](https://github.com/ishtms/cachelane/issues/297)
 
-Status: Approved and in progress. Ishtmeet Singh approved the R3 plan on August 14, 2026.
+Status: Completed through PR #345 on August 14, 2026. No production deployment was performed.
 
 ## Outcome
 
