@@ -19,6 +19,14 @@ body:
       description: Name the executable logic, state, API, command, or UI path that must change. Documentation, research, tests, fixtures, CI, dependencies, and refactors do not qualify alone.
     validations:
       required: true
+  - type: input
+    id: prd
+    attributes:
+      label: PRD coverage
+      description: Name the requirement IDs or milestone deliverable this feature implements.
+      placeholder: SYM-02 or M2 admin health view
+    validations:
+      required: true
   - type: textarea
     id: acceptance
     attributes:
