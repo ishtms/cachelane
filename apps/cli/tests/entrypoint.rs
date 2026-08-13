@@ -5,6 +5,11 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "../../../crates/symbols/tests/support/mod.rs"]
+mod symbol_support;
+
+use symbol_support::{GUID, TestDirectory, write_pdb, write_pe};
+
 const MAX_CRASH_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 struct TempInput {
@@ -29,6 +34,13 @@ impl Drop for TempInput {
 fn run_parse(path: &Path) -> Result<Output, std::io::Error> {
     Command::new(env!("CARGO_BIN_EXE_cachelane"))
         .args(["crash", "parse"])
+        .arg(path)
+        .output()
+}
+
+fn run_scan(path: &Path) -> Result<Output, std::io::Error> {
+    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+        .args(["symbols", "scan"])
         .arg(path)
         .output()
 }
@@ -176,6 +188,48 @@ fn reports_missing_files_without_echoing_the_path() -> Result<(), Box<dyn Error>
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("failed to read crash context"));
+    assert!(!stderr.contains("private-do-not-echo"));
+    Ok(())
+}
+
+#[test]
+fn scans_windows_artifacts_to_stable_json() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("cli-matched")?;
+    write_pe(
+        &directory.path().join("bin/Game.exe"),
+        GUID,
+        1,
+        "Game.pdb",
+        false,
+    )?;
+    write_pdb(&directory.path().join("symbols/Game.pdb"), GUID, 2, 1)?;
+
+    let first = run_scan(directory.path())?;
+    let second = run_scan(directory.path())?;
+    let expected = concat!(
+        r#"{"schema_version":1,"artifacts":[{"path":"bin/Game.exe","module":"Game.exe","artifact_type":"pe_executable","architecture":"x86_64","size":1024,"debug_id":"00112233-4455-6677-8899-AABBCCDDEEFF-1","code_id":"123456782000","match_state":"matched","matches":["symbols/Game.pdb"],"error":null},{"path":"symbols/Game.pdb","module":"Game.pdb","artifact_type":"pdb","architecture":"x86_64","size":4096,"debug_id":"00112233-4455-6677-8899-AABBCCDDEEFF-2","code_id":null,"match_state":"matched","matches":["bin/Game.exe"],"error":null}]}"#,
+        "\n"
+    );
+
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty());
+    assert_eq!(String::from_utf8(first.stdout.clone())?, expected);
+    assert_eq!(first.stdout, second.stdout);
+    Ok(())
+}
+
+#[test]
+fn scan_errors_do_not_echo_the_root_path() -> Result<(), Box<dyn Error>> {
+    let missing = std::env::temp_dir().join(format!(
+        "cachelane-symbols-{}-private-do-not-echo",
+        std::process::id()
+    ));
+    let output = run_scan(&missing)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("failed to inspect artifact path"));
     assert!(!stderr.contains("private-do-not-echo"));
     Ok(())
 }

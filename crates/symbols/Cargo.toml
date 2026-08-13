@@ -1,5 +1,5 @@
 [package]
-name = "cachelane-cli"
+name = "cachelane-symbols"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,14 +7,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "cachelane"
-path = "src/main.rs"
-
 [dependencies]
-cachelane-symbols = { path = "../../crates/symbols" }
-cachelane-unreal = { path = "../../crates/unreal" }
-clap.workspace = true
+object.workspace = true
+pdb.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true
 
 [lints]
