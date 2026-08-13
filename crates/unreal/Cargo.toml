@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cachelane-domain = { path = "../domain" }
+flate2.workspace = true
 roxmltree.workspace = true
 serde.workspace = true
 

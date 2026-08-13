@@ -7,7 +7,10 @@ use std::{
 };
 
 use cachelane_symbols::{ScanError, scan_artifacts};
-use cachelane_unreal::{CrashContextExtractionOptions, CrashContextParser, ParseError};
+use cachelane_unreal::{
+    CrashContextExtractionOptions, CrashContextParser, CrashRequestError, CrashRequestLimits,
+    ParseError, inspect_crash_request,
+};
 use clap::{Parser, Subcommand};
 
 const MAX_CRASH_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -32,6 +35,7 @@ enum Command {
 #[derive(Subcommand)]
 enum CrashCommand {
     Parse { path: PathBuf },
+    Unpack { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -44,6 +48,8 @@ enum CliError {
     TooLarge,
     InvalidUtf8,
     Parse(ParseError),
+    RequestRead,
+    Request(CrashRequestError),
     Scan(ScanError),
     Serialize(serde_json::Error),
     Write(io::Error),
@@ -59,6 +65,8 @@ impl fmt::Display for CliError {
             ),
             Self::InvalidUtf8 => write!(formatter, "crash context must be UTF-8"),
             Self::Parse(error) => error.fmt(formatter),
+            Self::RequestRead => write!(formatter, "failed to read crash request"),
+            Self::Request(error) => error.fmt(formatter),
             Self::Scan(error) => error.fmt(formatter),
             Self::Serialize(error) => write!(formatter, "failed to serialize output: {error}"),
             Self::Write(error) => write!(formatter, "failed to write output: {error}"),
@@ -79,12 +87,24 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Some(Command::Crash(CrashCommand::Parse { path })) => parse_crash_context(&path),
+        Some(Command::Crash(CrashCommand::Unpack { path })) => unpack_crash_request(&path),
         Some(Command::Symbols(SymbolsCommand::Scan { path })) => scan_symbols(&path),
         None => {
             println!("CacheLane CLI is ready");
             Ok(())
         }
     }
+}
+
+fn unpack_crash_request(path: &Path) -> Result<(), CliError> {
+    let file = File::open(path).map_err(|_| CliError::RequestRead)?;
+    let manifest =
+        inspect_crash_request(file, CrashRequestLimits::default()).map_err(CliError::Request)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+
+    serde_json::to_writer(&mut output, &manifest).map_err(CliError::Serialize)?;
+    writeln!(output).map_err(CliError::Write)
 }
 
 fn scan_symbols(path: &Path) -> Result<(), CliError> {
