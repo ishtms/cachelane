@@ -259,17 +259,46 @@ pub fn symbolicate_minidump(
     symbol_root: &Path,
     limits: SymbolicationLimits,
 ) -> Result<SymbolicationResult, SymbolicationError> {
+    let dump_path = dump_path.to_path_buf();
+    let symbol_root = symbol_root.to_path_buf();
+    run_symbolicator(limits, move || {
+        symbolicate_inner(&dump_path, &symbol_root, limits)
+    })
+}
+
+/// Symbolicates one bounded in-memory Windows x64 minidump with local artifacts.
+///
+/// # Errors
+///
+/// Returns a safe typed error for invalid inputs, resource limits, processing failures, or timeouts.
+pub fn symbolicate_minidump_bytes(
+    dump: Vec<u8>,
+    symbol_root: &Path,
+    limits: SymbolicationLimits,
+) -> Result<SymbolicationResult, SymbolicationError> {
+    if u64::try_from(dump.len()).unwrap_or(u64::MAX) > limits.dump_bytes {
+        return Err(SymbolicationError::DumpTooLarge);
+    }
+
+    let symbol_root = symbol_root.to_path_buf();
+    run_symbolicator(limits, move || {
+        symbolicate_bytes_inner(dump, &symbol_root, limits)
+    })
+}
+
+fn run_symbolicator(
+    limits: SymbolicationLimits,
+    operation: impl FnOnce() -> Result<SymbolicationResult, SymbolicationError> + Send + 'static,
+) -> Result<SymbolicationResult, SymbolicationError> {
     if limits.wall_time.is_zero() {
         return Err(SymbolicationError::TimedOut);
     }
 
-    let dump_path = dump_path.to_path_buf();
-    let symbol_root = symbol_root.to_path_buf();
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("cachelane-symbolicator".to_owned())
         .spawn(move || {
-            let _ = sender.send(symbolicate_inner(&dump_path, &symbol_root, limits));
+            let _ = sender.send(operation());
         })
         .map_err(SymbolicationError::RuntimeFailed)?;
 
@@ -286,6 +315,14 @@ fn symbolicate_inner(
     limits: SymbolicationLimits,
 ) -> Result<SymbolicationResult, SymbolicationError> {
     let bytes = read_dump(dump_path, limits.dump_bytes)?;
+    symbolicate_bytes_inner(bytes, symbol_root, limits)
+}
+
+fn symbolicate_bytes_inner(
+    bytes: Vec<u8>,
+    symbol_root: &Path,
+    limits: SymbolicationLimits,
+) -> Result<SymbolicationResult, SymbolicationError> {
     let dump = Minidump::read(bytes).map_err(|_| SymbolicationError::InvalidDump)?;
     let system_info = dump
         .get_stream::<MinidumpSystemInfo>()
@@ -798,6 +835,18 @@ mod tests {
         let result = symbolicate_minidump(Path::new("private.dmp"), Path::new("private"), limits);
 
         assert!(matches!(result, Err(SymbolicationError::TimedOut)));
+    }
+
+    #[test]
+    fn byte_input_enforces_the_dump_limit_before_processing() {
+        let limits = SymbolicationLimits {
+            dump_bytes: 1,
+            ..SymbolicationLimits::default()
+        };
+
+        let result = symbolicate_minidump_bytes(vec![0_u8; 2], Path::new("private"), limits);
+
+        assert!(matches!(result, Err(SymbolicationError::DumpTooLarge)));
     }
 
     #[test]

@@ -22,7 +22,7 @@ mod symbolicate;
 pub use symbolicate::{
     FrameSymbolStatus, InlineSymbol, ModuleSymbolStatus, SymbolicatedFrame, SymbolicatedModule,
     SymbolicatedThread, SymbolicationError, SymbolicationErrorKind, SymbolicationLimits,
-    SymbolicationResult, ThreadUnwindStatus, symbolicate_minidump,
+    SymbolicationResult, ThreadUnwindStatus, symbolicate_minidump, symbolicate_minidump_bytes,
 };
 
 pub const ARTIFACT_SCAN_SCHEMA_VERSION: u32 = 1;
