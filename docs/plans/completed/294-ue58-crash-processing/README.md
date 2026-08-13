@@ -10,7 +10,7 @@ Extend `cachelane crash process` so a developer can pass one complete UE 5.8.1 C
 
 The Unreal request decoder validates and streams the installed UE 5.8.1 `CR1` envelope but currently discards file contents after inspection. The crash-context parser, log-tail extractor, artifact scanner, and Windows minidump symbolicator already provide the required bounded capabilities separately. Issue #293 adds the versioned processing result and history contract for extracted XML and minidump inputs. This issue composes those capabilities for the real request entrypoint without changing the attempt-history shape.
 
-The private proof is available outside Git at `C:\Users\hello\cachelane-private\ue58-blueprint-proof`. It contains a 134,839-byte request captured from installed UE 5.8.1 changelist 56057345, a 618,748-byte minidump, a 25,254-byte crash context, a 62,907-byte log, and matching `UnrealGame.exe` and `UnrealGame.pdb` artifacts. No private fixture content or path enters product output, tests, commits, or GitHub.
+The private proof is available in a dedicated directory outside Git. It contains a 134,839-byte request captured from installed UE 5.8.1 changelist 56057345, a 618,748-byte minidump, a 25,254-byte crash context, a 62,907-byte log, and matching `UnrealGame.exe` and `UnrealGame.pdb` artifacts. No private fixture content or path enters product output, tests, commits, or GitHub.
 
 ## Acceptance criteria
 
