@@ -79,6 +79,14 @@ Ship the command as an additive local feature. Roll back by reverting the pull r
 - Fingerprinting, grouping, issue history, or database event identity
 - Committing private Unreal reports or build artifacts
 
+## Result
+
+- `cachelane crash process` emits a versioned result with normalized crash context, the current symbolication attempt, and bounded prior attempts.
+- Reprocessing the synthetic crash after exact PE and PDB artifacts arrive resolves `CrashFixture()` and retains the earlier missing-symbol frames and processor versions.
+- Unchanged reprocessing is byte-stable and does not grow history.
+- Prior results are capped at 64 MiB and 16 attempts. Malformed, nested, incompatible, excessive, and cross-crash input fails with fixed safe errors.
+- The 19 CLI entrypoint tests and `scripts/check-fast` pass locally.
+
 ## Unresolved decisions
 
 None. Issue #294 will extend the processing entrypoint from extracted files to the complete UE 5.8 request without changing this result-history contract.
