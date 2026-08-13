@@ -39,4 +39,8 @@ if [[ "$setup_response" != *"Set up your first project"* ]]; then
   exit 1
 fi
 
+if [[ "${CACHELANE_SMOKE_DURABLE:-false}" == "true" ]]; then
+  bash scripts/prove-durable-ingest >/dev/null
+fi
+
 echo "smoke checks passed"

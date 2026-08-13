@@ -2,7 +2,7 @@ openapi: 3.1.1
 info:
   title: CacheLane API
   version: 0.1.0
-  description: Versioned control, setup, ingest-key, and health contract for CacheLane.
+  description: Versioned control, setup, crash ingest, and health contract for CacheLane.
 servers:
   - url: http://127.0.0.1:8080
     description: Local API development
@@ -111,6 +111,12 @@ paths:
       description: The raw ingest key is returned once.
       security:
         - bootstrapAuthorization: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestKeyPolicy"
       responses:
         "201":
           description: Ingest key created
@@ -127,15 +133,44 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{project_id}/ingest-keys/{key_id}/policy:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IngestKeyId"
+    patch:
+      operationId: updateProjectIngestKeyPolicy
+      summary: Update one ingest key environment and source allowlist
+      security:
+        - bootstrapAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestKeyPolicy"
+      responses:
+        "200":
+          description: Ingest key policy updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - setup
+                properties:
+                  setup:
+                    $ref: "#/components/schemas/ProjectSetup"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/projects/{project_id}/ingest-keys/{key_id}:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
-      - name: key_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+      - $ref: "#/components/parameters/IngestKeyId"
     delete:
       operationId: revokeProjectIngestKey
       summary: Revoke a project ingest key
@@ -148,6 +183,31 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{project_id}/events/{event_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: event_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getCrashEventState
+      summary: Get one project-scoped crash processing state
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Current crash processing state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventState"
+        "404":
+          $ref: "#/components/responses/IngestNotFound"
+        "500":
+          $ref: "#/components/responses/IngestInternalError"
   /u/{key}:
     servers:
       - url: http://127.0.0.1:8081
@@ -162,17 +222,82 @@ paths:
           pattern: ^clpk_[a-f0-9]{64}$
     post:
       operationId: submitCrashReport
-      summary: Resolve an ingest key for crash submission
-      description: Active keys are recognized, but successful crash acknowledgement remains unavailable until durable ingestion is implemented.
+      summary: Store and queue one bounded UE 5.8 crash request
+      parameters:
+        - name: AppID
+          in: query
+          schema:
+            type: string
+        - name: AppVersion
+          in: query
+          schema:
+            type: string
+        - name: AppEnvironment
+          in: query
+          schema:
+            type: string
+        - name: UploadType
+          in: query
+          required: true
+          schema:
+            type: string
+            const: crashreports
+        - name: UserID
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
       responses:
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "503":
-          description: The key is active but durable ingestion is not ready
+        "202":
+          description: Raw request and processing job are durable
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+            RateLimit-Limit:
+              $ref: "#/components/headers/RateLimitLimit"
+            RateLimit-Remaining:
+              $ref: "#/components/headers/RateLimitRemaining"
+            RateLimit-Reset:
+              $ref: "#/components/headers/RateLimitReset"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/AcceptedCrash"
+        "400":
+          $ref: "#/components/responses/InvalidCrashRequest"
+        "404":
+          $ref: "#/components/responses/IngestNotFound"
+        "413":
+          $ref: "#/components/responses/CrashRequestTooLarge"
+        "429":
+          description: Project or source rate limit exceeded
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                const: 60
+            RateLimit-Limit:
+              $ref: "#/components/headers/RateLimitLimit"
+            RateLimit-Remaining:
+              $ref: "#/components/headers/RateLimitRemaining"
+            RateLimit-Reset:
+              $ref: "#/components/headers/RateLimitReset"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestError"
+        "500":
+          $ref: "#/components/responses/IngestInternalError"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
 components:
   securitySchemes:
     bootstrapAuthorization:
@@ -188,6 +313,29 @@ components:
       schema:
         type: string
         format: uuid
+    IngestKeyId:
+      name: key_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  headers:
+    RateLimitLimit:
+      description: The tighter applicable request limit.
+      schema:
+        type: integer
+        minimum: 1
+    RateLimitRemaining:
+      description: Requests remaining in the current fixed window.
+      schema:
+        type: integer
+        minimum: 0
+    RateLimitReset:
+      description: Seconds until the fixed window resets.
+      schema:
+        type: integer
+        const: 60
   responses:
     InvalidRequest:
       description: Request validation failed
@@ -207,6 +355,36 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InvalidCrashRequest:
+      description: Crash request transport or envelope validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IngestError"
+    IngestNotFound:
+      description: The ingest resource is unavailable or the event is outside the caller's scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IngestError"
+    CrashRequestTooLarge:
+      description: Crash request exceeded a configured resource limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IngestError"
+    IngestInternalError:
+      description: Crash request could not be completed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IngestError"
+    IngestUnavailable:
+      description: Crash ingestion is temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IngestError"
   schemas:
     Health:
       type: object
@@ -294,6 +472,8 @@ components:
       required:
         - id
         - display_suffix
+        - environment
+        - allowed_cidrs
         - created_at
         - revoked_at
       properties:
@@ -303,6 +483,14 @@ components:
         display_suffix:
           type: string
           pattern: ^[a-f0-9]{8}$
+        environment:
+          $ref: "#/components/schemas/Environment"
+        allowed_cidrs:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            description: IPv4 or IPv6 CIDR
         created_at:
           type: string
           format: date-time
@@ -311,6 +499,26 @@ components:
             - string
             - "null"
           format: date-time
+    Environment:
+      type: string
+      minLength: 1
+      maxLength: 32
+      pattern: ^[a-z0-9][a-z0-9-]{0,31}$
+    IngestKeyPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - environment
+      properties:
+        environment:
+          $ref: "#/components/schemas/Environment"
+        allowed_cidrs:
+          type: array
+          maxItems: 32
+          default: []
+          items:
+            type: string
+            description: IPv4 or IPv6 CIDR
     ProjectSetup:
       type: object
       additionalProperties: false
@@ -385,6 +593,100 @@ components:
           format: uri
         configuration:
           $ref: "#/components/schemas/UnrealConfiguration"
+    AcceptedCrash:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - state
+        - deduplicated
+        - received_at
+        - status_path
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        state:
+          $ref: "#/components/schemas/ProcessingState"
+        deduplicated:
+          type: boolean
+        received_at:
+          type: string
+          format: date-time
+        status_path:
+          type: string
+    ProcessingState:
+      type: string
+      enum:
+        - received
+        - stored
+        - parsed
+        - awaiting_symbols
+        - symbolicating
+        - processed
+        - failed
+        - quarantined
+    EventState:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - project_id
+        - environment
+        - crash_guid
+        - state
+        - reason
+        - retryable
+        - retry_at
+        - received_at
+        - updated_at
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        environment:
+          $ref: "#/components/schemas/Environment"
+        crash_guid:
+          type:
+            - string
+            - "null"
+        state:
+          $ref: "#/components/schemas/ProcessingState"
+        reason:
+          type:
+            - string
+            - "null"
+          pattern: ^[a-z0-9][a-z0-9_]{0,63}$
+        retryable:
+          type: boolean
+        retry_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        received_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    IngestError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
     Error:
       type: object
       additionalProperties: false

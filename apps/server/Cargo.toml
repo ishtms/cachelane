@@ -9,18 +9,26 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
+cachelane-domain = { path = "../../crates/domain" }
+cachelane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
+ipnet.workspace = true
+object_store.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+flate2.workspace = true
 tower.workspace = true
 
 [lints]

@@ -17,7 +17,13 @@ docker compose \
   --project-name "${CACHELANE_COMPOSE_PROJECT:-cachelane}" \
   --env-file .env \
   -f deploy/docker-compose/compose.yml \
-  up -d --wait
+  up -d --wait postgres minio
+
+docker compose \
+  --project-name "${CACHELANE_COMPOSE_PROJECT:-cachelane}" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  run --rm minio-init
 
 cargo run --package cachelane-server -- migrate
 

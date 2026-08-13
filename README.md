@@ -6,7 +6,7 @@ The current target is packaged Unreal Engine 5.8 games on Windows, validated aga
 
 ## Current status
 
-The repository includes the first-project setup flow, Windows crash-processing feasibility work, local PostgreSQL and MinIO services, and deterministic verification. Local bootstrap setup creates an owner, organization, project, and write-only ingest key. Durable crash ingestion remains unavailable until its storage boundary is implemented.
+The repository includes first-project setup, durable Windows crash ingest, crash-processing feasibility work, local PostgreSQL and MinIO services, and deterministic verification. Local bootstrap setup creates an owner, organization, project, and write-only environment key. A bounded UE 5.8 crash request is stored in the private local bucket before CacheLane acknowledges it and queues processing.
 
 No production deployment is configured.
 
@@ -38,7 +38,7 @@ Requirements:
 ./scripts/dev
 ```
 
-The web app runs at `http://127.0.0.1:3000`, the API at `http://127.0.0.1:8080`, and the ingest boundary at `http://127.0.0.1:8081` by default. Open `http://127.0.0.1:3000/setup` to create the first project. Bootstrap setup is loopback-only and uses the development secret in `.env`. Edit that file to isolate ports and the Compose project name for another worktree.
+The web app runs at `http://127.0.0.1:3000`, the API at `http://127.0.0.1:8080`, and the ingest boundary at `http://127.0.0.1:8081` by default. Open `http://127.0.0.1:3000/setup` to create the first project. Bootstrap setup is loopback-only and uses the development secret in `.env`. MinIO initialization creates the private development bucket. Edit `.env` to isolate ports and the Compose project name for another worktree.
 
 Run the command-line application locally with:
 
@@ -55,6 +55,7 @@ cargo run -p cachelane-cli -- --help
 ```
 
 `./scripts/check` is the canonical pre-PR command and is also used by CI. `./scripts/smoke` expects the local application or a target environment to be running.
+Set `CACHELANE_SMOKE_DURABLE=true` for an empty isolated target to include one real crash upload, duplicate retry, and state read.
 
 ## License
 

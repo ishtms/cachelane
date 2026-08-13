@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod crash_ingest;
 mod project_setup;
 
 use project_setup::{ServerState, migrate, router};
@@ -53,11 +54,16 @@ async fn serve(
         .and_then(|value| value.parse().ok())
         .unwrap_or(default_port);
     let address: SocketAddr = format!("{host}:{port}").parse()?;
-    let state = ServerState::from_environment(&host).await?;
+    let state = ServerState::from_environment(&host, role).await?;
+    state.start_maintenance(role);
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     info!(%address, role, "server started");
-    axum::serve(listener, router(role, state)).await?;
+    axum::serve(
+        listener,
+        router(role, state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
