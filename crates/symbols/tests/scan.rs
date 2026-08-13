@@ -2,8 +2,11 @@ mod support;
 
 use std::{error::Error, fs, fs::File};
 
-use cachelane_symbols::{ArtifactErrorCode, ArtifactType, MatchState, scan_artifacts};
-use support::{GUID, TestDirectory, write_pdb, write_pe};
+use cachelane_symbols::{
+    ArtifactErrorCode, ArtifactScanLimits, ArtifactType, MatchState, ScanError, scan_artifacts,
+    scan_artifacts_with_limits,
+};
+use support::{GUID, TestDirectory, write_large_dbi_pdb, write_pdb, write_pe};
 
 #[test]
 fn scans_and_matches_pe_and_pdb_by_identity() -> Result<(), Box<dyn Error>> {
@@ -103,4 +106,75 @@ fn missing_root_errors_do_not_echo_the_path() {
 
     assert_eq!(error.to_string(), "failed to inspect artifact path");
     assert!(!error.to_string().contains("private-do-not-echo"));
+}
+
+#[test]
+fn reads_large_dbi_identity_without_loading_the_stream() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("large-dbi")?;
+    write_large_dbi_pdb(&directory.path().join("Game.pdb"), GUID, 2, 1, 36_716_544)?;
+
+    let scan = scan_artifacts(directory.path())?;
+
+    assert_eq!(scan.artifacts.len(), 1);
+    assert_eq!(
+        scan.artifacts[0].architecture,
+        Some(cachelane_symbols::Architecture::X86_64)
+    );
+    assert_eq!(
+        scan.artifacts[0].debug_id.as_deref(),
+        Some("00112233-4455-6677-8899-AABBCCDDEEFF-2")
+    );
+    assert!(scan.artifacts[0].error.is_none());
+    Ok(())
+}
+
+#[test]
+fn enforces_artifact_tree_limits() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("limits")?;
+    fs::write(directory.path().join("Game.exe"), b"artifact")?;
+    fs::write(directory.path().join("ignored.txt"), b"entry")?;
+    fs::create_dir(directory.path().join("nested"))?;
+    fs::write(directory.path().join("nested/Game.pdb"), b"artifact")?;
+
+    let base = ArtifactScanLimits {
+        entries: usize::MAX,
+        depth: usize::MAX,
+        files: usize::MAX,
+        file_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    };
+    for (limits, expected) in [
+        (
+            ArtifactScanLimits { entries: 0, ..base },
+            ScanError::TooManyEntries,
+        ),
+        (
+            ArtifactScanLimits { depth: 0, ..base },
+            ScanError::DirectoryDepthExceeded,
+        ),
+        (
+            ArtifactScanLimits { files: 0, ..base },
+            ScanError::TooManyFiles,
+        ),
+        (
+            ArtifactScanLimits {
+                file_bytes: 0,
+                ..base
+            },
+            ScanError::ArtifactTooLarge,
+        ),
+        (
+            ArtifactScanLimits {
+                total_bytes: 0,
+                ..base
+            },
+            ScanError::TotalSizeExceeded,
+        ),
+    ] {
+        let Err(error) = scan_artifacts_with_limits(directory.path(), limits) else {
+            panic!("limit must reject the artifact tree");
+        };
+        assert_eq!(error.to_string(), expected.to_string());
+    }
+    Ok(())
 }

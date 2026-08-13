@@ -55,6 +55,15 @@ fn run_scan(path: &Path) -> Result<Output, std::io::Error> {
         .output()
 }
 
+fn run_symbolicate(dump: &Path, symbols: &Path) -> Result<Output, std::io::Error> {
+    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+        .args(["crash", "symbolicate"])
+        .arg(dump)
+        .arg("--symbols")
+        .arg(symbols)
+        .output()
+}
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -367,6 +376,113 @@ fn scan_errors_do_not_echo_the_root_path() -> Result<(), Box<dyn Error>> {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("failed to inspect artifact path"));
+    assert!(!stderr.contains("private-do-not-echo"));
+    Ok(())
+}
+
+#[test]
+fn symbolicates_a_windows_minidump_to_stable_json() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = directory.join("cachelane-symbolication.dmp");
+    let first = run_symbolicate(&dump, &directory)?;
+    let second = run_symbolicate(&dump, &directory)?;
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    let result: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    let threads = result["threads"].as_array().ok_or("missing threads")?;
+    assert!(threads[0]["faulting"].as_bool().is_some_and(|value| value));
+    assert!(
+        result["modules"]
+            .as_array()
+            .ok_or("missing modules")?
+            .iter()
+            .any(|module| {
+                module["module"] == "cachelane-symbolication.exe"
+                    && module["status"] == "matched"
+                    && module["code_id"] == "823B128D8000"
+                    && module["debug_id"] == "80AC8B00-5C85-685B-8EF9-2D757F9A2125-3"
+            })
+    );
+    let frames = threads[0]["frames"].as_array().ok_or("missing frames")?;
+    let crash = frames
+        .iter()
+        .find(|frame| frame["function"] == "CrashFixture()")
+        .ok_or("missing fixture frame")?;
+    assert_eq!(crash["symbol_status"], "resolved");
+    assert_eq!(crash["source_file"], r"Z:\cachelane-fixture\source.cpp");
+    assert_eq!(crash["source_line"], 16);
+    assert!(crash["inlines"].as_array().is_some_and(|inlines| {
+        inlines
+            .iter()
+            .any(|inline| inline["function"] == "RaiseFixtureException(long*)")
+    }));
+    Ok(())
+}
+
+#[test]
+fn keeps_partial_frames_for_missing_and_mismatched_symbols() -> Result<(), Box<dyn Error>> {
+    let fixture_directory = fixture("windows-symbolication");
+    let dump = fixture_directory.join("cachelane-symbolication.dmp");
+    let missing = TestDirectory::new("symbolicate-missing")?;
+    fs::copy(
+        fixture_directory.join("cachelane-symbolication.exe"),
+        missing.path().join("cachelane-symbolication.exe"),
+    )?;
+    let missing_output = run_symbolicate(&dump, missing.path())?;
+    assert!(missing_output.status.success());
+    let missing_result: serde_json::Value = serde_json::from_slice(&missing_output.stdout)?;
+    assert!(
+        missing_result["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.iter().any(|module| {
+                module["module"] == "cachelane-symbolication.exe"
+                    && module["status"] == "missing_pdb"
+            }))
+    );
+    assert!(
+        missing_result["threads"][0]["frames"]
+            .as_array()
+            .is_some_and(|frames| !frames.is_empty())
+    );
+
+    let mismatched = TestDirectory::new("symbolicate-mismatched")?;
+    write_pe(
+        &mismatched.path().join("cachelane-symbolication.exe"),
+        GUID,
+        1,
+        "cachelane-symbolication.pdb",
+        false,
+    )?;
+    let mismatched_output = run_symbolicate(&dump, mismatched.path())?;
+    assert!(mismatched_output.status.success());
+    let mismatched_result: serde_json::Value = serde_json::from_slice(&mismatched_output.stdout)?;
+    assert!(
+        mismatched_result["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.iter().any(|module| {
+                module["module"] == "cachelane-symbolication.exe"
+                    && module["status"] == "mismatched"
+            }))
+    );
+    Ok(())
+}
+
+#[test]
+fn symbolication_errors_do_not_echo_private_inputs() -> Result<(), Box<dyn Error>> {
+    let input = TempInput::new("private-do-not-echo.dmp", b"private-do-not-echo")?;
+    let symbols = TestDirectory::new("symbolicate-errors")?;
+    let output = run_symbolicate(&input.path, symbols.path())?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("invalid minidump"));
     assert!(!stderr.contains("private-do-not-echo"));
     Ok(())
 }

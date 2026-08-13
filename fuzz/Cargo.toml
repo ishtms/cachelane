@@ -11,6 +11,7 @@ cargo-fuzz = true
 cachelane-symbols = { path = "../crates/symbols" }
 cachelane-unreal = { path = "../crates/unreal" }
 libfuzzer-sys = "0.4"
+minidump = "=0.27.0"
 
 [[bin]]
 name = "windows_artifact"
@@ -22,6 +23,13 @@ bench = false
 [[bin]]
 name = "crash_request"
 path = "fuzz_targets/crash_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "minidump"
+path = "fuzz_targets/minidump.rs"
 test = false
 doc = false
 bench = false

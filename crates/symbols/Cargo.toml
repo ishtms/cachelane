@@ -8,9 +8,13 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+minidump.workspace = true
+minidump-processor.workspace = true
+minidump-unwind.workspace = true
 object.workspace = true
 pdb.workspace = true
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
