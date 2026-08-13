@@ -2,6 +2,7 @@
   <RuntimeProperties>
     <CrashGUID>UECC-Synthetic-150</CrashGUID>
     <CrashType>Assert</CrashType>
+    <EngineVersion>5.8.1-56057345</EngineVersion>
     <PlatformName>Win64</PlatformName>
     <CommandLine>-token=do-not-print</CommandLine>
     <FutureField>kept</FutureField>

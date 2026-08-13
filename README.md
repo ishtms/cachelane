@@ -2,7 +2,7 @@
 
 CacheLane is an Unreal-native crash analytics and symbolication platform. It receives Unreal Engine crash reports, stores their original artifacts, matches exact debug information, produces readable stacks, and groups repeated failures into issues.
 
-The initial target is packaged Unreal Engine 5.4+ games on Windows. Basic desktop reporting will use Unreal's built-in Crash Report Client, so a runtime SDK is not required.
+The current target is packaged Unreal Engine 5.8 games on Windows, validated against the installed UE 5.8.1 build. Basic desktop reporting will use Unreal's built-in Crash Report Client, so a runtime SDK is not required. Earlier engine versions will be tested during the late pre-launch compatibility pass.
 
 ## Current status
 
