@@ -10,12 +10,17 @@ repository.workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 serde.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tower.workspace = true
 
 [lints]

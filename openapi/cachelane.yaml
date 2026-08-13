@@ -2,10 +2,10 @@ openapi: 3.1.1
 info:
   title: CacheLane API
   version: 0.1.0
-  description: Versioned control and health contract for CacheLane.
+  description: Versioned control, setup, ingest-key, and health contract for CacheLane.
 servers:
   - url: http://127.0.0.1:8080
-    description: Local development
+    description: Local API development
 paths:
   /health/live:
     get:
@@ -40,7 +40,173 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Health"
+  /api/v1/setup:
+    post:
+      operationId: createInitialProject
+      summary: Create the first owner, organization, project, and ingest key
+      description: Available only when loopback bootstrap authentication is explicitly enabled. The raw ingest key is returned once.
+      security:
+        - bootstrapAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSetupRequest"
+      responses:
+        "201":
+          description: Initial project created
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedSetup"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Initial setup is already complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/projects/{project_id}/setup:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectSetup
+      summary: Get setup details without raw ingest keys
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Project setup details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - setup
+                properties:
+                  setup:
+                    $ref: "#/components/schemas/ProjectSetup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{project_id}/ingest-keys:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createProjectIngestKey
+      summary: Create another write-only ingest key
+      description: The raw ingest key is returned once.
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "201":
+          description: Ingest key created
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedSetup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{project_id}/ingest-keys/{key_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: key_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: revokeProjectIngestKey
+      summary: Revoke a project ingest key
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "204":
+          description: Ingest key revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /u/{key}:
+    servers:
+      - url: http://127.0.0.1:8081
+        description: Local ingest development
+    parameters:
+      - name: key
+        in: path
+        required: true
+        description: Write-only project ingest key
+        schema:
+          type: string
+          pattern: ^clpk_[a-f0-9]{64}$
+    post:
+      operationId: submitCrashReport
+      summary: Resolve an ingest key for crash submission
+      description: Active keys are recognized, but successful crash acknowledgement remains unavailable until durable ingestion is implemented.
+      responses:
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: The key is active but durable ingestion is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 components:
+  securitySchemes:
+    bootstrapAuthorization:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Loopback-only Authorization header using the value Bootstrap followed by the configured secret.
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    InvalidRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Bootstrap authorization is missing or invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: The resource is unavailable or outside the caller's organization
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
   schemas:
     Health:
       type: object
@@ -60,4 +226,173 @@ components:
           type: string
           const: ok
         version:
+          type: string
+    CreateSetupRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - owner_email
+        - organization_name
+        - organization_slug
+        - project_name
+        - project_slug
+      properties:
+        owner_email:
+          type: string
+          format: email
+          maxLength: 254
+        organization_name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        organization_slug:
+          $ref: "#/components/schemas/Slug"
+        project_name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        project_slug:
+          $ref: "#/components/schemas/Slug"
+    Slug:
+      type: string
+      minLength: 1
+      maxLength: 63
+      pattern: ^[a-z0-9]+(?:-[a-z0-9]+)*$
+    Organization:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - slug
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+    Project:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - slug
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+    IngestKey:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - display_suffix
+        - created_at
+        - revoked_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_suffix:
+          type: string
+          pattern: ^[a-f0-9]{8}$
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+    ProjectSetup:
+      type: object
+      additionalProperties: false
+      required:
+        - owner_id
+        - organization
+        - project
+        - ingest_keys
+      properties:
+        owner_id:
+          type: string
+          format: uuid
+        organization:
+          $ref: "#/components/schemas/Organization"
+        project:
+          $ref: "#/components/schemas/Project"
+        ingest_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/IngestKey"
+    SecretIngestKey:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - value
+        - display_suffix
+      properties:
+        id:
+          type: string
+          format: uuid
+        value:
+          type: string
+          pattern: ^clpk_[a-f0-9]{64}$
+          readOnly: true
+          description: Write-only credential value returned only when the key is created.
+        display_suffix:
+          type: string
+          pattern: ^[a-f0-9]{8}$
+    UnrealConfiguration:
+      type: object
+      additionalProperties: false
+      required:
+        - default_game_ini_path
+        - default_game_ini
+        - default_engine_ini_path
+        - default_engine_ini
+      properties:
+        default_game_ini_path:
+          type: string
+        default_game_ini:
+          type: string
+        default_engine_ini_path:
+          type: string
+        default_engine_ini:
+          type: string
+    CreatedSetup:
+      type: object
+      additionalProperties: false
+      required:
+        - setup
+        - ingest_key
+        - data_router_url
+        - configuration
+      properties:
+        setup:
+          $ref: "#/components/schemas/ProjectSetup"
+        ingest_key:
+          $ref: "#/components/schemas/SecretIngestKey"
+        data_router_url:
+          type: string
+          format: uri
+        configuration:
+          $ref: "#/components/schemas/UnrealConfiguration"
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
           type: string

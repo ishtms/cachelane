@@ -2,11 +2,11 @@
 
 CacheLane is an Unreal-native crash analytics and symbolication platform. It receives Unreal Engine crash reports, stores their original artifacts, matches exact debug information, produces readable stacks, and groups repeated failures into issues.
 
-The current target is packaged Unreal Engine 5.8 games on Windows, validated against the installed UE 5.8.1 build. Basic desktop reporting will use Unreal's built-in Crash Report Client, so a runtime SDK is not required. Earlier engine versions will be tested during the late pre-launch compatibility pass.
+The current target is packaged Unreal Engine 5.8 games on Windows, validated against the installed UE 5.8.1 build. Basic desktop reporting uses Unreal's built-in Crash Report Client, so a runtime SDK is not required. Earlier engine versions will be tested during the late pre-launch compatibility pass.
 
 ## Current status
 
-The repository is in its foundation phase. It contains the Rust and Next.js monorepo scaffold, local PostgreSQL and MinIO services, deterministic checks, security boundaries, and the workflow needed to begin protocol and symbolication feasibility work.
+The repository includes the first-project setup flow, Windows crash-processing feasibility work, local PostgreSQL and MinIO services, and deterministic verification. Local bootstrap setup creates an owner, organization, project, and write-only ingest key. Durable crash ingestion remains unavailable until its storage boundary is implemented.
 
 No production deployment is configured.
 
@@ -38,7 +38,7 @@ Requirements:
 ./scripts/dev
 ```
 
-The web app runs at `http://127.0.0.1:3000` and the API runs at `http://127.0.0.1:8080` by default. Edit the development-only `.env` file to isolate ports and the Compose project name for another worktree.
+The web app runs at `http://127.0.0.1:3000`, the API at `http://127.0.0.1:8080`, and the ingest boundary at `http://127.0.0.1:8081` by default. Open `http://127.0.0.1:3000/setup` to create the first project. Bootstrap setup is loopback-only and uses the development secret in `.env`. Edit that file to isolate ports and the Compose project name for another worktree.
 
 Run the command-line application locally with:
 
