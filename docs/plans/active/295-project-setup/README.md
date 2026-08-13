@@ -2,7 +2,7 @@
 
 Issue: [#295](https://github.com/ishtms/cachelane/issues/295)
 
-Status: Proposed. R3 implementation requires human approval.
+Status: Approved by Ishtmeet Singh on August 13, 2026. Implementation may proceed without production deployment.
 
 ## Outcome
 
@@ -152,12 +152,12 @@ Rollback disables the project routes and bootstrap adapter, then restores the pr
 - PostgreSQL row-level security activation before the hosted identity and connection model is selected
 - Production credentials, production data, deployment configuration, or cloud-provider selection
 
-## Approval required
+## Approved decisions
 
-Implementation must not begin until a human approves all three decisions:
+Ishtmeet Singh approved all three decisions on August 13, 2026:
 
 1. Use the loopback-only bootstrap administrator adapter until #310 adds hosted authentication.
 2. Prove the ingest key at the authorization boundary without returning successful crash acceptance before #296.
 3. Treat isolated local Docker Compose evidence as the staging gate for this non-deployed change.
 
-If any decision is rejected, update the issue dependency order and this plan before moving #295 to Ready.
+Any change to these decisions requires another plan review before implementation continues.
