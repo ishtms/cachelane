@@ -93,6 +93,23 @@ fn run_process(
     command.output()
 }
 
+fn run_request_process(
+    request: &Path,
+    symbols: &Path,
+    previous: Option<&Path>,
+) -> Result<Output, std::io::Error> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cachelane"));
+    command
+        .args(["crash", "process"])
+        .arg(request)
+        .arg("--symbols")
+        .arg(symbols);
+    if let Some(previous) = previous {
+        command.arg("--previous").arg(previous);
+    }
+    command.output()
+}
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -716,6 +733,183 @@ fn process_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
         assert!(output.stdout.is_empty());
         assert!(stderr.contains(expected), "{name}: {stderr}");
         assert!(!stderr.contains("private-do-not-echo"));
+    }
+    Ok(())
+}
+
+#[test]
+fn processes_a_complete_crash_request_and_reprocesses_it() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let crash_context = fs::read(fixture("crash-context.xml"))?;
+    let log = b"LogCacheLane: old\nLogCacheLane: newest\n";
+    let request = crash_request(&[
+        ("CrashContext.runtime-xml", &crash_context),
+        ("Synthetic.log", log),
+        ("UEMinidump.dmp", &dump),
+        ("Future.bin", b"do-not-retain"),
+    ])?;
+    let input = TempInput::new("complete-request.uecrash", &request)?;
+    let empty_symbols = TestDirectory::new("request-process-empty")?;
+    let first = run_request_process(&input.path, empty_symbols.path(), None)?;
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    let partial: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(partial["request"]["schema_version"], 1);
+    assert_eq!(partial["request"]["envelope"], "cr1");
+    assert_eq!(
+        partial["request"]["files"].as_array().map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(partial["classification"]["crash_type"], "assert");
+    assert_eq!(partial["classification"]["confidence"], "high");
+    assert_eq!(
+        partial["crash_context"]["unknown_fields"]["FutureProperties"]["Zulu"],
+        serde_json::json!(["value"])
+    );
+    assert_eq!(partial["log"]["name"], "Synthetic.log");
+    assert_eq!(
+        partial["log"]["tail"]["text"],
+        "LogCacheLane: old\nLogCacheLane: newest\n"
+    );
+    assert!(
+        partial["current"]["symbolication"]["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.iter().any(|module| {
+                module["module"] == "cachelane-symbolication.exe"
+                    && module["status"] == "missing_pe"
+            }))
+    );
+
+    let previous = TempInput::new("complete-request-partial.json", &first.stdout)?;
+    let second = run_request_process(&input.path, &directory, Some(&previous.path))?;
+    let repeated = run_request_process(&input.path, &directory, Some(&previous.path))?;
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.stderr.is_empty());
+    assert_eq!(second.stdout, repeated.stdout);
+    let resolved: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    assert_eq!(resolved["history"].as_array().map(Vec::len), Some(1));
+    assert_eq!(resolved["history"][0], partial["current"]);
+    let frames = resolved["current"]["symbolication"]["threads"][0]["frames"]
+        .as_array()
+        .ok_or("missing resolved frames")?;
+    let crash = frames
+        .iter()
+        .find(|frame| frame["function"] == "CrashFixture()")
+        .ok_or("missing resolved fixture frame")?;
+    assert_eq!(crash["module"], "cachelane-symbolication.exe");
+    assert_eq!(crash["source_file"], r"Z:\cachelane-fixture\source.cpp");
+    assert_eq!(crash["source_line"], 16);
+    assert!(crash["trust"].as_str().is_some());
+    assert!(crash["inlines"].as_array().is_some_and(|inlines| {
+        inlines
+            .iter()
+            .any(|inline| inline["function"] == "RaiseFixtureException(long*)")
+    }));
+    Ok(())
+}
+
+#[test]
+fn exposes_classification_evidence_through_request_processing() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let crash_context = br"<FGenericCrashContext><RuntimeProperties>
+  <CrashGUID>UECC-Synthetic-Signals</CrashGUID>
+  <CrashType>GPU Crash</CrashType>
+  <ErrorMessage>GPU crashed after out of memory: do-not-copy</ErrorMessage>
+  <MemoryStats.bIsOOM>1</MemoryStats.bIsOOM>
+</RuntimeProperties></FGenericCrashContext>";
+    let request = crash_request(&[
+        ("CrashContext.runtime-xml", crash_context),
+        ("UEMinidump.dmp", &dump),
+    ])?;
+    let input = TempInput::new("classified-request.uecrash", &request)?;
+    let output = run_request_process(&input.path, &directory, None)?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        result["classification"]["signals"]
+            .as_array()
+            .is_some_and(|signals| {
+                signals.iter().any(|signal| {
+                    signal["kind"] == "out_of_memory" && signal["confidence"] == "high"
+                }) && signals
+                    .iter()
+                    .any(|signal| signal["kind"] == "gpu_crash" && signal["confidence"] == "high")
+            })
+    );
+    let classification = serde_json::to_string(&result["classification"])?;
+    assert!(classification.contains("crash_context.memory_stats.is_oom"));
+    assert!(classification.contains("crash_context.crash_type_gpu"));
+    assert!(!classification.contains("do-not-copy"));
+    Ok(())
+}
+
+#[test]
+fn request_processing_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
+    let directory = fixture("windows-symbolication");
+    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let context = fs::read(fixture("crash-context.xml"))?;
+    let missing_context = crash_request(&[("UEMinidump.dmp", &dump)])?;
+    let missing_dump = crash_request(&[("CrashContext.runtime-xml", &context)])?;
+    let malformed_context = crash_request(&[
+        (
+            "CrashContext.runtime-xml",
+            b"<FGenericCrashContext><Secret>do-not-echo</FGenericCrashContext>",
+        ),
+        ("UEMinidump.dmp", &dump),
+    ])?;
+    let invalid_dump = crash_request(&[
+        ("CrashContext.runtime-xml", &context),
+        ("UEMinidump.dmp", b"do-not-echo"),
+    ])?;
+
+    for (name, request, expected) in [
+        (
+            "missing-context.uecrash",
+            missing_context,
+            "crash request has no crash context",
+        ),
+        (
+            "missing-dump.uecrash",
+            missing_dump,
+            "crash request has no minidump",
+        ),
+        (
+            "malformed-context.uecrash",
+            malformed_context,
+            "invalid crash context XML",
+        ),
+        ("invalid-dump.uecrash", invalid_dump, "invalid minidump"),
+        (
+            "malformed-request.uecrash",
+            b"do-not-echo".to_vec(),
+            "invalid crash request compression",
+        ),
+    ] {
+        let input = TempInput::new(name, &request)?;
+        let output = run_request_process(&input.path, &directory, None)?;
+        let stderr = String::from_utf8(output.stderr)?;
+
+        assert!(!output.status.success(), "{name}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!stderr.contains("do-not-echo"));
     }
     Ok(())
 }

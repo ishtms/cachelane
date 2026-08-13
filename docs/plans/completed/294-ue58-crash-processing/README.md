@@ -84,6 +84,14 @@ Ship the request mode as an additive local CLI path after #293. Roll back by rev
 - Committing the real UE request, packaged build, minidump, PE, PDB, or raw output
 - Compatibility claims outside installed UE 5.8.1
 
+## Result
+
+- `cachelane crash process <request> --symbols <path> [--previous <result>]` composes request decoding, normalized crash context, bounded log output, classification, and Windows symbolication through one command.
+- Synthetic request tests prove exact module, function, source file, source line, inline frame, trust, processor versions, missing-symbol output, prior history, deterministic output, and fixed safe failures.
+- Classification tests cover structured Crash, Assert, Ensure, OOM, and GPU evidence plus medium-confidence normalized error patterns without copying source payloads into evidence.
+- The private UE 5.8.1 request produced four request records, a bounded log tail, six faulting frames, four readable frames, one matched module, and byte-identical output across repeated runs. The private files and output remained outside Git.
+- The Unreal, request, symbols, CLI, and fuzz boundaries pass their focused tests and strict Clippy checks.
+
 ## Unresolved decisions
 
 None. Request processing remains an additive mode on the result and history contract from #293.
