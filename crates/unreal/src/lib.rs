@@ -8,7 +8,7 @@ mod request;
 pub use request::{
     CrashRequestContents, CrashRequestError, CrashRequestErrorKind, CrashRequestFile,
     CrashRequestFileKind, CrashRequestLimits, CrashRequestLog, CrashRequestManifest,
-    inspect_crash_request, read_crash_request,
+    inspect_crash_envelope, inspect_crash_request, read_crash_request,
 };
 
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";

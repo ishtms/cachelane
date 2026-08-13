@@ -2,7 +2,7 @@ use std::{error::Error, io::Write};
 
 use cachelane_unreal::{
     CrashRequestErrorKind, CrashRequestFile, CrashRequestFileKind, CrashRequestLimits,
-    inspect_crash_request, read_crash_request,
+    inspect_crash_envelope, inspect_crash_request, read_crash_request,
 };
 use flate2::{Compression, write::ZlibEncoder};
 
@@ -108,6 +108,18 @@ fn inspects_real_format_records_in_source_order() -> Result<(), Box<dyn Error>> 
             },
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn envelope_inspection_does_not_parse_crash_contents() -> Result<(), Box<dyn Error>> {
+    let request = crash_request(&[(
+        "CrashContext.runtime-xml",
+        b"<FGenericCrashContext><secret>malformed",
+    )])?;
+
+    inspect_crash_envelope(&request.compressed[..], CrashRequestLimits::default())?;
+    assert!(inspect_crash_request(&request.compressed[..], CrashRequestLimits::default()).is_err());
     Ok(())
 }
 

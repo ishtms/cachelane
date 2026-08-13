@@ -19,6 +19,22 @@ jobs:
     name: check
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CACHELANE_TEST_DATABASE_URL: postgres://cachelane_296:cachelane_296_dev@127.0.0.1:5432/cachelane_296
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: cachelane_296
+          POSTGRES_PASSWORD: cachelane_296_dev
+          POSTGRES_USER: cachelane_296
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cachelane_296 -d cachelane_296"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020

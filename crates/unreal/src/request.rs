@@ -446,6 +446,7 @@ fn inspect_files(
     file_count: u64,
     limits: CrashRequestLimits,
     retain_contents: bool,
+    validate_crash_context: bool,
 ) -> Result<InspectedFiles, CrashRequestError> {
     let file_capacity = usize::try_from(file_count)
         .map_err(|_| CrashRequestError::new(CrashRequestErrorKind::TooManyFiles))?;
@@ -487,11 +488,17 @@ fn inspect_files(
         }
 
         match kind {
-            CrashRequestFileKind::CrashContext => {
+            CrashRequestFileKind::CrashContext if validate_crash_context => {
                 let xml = read_crash_context(expanded, size, limits)?;
                 if retain_contents {
                     crash_context = Some(xml);
                 }
+            }
+            CrashRequestFileKind::CrashContext => {
+                if size > limits.crash_context_bytes {
+                    return Err(CrashRequestError::new(CrashRequestErrorKind::FileTooLarge));
+                }
+                discard(expanded, size)?;
             }
             CrashRequestFileKind::Minidump if retain_contents => {
                 if size > limits.minidump_bytes {
@@ -550,6 +557,7 @@ fn decode_crash_request<R: Read>(
     input: R,
     limits: CrashRequestLimits,
     retain_contents: bool,
+    validate_crash_context: bool,
 ) -> Result<CrashRequestContents, CrashRequestError> {
     let compressed_bytes_read = Rc::new(Cell::new(0));
     let compressed = CompressedReader::new(
@@ -587,7 +595,13 @@ fn decode_crash_request<R: Read>(
         return Err(CrashRequestError::new(CrashRequestErrorKind::TooManyFiles));
     }
 
-    let contents = inspect_files(&mut expanded, reported_file_count, limits, retain_contents)?;
+    let contents = inspect_files(
+        &mut expanded,
+        reported_file_count,
+        limits,
+        retain_contents,
+        validate_crash_context,
+    )?;
 
     let mut extra = [0_u8; 1];
     if expanded
@@ -643,7 +657,20 @@ pub fn inspect_crash_request<R: Read>(
     input: R,
     limits: CrashRequestLimits,
 ) -> Result<CrashRequestManifest, CrashRequestError> {
-    decode_crash_request(input, limits, false).map(|contents| contents.manifest)
+    decode_crash_request(input, limits, false, true).map(|contents| contents.manifest)
+}
+
+/// Inspects the bounded UE 5.8 envelope without parsing crash contents.
+///
+/// # Errors
+///
+/// Returns a typed safe error when the compressed stream, archive metadata, filename, or resource
+/// limit is invalid.
+pub fn inspect_crash_envelope<R: Read>(
+    input: R,
+    limits: CrashRequestLimits,
+) -> Result<CrashRequestManifest, CrashRequestError> {
+    decode_crash_request(input, limits, false, false).map(|contents| contents.manifest)
 }
 
 /// Reads the bounded contents required to process one UE 5.8 Crash Report Client request.
@@ -656,5 +683,5 @@ pub fn read_crash_request<R: Read>(
     input: R,
     limits: CrashRequestLimits,
 ) -> Result<CrashRequestContents, CrashRequestError> {
-    decode_crash_request(input, limits, true)
+    decode_crash_request(input, limits, true, true)
 }

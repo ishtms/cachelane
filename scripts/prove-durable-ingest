@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+api_url="${CACHELANE_API_URL:-http://127.0.0.1:${CACHELANE_API_PORT:-8080}}"
+ingest_url="${CACHELANE_INGEST_URL:-http://127.0.0.1:${CACHELANE_INGEST_PORT:-8081}}"
+bootstrap_secret="${CACHELANE_BOOTSTRAP_SECRET:?CACHELANE_BOOTSTRAP_SECRET is required}"
+
+json_field() {
+  local path="$1"
+  node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const path = process.argv[1].split(".");
+      const value = path.reduce((current, field) => current[field], JSON.parse(input));
+      process.stdout.write(String(value));
+    });
+  ' "$path"
+}
+
+setup_response="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $bootstrap_secret" \
+  -H "Content-Type: application/json" \
+  --data '{"owner_email":"owner@example.com","organization_name":"CacheLane Staging","organization_slug":"cachelane-staging","project_name":"Windows Game","project_slug":"windows-game"}' \
+  "$api_url/api/v1/setup")"
+project_id="$(json_field setup.project.id <<<"$setup_response")"
+key_id="$(json_field ingest_key.id <<<"$setup_response")"
+ingest_key="$(json_field ingest_key.value <<<"$setup_response")"
+
+curl --fail --silent --show-error \
+  -X PATCH \
+  -H "Authorization: Bootstrap $bootstrap_secret" \
+  -H "Content-Type: application/json" \
+  --data '{"environment":"playtest","allowed_cidrs":["127.0.0.0/8"]}' \
+  "$api_url/api/v1/projects/$project_id/ingest-keys/$key_id/policy" >/dev/null
+
+generate_request() {
+  node -e '
+    const zlib = require("node:zlib");
+    const directory = "UECC-Windows-HTTP-Proof";
+    const integer = value => {
+      const output = Buffer.alloc(4);
+      output.writeInt32LE(value);
+      return output;
+    };
+    const field = value => {
+      const output = Buffer.alloc(264);
+      output.writeInt32LE(260);
+      output.write(value, 4, "ascii");
+      return output;
+    };
+    const xml = Buffer.from("<FGenericCrashContext><RuntimeProperties /></FGenericCrashContext>");
+    const parts = [
+      Buffer.from("CR1"),
+      field(directory),
+      field(`${directory}.uecrash`),
+      integer(0),
+      integer(1),
+      integer(0),
+      field("CrashContext.runtime-xml"),
+      integer(xml.length),
+      xml,
+    ];
+    const expanded = Buffer.concat(parts);
+    expanded.writeInt32LE(expanded.length, 531);
+    process.stdout.write(zlib.deflateSync(expanded));
+  '
+}
+
+request_url="$ingest_url/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0&AppEnvironment=Shipping&UploadType=crashreports&UserID="
+first="$(generate_request | curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @- \
+  "$request_url")"
+second="$(generate_request | curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @- \
+  "$request_url")"
+event_id="$(json_field event_id <<<"$first")"
+state="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $bootstrap_secret" \
+  "$api_url/api/v1/projects/$project_id/events/$event_id")"
+
+FIRST="$first" SECOND="$second" STATE="$state" node -e '
+  const first = JSON.parse(process.env.FIRST);
+  const second = JSON.parse(process.env.SECOND);
+  const state = JSON.parse(process.env.STATE);
+  if (first.deduplicated || !second.deduplicated || first.event_id !== second.event_id) {
+    throw new Error("deduplication proof failed");
+  }
+  if (state.state !== "stored" || state.environment !== "playtest") {
+    throw new Error("state proof failed");
+  }
+  process.stdout.write(JSON.stringify({
+    event_id: first.event_id,
+    duplicate: second.deduplicated,
+    state: state.state,
+    environment: state.environment,
+  }) + "\n");
+'
