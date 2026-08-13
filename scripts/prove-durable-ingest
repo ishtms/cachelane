@@ -98,3 +98,9 @@ FIRST="$first" SECOND="$second" STATE="$state" node -e '
     environment: state.environment,
   }) + "\n");
 '
+
+if [[ "${CACHELANE_SMOKE_SYMBOL_UPLOAD:-false}" == "true" ]]; then
+  CACHELANE_PROOF_PROJECT_ID="$project_id" \
+    CACHELANE_PROOF_PROJECT_SLUG="windows-game" \
+    bash scripts/prove-symbol-upload
+fi

@@ -33,6 +33,7 @@ pub(crate) struct ServerState {
     bootstrap: BootstrapAuthorization,
     ingest_base_url: String,
     crash_ingest: crate::crash_ingest::CrashIngest,
+    symbol_uploads: crate::symbol_upload::SymbolUploads,
 }
 
 impl ServerState {
@@ -76,11 +77,15 @@ impl ServerState {
             .await
             .map_err(|_| StartupError::DatabaseUnavailable)?;
 
+        let symbol_uploads =
+            crate::symbol_upload::SymbolUploads::postgres(pool.clone(), role, host)?;
+
         Ok(Self {
             store: ProjectStore::Postgres(pool.clone()),
             bootstrap,
             ingest_base_url,
             crash_ingest: crate::crash_ingest::CrashIngest::postgres(pool, role)?,
+            symbol_uploads,
         })
     }
 
@@ -94,6 +99,7 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
     }
 
@@ -109,6 +115,23 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn symbol_upload_test(
+        pool: PgPool,
+        symbol_uploads: crate::symbol_upload::SymbolUploads,
+        secret: &str,
+    ) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            symbol_uploads,
         }
     }
 
@@ -130,6 +153,10 @@ impl ServerState {
 
     pub(crate) fn crash_ingest(&self) -> &crate::crash_ingest::CrashIngest {
         &self.crash_ingest
+    }
+
+    pub(crate) fn symbol_uploads(&self) -> &crate::symbol_upload::SymbolUploads {
+        &self.symbol_uploads
     }
 
     pub(crate) fn start_maintenance(&self, role: &str) {
@@ -155,6 +182,7 @@ pub(crate) enum StartupError {
     DatabaseUnavailable,
     MigrationFailed,
     IngestConfiguration,
+    SymbolUploadConfiguration,
 }
 
 impl fmt::Display for StartupError {
@@ -164,6 +192,9 @@ impl fmt::Display for StartupError {
             Self::DatabaseUnavailable => formatter.write_str("database is unavailable"),
             Self::MigrationFailed => formatter.write_str("database migration failed"),
             Self::IngestConfiguration => formatter.write_str("ingest configuration is invalid"),
+            Self::SymbolUploadConfiguration => {
+                formatter.write_str("symbol upload configuration is invalid")
+            }
         }
     }
 }
@@ -208,6 +239,35 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
             .route(
                 "/api/v1/projects/{project_id}/events/{event_id}",
                 get(crate::crash_ingest::get_event_state),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/artifact-upload-tokens",
+                post(crate::symbol_upload::create_upload_token),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/artifact-upload-tokens/{token_id}",
+                delete(crate::symbol_upload::revoke_upload_token),
+            )
+            .route(
+                "/api/v1/projects/{project_slug}/artifact-uploads",
+                post(crate::symbol_upload::negotiate_uploads)
+                    .layer(DefaultBodyLimit::max(1024 * 1024)),
+            )
+            .route(
+                "/api/v1/artifact-uploads/{upload_id}/parts",
+                post(crate::symbol_upload::sign_part).layer(DefaultBodyLimit::max(4 * 1024)),
+            )
+            .route(
+                "/api/v1/artifact-uploads/{upload_id}/parts/{part_number}",
+                patch(crate::symbol_upload::record_part).layer(DefaultBodyLimit::max(4 * 1024)),
+            )
+            .route(
+                "/api/v1/artifact-uploads/{upload_id}/complete",
+                post(crate::symbol_upload::complete_upload),
+            )
+            .route(
+                "/api/v1/releases/{release_id}/coverage",
+                get(crate::symbol_upload::get_coverage),
             )
             .with_state(state),
         "ingest" => ingest_router(

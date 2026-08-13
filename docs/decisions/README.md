@@ -6,3 +6,4 @@ Accepted decisions are implementation constraints until replaced by a later numb
 - [0002: PostgreSQL and object storage](0002-postgres-and-object-storage.md)
 - [0003: Isolated artifact processing](0003-isolated-artifact-processing.md)
 - [0004: Licensing model](0004-licensing-model.md)
+- [0005: Cloudflare R2 for hosted artifacts](0005-cloudflare-r2.md)

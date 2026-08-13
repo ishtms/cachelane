@@ -12,11 +12,15 @@ name = "cachelane"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 cachelane-symbols = { path = "../../crates/symbols" }
 cachelane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true
+md-5.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true

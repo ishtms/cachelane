@@ -8,8 +8,11 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+aws-sdk-s3.workspace = true
 axum.workspace = true
+base64.workspace = true
 cachelane-domain = { path = "../../crates/domain" }
+cachelane-symbols = { path = "../../crates/symbols" }
 cachelane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true
 futures-util.workspace = true
@@ -22,6 +25,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,6 +33,7 @@ url.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
+md-5.workspace = true
 tower.workspace = true
 
 [lints]

@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod crash_ingest;
 mod project_setup;
+mod symbol_upload;
 
 use project_setup::{ServerState, migrate, router};
 
