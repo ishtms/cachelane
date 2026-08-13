@@ -97,4 +97,8 @@ The private proof used a Blueprint-only packaged Development build created by in
 - Expanded archive: 708,878 bytes
 - Files: `CacheLaneProof.log` at 62,907 bytes, `CrashContext.runtime-xml` at 25,254 bytes, `CrashReportClient.ini` at 342 bytes, and `UEMinidump.dmp` at 618,748 bytes
 
-The command returned exit code 0 twice for the captured body and emitted byte-for-byte identical version 1 manifests containing one log, one crash context, one unknown file, and one minidump. The request and matching packaged artifacts remain under `C:\Users\hello\cachelane-private\ue58-blueprint-proof` and are not tracked by Git.
+The command returned exit code 0 twice for the captured body and emitted byte-for-byte identical version 1 manifests containing one log, one crash context, one unknown file, and one minidump. The request and matching packaged artifacts remain in a dedicated private directory outside Git.
+
+## Result
+
+Bounded UE 5.8 crash request decoding shipped in [#338](https://github.com/ishtms/cachelane/pull/338). The synthetic adversarial suite and private installed-engine proof passed, and the request decoder fuzz target compiles with the repository checks.

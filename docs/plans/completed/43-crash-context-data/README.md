@@ -71,3 +71,7 @@ Rollout is the normal merge of an unused library capability. Roll back by revert
 ## Unresolved decisions
 
 None. Real fixture evidence may add compatible source-field aliases without changing the extraction model.
+
+## Result
+
+Crash-context data extraction shipped in [#279](https://github.com/ishtms/cachelane/pull/279). The extractor preserves source order, retains unknown-compatible data, excludes command lines by default, and has synthetic coverage for complete and partial runtime documents.

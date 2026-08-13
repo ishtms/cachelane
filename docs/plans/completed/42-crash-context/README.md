@@ -66,3 +66,7 @@ This is an unused library addition, so rollout is the normal merge after checks.
 ## Unresolved decisions
 
 None. Future fixture evidence may tune the caller-provided node limit without changing the adapter contract.
+
+## Result
+
+The bounded, version-tolerant crash-context XML adapter shipped in [#276](https://github.com/ishtms/cachelane/pull/276). Synthetic tests cover supported input variations, unsafe XML, malformed input, unexpected roots, and node limits.

@@ -90,3 +90,7 @@ Ship the command as an additive local feature. Roll back by reverting the pull r
 ## Unresolved decisions
 
 None. M0 validates Windows x64 only. Broader platform behavior remains in its roadmap milestones.
+
+## Result
+
+Local Windows minidump symbolication shipped in [#339](https://github.com/ishtms/cachelane/pull/339). Synthetic end-to-end tests prove exact artifact selection, readable source and inline frames, partial stacks, safe failures, and byte-stable output. The private UE 5.8.1 proof resolves readable functions from matching packaged artifacts.

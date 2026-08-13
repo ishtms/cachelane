@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet, VecDeque},
     error::Error,
     fmt,
     io::{self, BufRead, BufReader, Read},
@@ -11,7 +11,7 @@ use std::{
 use flate2::bufread::ZlibDecoder;
 use serde::Serialize;
 
-use crate::{CrashContextParser, ParseError};
+use crate::{CrashContextParser, ParseError, ProjectLogTail};
 
 const ENVELOPE_MAGIC: &[u8; 3] = b"CR1";
 const ANSI_FIELD_BYTES: usize = 260;
@@ -26,6 +26,9 @@ pub struct CrashRequestLimits {
     pub file_bytes: u64,
     pub crash_context_bytes: u64,
     pub crash_context_nodes: u32,
+    pub minidump_bytes: u64,
+    pub log_tail_bytes: usize,
+    pub log_tail_lines: usize,
 }
 
 impl Default for CrashRequestLimits {
@@ -38,6 +41,9 @@ impl Default for CrashRequestLimits {
             file_bytes: 128 * 1024 * 1024,
             crash_context_bytes: 4 * 1024 * 1024,
             crash_context_nodes: 100_000,
+            minidump_bytes: 64 * 1024 * 1024,
+            log_tail_bytes: 64 * 1024,
+            log_tail_lines: 200,
         }
     }
 }
@@ -68,6 +74,20 @@ pub struct CrashRequestManifest {
     pub compressed_size: u64,
     pub expanded_size: u64,
     pub files: Vec<CrashRequestFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CrashRequestLog {
+    pub name: String,
+    pub tail: ProjectLogTail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashRequestContents {
+    pub manifest: CrashRequestManifest,
+    pub crash_context: Option<String>,
+    pub minidump: Option<Vec<u8>>,
+    pub log: Option<CrashRequestLog>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,16 +396,65 @@ fn discard(reader: &mut impl Read, size: u64) -> Result<(), CrashRequestError> {
     Ok(())
 }
 
+fn read_bytes(reader: &mut impl Read, size: u64) -> Result<Vec<u8>, CrashRequestError> {
+    let size = usize::try_from(size)
+        .map_err(|_| CrashRequestError::new(CrashRequestErrorKind::FileTooLarge))?;
+    let mut bytes = vec![0_u8; size];
+    read_exact(reader, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_log_tail(
+    reader: &mut impl Read,
+    size: u64,
+    max_bytes: usize,
+    max_lines: usize,
+) -> Result<ProjectLogTail, CrashRequestError> {
+    let retain = max_bytes.saturating_add(4);
+    let mut remaining = size;
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut suffix = VecDeque::new();
+
+    while remaining > 0 {
+        let buffer_length = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        let count = usize::try_from(remaining.min(buffer_length)).unwrap_or(buffer.len());
+        read_exact(reader, &mut buffer[..count])?;
+        suffix.extend(&buffer[..count]);
+        if suffix.len() > retain {
+            let excess = suffix.len() - retain;
+            suffix.drain(..excess);
+        }
+        remaining -= u64::try_from(count).unwrap_or(remaining);
+    }
+
+    Ok(ProjectLogTail::extract(
+        suffix.make_contiguous(),
+        max_bytes,
+        max_lines,
+    ))
+}
+
+struct InspectedFiles {
+    files: Vec<CrashRequestFile>,
+    crash_context: Option<String>,
+    minidump: Option<Vec<u8>>,
+    log: Option<CrashRequestLog>,
+}
+
 fn inspect_files(
     expanded: &mut impl Read,
     file_count: u64,
     limits: CrashRequestLimits,
-) -> Result<Vec<CrashRequestFile>, CrashRequestError> {
+    retain_contents: bool,
+) -> Result<InspectedFiles, CrashRequestError> {
     let file_capacity = usize::try_from(file_count)
         .map_err(|_| CrashRequestError::new(CrashRequestErrorKind::TooManyFiles))?;
     let mut files = Vec::with_capacity(file_capacity);
     let mut critical_files = BTreeSet::new();
     let mut filenames = HashSet::new();
+    let mut crash_context = None;
+    let mut minidump = None;
+    let mut log = None;
 
     for expected_index in 0..file_count {
         let index = read_count(expanded)?;
@@ -417,10 +486,28 @@ fn inspect_files(
             return Err(CrashRequestError::new(CrashRequestErrorKind::FileTooLarge));
         }
 
-        if kind == CrashRequestFileKind::CrashContext {
-            validate_crash_context(expanded, size, limits)?;
-        } else {
-            discard(expanded, size)?;
+        match kind {
+            CrashRequestFileKind::CrashContext => {
+                let xml = read_crash_context(expanded, size, limits)?;
+                if retain_contents {
+                    crash_context = Some(xml);
+                }
+            }
+            CrashRequestFileKind::Minidump if retain_contents => {
+                if size > limits.minidump_bytes {
+                    return Err(CrashRequestError::new(CrashRequestErrorKind::FileTooLarge));
+                }
+                minidump = Some(read_bytes(expanded, size)?);
+            }
+            CrashRequestFileKind::Log if retain_contents && log.is_none() => {
+                let tail =
+                    read_log_tail(expanded, size, limits.log_tail_bytes, limits.log_tail_lines)?;
+                log = Some(CrashRequestLog {
+                    name: name.clone(),
+                    tail,
+                });
+            }
+            _ => discard(expanded, size)?,
         }
 
         let index = u32::try_from(index)
@@ -433,40 +520,37 @@ fn inspect_files(
         });
     }
 
-    Ok(files)
+    Ok(InspectedFiles {
+        files,
+        crash_context,
+        minidump,
+        log,
+    })
 }
 
-fn validate_crash_context(
+fn read_crash_context(
     reader: &mut impl Read,
     size: u64,
     limits: CrashRequestLimits,
-) -> Result<(), CrashRequestError> {
+) -> Result<String, CrashRequestError> {
     if size > limits.crash_context_bytes {
         return Err(CrashRequestError::new(CrashRequestErrorKind::FileTooLarge));
     }
 
-    let size = usize::try_from(size)
-        .map_err(|_| CrashRequestError::new(CrashRequestErrorKind::FileTooLarge))?;
-    let mut bytes = vec![0_u8; size];
-    read_exact(reader, &mut bytes)?;
-    let xml = std::str::from_utf8(&bytes)
+    let bytes = read_bytes(reader, size)?;
+    let xml = String::from_utf8(bytes)
         .map_err(|_| CrashRequestError::new(CrashRequestErrorKind::InvalidCrashContextUtf8))?;
     CrashContextParser::new(limits.crash_context_nodes)
-        .parse(xml)
+        .parse(&xml)
         .map_err(CrashRequestError::xml)?;
-    Ok(())
+    Ok(xml)
 }
 
-/// Inspects one UE 5.8 Crash Report Client request body without retaining all expanded files.
-///
-/// # Errors
-///
-/// Returns a typed safe error when the compressed stream, archive metadata, filename, resource
-/// limit, or crash context is invalid.
-pub fn inspect_crash_request<R: Read>(
+fn decode_crash_request<R: Read>(
     input: R,
     limits: CrashRequestLimits,
-) -> Result<CrashRequestManifest, CrashRequestError> {
+    retain_contents: bool,
+) -> Result<CrashRequestContents, CrashRequestError> {
     let compressed_bytes_read = Rc::new(Cell::new(0));
     let compressed = CompressedReader::new(
         input,
@@ -503,7 +587,7 @@ pub fn inspect_crash_request<R: Read>(
         return Err(CrashRequestError::new(CrashRequestErrorKind::TooManyFiles));
     }
 
-    let files = inspect_files(&mut expanded, reported_file_count, limits)?;
+    let contents = inspect_files(&mut expanded, reported_file_count, limits, retain_contents)?;
 
     let mut extra = [0_u8; 1];
     if expanded
@@ -533,13 +617,44 @@ pub fn inspect_crash_request<R: Read>(
         return Err(CrashRequestError::new(CrashRequestErrorKind::TrailingData));
     }
 
-    Ok(CrashRequestManifest {
-        schema_version: 1,
-        envelope: "cr1",
-        directory_name,
-        archive_name,
-        compressed_size: compressed_bytes_read.get(),
-        expanded_size,
-        files,
+    Ok(CrashRequestContents {
+        manifest: CrashRequestManifest {
+            schema_version: 1,
+            envelope: "cr1",
+            directory_name,
+            archive_name,
+            compressed_size: compressed_bytes_read.get(),
+            expanded_size,
+            files: contents.files,
+        },
+        crash_context: contents.crash_context,
+        minidump: contents.minidump,
+        log: contents.log,
     })
+}
+
+/// Inspects one UE 5.8 Crash Report Client request body without retaining expanded file contents.
+///
+/// # Errors
+///
+/// Returns a typed safe error when the compressed stream, archive metadata, filename, resource
+/// limit, or crash context is invalid.
+pub fn inspect_crash_request<R: Read>(
+    input: R,
+    limits: CrashRequestLimits,
+) -> Result<CrashRequestManifest, CrashRequestError> {
+    decode_crash_request(input, limits, false).map(|contents| contents.manifest)
+}
+
+/// Reads the bounded contents required to process one UE 5.8 Crash Report Client request.
+///
+/// # Errors
+///
+/// Returns a typed safe error when the request or retained crash context, minidump, or log exceeds
+/// its limit or is malformed.
+pub fn read_crash_request<R: Read>(
+    input: R,
+    limits: CrashRequestLimits,
+) -> Result<CrashRequestContents, CrashRequestError> {
+    decode_crash_request(input, limits, true)
 }

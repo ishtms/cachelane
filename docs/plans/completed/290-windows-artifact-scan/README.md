@@ -66,3 +66,7 @@ Ship the command as an additive local capability. Later upload and symbolication
 - Non-Windows artifact formats
 - Derived symbol or unwind cache generation
 - Private Unreal fixture material
+
+## Result
+
+Windows PE and PDB identity scanning shipped in [#337](https://github.com/ishtms/cachelane/pull/337). The command matches artifacts by embedded identities, emits deterministic JSON, rejects unsafe artifact trees, and passes the synthetic CLI behavior tests and repository checks.

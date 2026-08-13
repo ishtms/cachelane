@@ -8,10 +8,12 @@ use std::{
 
 use cachelane_symbols::{
     ScanError, SymbolicationError, SymbolicationLimits, scan_artifacts, symbolicate_minidump,
+    symbolicate_minidump_bytes,
 };
 use cachelane_unreal::{
-    CrashContextData, CrashContextExtractionOptions, CrashContextParser, CrashRequestError,
-    CrashRequestLimits, ParseError, inspect_crash_request,
+    CrashClassification, CrashContextData, CrashContextExtractionOptions, CrashContextParser,
+    CrashRequestError, CrashRequestLimits, CrashRequestLog, CrashRequestManifest, ParseError,
+    inspect_crash_request, read_crash_request,
 };
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -47,9 +49,9 @@ enum CrashCommand {
         path: PathBuf,
     },
     Process {
-        dump: PathBuf,
+        input: PathBuf,
         #[arg(long)]
-        crash_context: PathBuf,
+        crash_context: Option<PathBuf>,
         #[arg(long)]
         symbols: PathBuf,
         #[arg(long)]
@@ -76,6 +78,8 @@ enum CliError {
     InvalidUtf8,
     Parse(ParseError),
     MissingCrashIdentity,
+    MissingRequestCrashContext,
+    MissingRequestMinidump,
     PreviousRead,
     PreviousTooLarge,
     InvalidPrevious,
@@ -104,6 +108,10 @@ impl fmt::Display for CliError {
             Self::MissingCrashIdentity => {
                 formatter.write_str("crash context has no usable crash identity")
             }
+            Self::MissingRequestCrashContext => {
+                formatter.write_str("crash request has no crash context")
+            }
+            Self::MissingRequestMinidump => formatter.write_str("crash request has no minidump"),
             Self::PreviousRead => formatter.write_str("failed to read previous processing result"),
             Self::PreviousTooLarge => write!(
                 formatter,
@@ -146,11 +154,16 @@ fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Some(Command::Crash(CrashCommand::Parse { path })) => parse_crash_context(&path),
         Some(Command::Crash(CrashCommand::Process {
-            dump,
+            input,
             crash_context,
             symbols,
             previous,
-        })) => process_crash(&dump, &crash_context, &symbols, previous.as_deref()),
+        })) => match crash_context {
+            Some(crash_context) => {
+                process_extracted_crash(&input, &crash_context, &symbols, previous.as_deref())
+            }
+            None => process_crash_request(&input, &symbols, previous.as_deref()),
+        },
         Some(Command::Crash(CrashCommand::Unpack { path })) => unpack_crash_request(&path),
         Some(Command::Crash(CrashCommand::Symbolicate { dump, symbols })) => {
             symbolicate_crash(&dump, &symbols)
@@ -175,6 +188,12 @@ struct LocalProcessingResult<'result> {
     schema_version: u32,
     crash_guid: &'result str,
     crash_context: &'result CrashContextData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<&'result CrashRequestManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification: Option<&'result CrashClassification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log: Option<&'result CrashRequestLog>,
     current: &'result Value,
     history: &'result [Value],
 }
@@ -184,7 +203,7 @@ struct PreviousProcessing {
     history: Vec<Value>,
 }
 
-fn process_crash(
+fn process_extracted_crash(
     dump: &Path,
     crash_context: &Path,
     symbols: &Path,
@@ -195,20 +214,77 @@ fn process_crash(
         .parse(&xml)
         .map_err(CliError::Parse)?
         .extract(CrashContextExtractionOptions::default());
-    let crash_guid = crash_context
+    let previous = load_previous_processing(&crash_context, previous)?;
+    let symbolication = symbolicate_minidump(dump, symbols, SymbolicationLimits::default())
+        .map_err(CliError::Symbolicate)?;
+
+    write_processing_result(&crash_context, &symbolication, previous, None, None, None)
+}
+
+fn process_crash_request(
+    request: &Path,
+    symbols: &Path,
+    previous: Option<&Path>,
+) -> Result<(), CliError> {
+    let file = File::open(request).map_err(|_| CliError::RequestRead)?;
+    let contents =
+        read_crash_request(file, CrashRequestLimits::default()).map_err(CliError::Request)?;
+    let xml = contents
+        .crash_context
+        .as_deref()
+        .ok_or(CliError::MissingRequestCrashContext)?;
+    let parsed = CrashContextParser::new(MAX_CRASH_CONTEXT_NODES)
+        .parse(xml)
+        .map_err(CliError::Parse)?;
+    let classification = parsed.classification();
+    let crash_context = parsed.extract(CrashContextExtractionOptions::default());
+    let previous = load_previous_processing(&crash_context, previous)?;
+    let minidump = contents.minidump.ok_or(CliError::MissingRequestMinidump)?;
+    let symbolication =
+        symbolicate_minidump_bytes(minidump, symbols, SymbolicationLimits::default())
+            .map_err(CliError::Symbolicate)?;
+
+    write_processing_result(
+        &crash_context,
+        &symbolication,
+        previous,
+        Some(&contents.manifest),
+        Some(&classification),
+        contents.log.as_ref(),
+    )
+}
+
+fn load_previous_processing(
+    crash_context: &CrashContextData,
+    previous: Option<&Path>,
+) -> Result<Option<PreviousProcessing>, CliError> {
+    let crash_guid = crash_guid(crash_context)?;
+    previous
+        .map(|path| read_previous_processing(path, crash_guid))
+        .transpose()
+}
+
+fn crash_guid(crash_context: &CrashContextData) -> Result<&str, CliError> {
+    crash_context
         .crash_guid
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .ok_or(CliError::MissingCrashIdentity)?;
-    let previous = previous
-        .map(|path| read_previous_processing(path, crash_guid))
-        .transpose()?;
-    let symbolication = symbolicate_minidump(dump, symbols, SymbolicationLimits::default())
-        .map_err(CliError::Symbolicate)?;
+        .ok_or(CliError::MissingCrashIdentity)
+}
+
+fn write_processing_result(
+    crash_context: &CrashContextData,
+    symbolication: &cachelane_symbols::SymbolicationResult,
+    previous: Option<PreviousProcessing>,
+    request: Option<&CrashRequestManifest>,
+    classification: Option<&CrashClassification>,
+    log: Option<&CrashRequestLog>,
+) -> Result<(), CliError> {
+    let crash_guid = crash_guid(crash_context)?;
     let current = serde_json::to_value(ProcessingAttempt {
         processing_version: LOCAL_PROCESSING_VERSION,
         parser_version: crash_context.parser_version,
-        symbolication: &symbolication,
+        symbolication,
     })
     .map_err(CliError::Serialize)?;
     let mut history = previous
@@ -227,7 +303,10 @@ fn process_crash(
     let result = LocalProcessingResult {
         schema_version: LOCAL_RESULT_SCHEMA_VERSION,
         crash_guid,
-        crash_context: &crash_context,
+        crash_context,
+        request,
+        classification,
+        log,
         current: &current,
         history: &history,
     };

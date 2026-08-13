@@ -2,7 +2,7 @@ use std::{error::Error, io::Write};
 
 use cachelane_unreal::{
     CrashRequestErrorKind, CrashRequestFile, CrashRequestFileKind, CrashRequestLimits,
-    inspect_crash_request,
+    inspect_crash_request, read_crash_request,
 };
 use flate2::{Compression, write::ZlibEncoder};
 
@@ -108,6 +108,56 @@ fn inspects_real_format_records_in_source_order() -> Result<(), Box<dyn Error>> 
             },
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn reads_only_bounded_processing_contents() -> Result<(), Box<dyn Error>> {
+    let xml = b"<FGenericCrashContext><RuntimeProperties><CrashGUID>UECC-Synthetic</CrashGUID></RuntimeProperties></FGenericCrashContext>";
+    let minidump = b"synthetic minidump";
+    let log = b"old line\nmiddle line\nnewest\n";
+    let request = crash_request(&[
+        ("CrashContext.runtime-xml", xml),
+        ("Synthetic.log", log),
+        ("UEMinidump.dmp", minidump),
+        ("Future.bin", b"do-not-retain"),
+    ])?;
+    let contents = read_crash_request(
+        &request.compressed[..],
+        CrashRequestLimits {
+            log_tail_bytes: 12,
+            log_tail_lines: 1,
+            ..CrashRequestLimits::default()
+        },
+    )?;
+
+    assert_eq!(contents.manifest.files.len(), 4);
+    assert_eq!(
+        contents.crash_context.as_deref(),
+        std::str::from_utf8(xml).ok()
+    );
+    assert_eq!(contents.minidump.as_deref(), Some(minidump.as_slice()));
+    let log = contents.log.ok_or("missing log")?;
+    assert_eq!(log.name, "Synthetic.log");
+    assert_eq!(log.tail.text(), "newest\n");
+    assert!(log.tail.truncated());
+    assert!(!log.tail.had_invalid_utf8());
+    Ok(())
+}
+
+#[test]
+fn capture_applies_the_minidump_limit_without_changing_inspection() -> Result<(), Box<dyn Error>> {
+    let request = crash_request(&[("UEMinidump.dmp", b"too large")])?;
+    let limits = CrashRequestLimits {
+        minidump_bytes: 1,
+        ..CrashRequestLimits::default()
+    };
+
+    assert!(inspect_crash_request(&request.compressed[..], limits).is_ok());
+    let error = read_crash_request(&request.compressed[..], limits)
+        .err()
+        .ok_or("captured minidump must exceed its limit")?;
+    assert_eq!(error.kind(), CrashRequestErrorKind::FileTooLarge);
     Ok(())
 }
 

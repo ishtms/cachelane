@@ -6,8 +6,9 @@ use serde::Serialize;
 mod request;
 
 pub use request::{
-    CrashRequestError, CrashRequestErrorKind, CrashRequestFile, CrashRequestFileKind,
-    CrashRequestLimits, CrashRequestManifest, inspect_crash_request,
+    CrashRequestContents, CrashRequestError, CrashRequestErrorKind, CrashRequestFile,
+    CrashRequestFileKind, CrashRequestLimits, CrashRequestLog, CrashRequestManifest,
+    inspect_crash_request, read_crash_request,
 };
 
 const CRASH_CONTEXT_ROOT: &str = "FGenericCrashContext";
@@ -54,7 +55,155 @@ pub struct CrashContextData {
     pub unknown_fields: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashSignalKind {
+    GpuCrash,
+    OutOfMemory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CrashSignal {
+    pub kind: CrashSignalKind,
+    pub confidence: ClassificationConfidence,
+    pub evidence: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CrashClassification {
+    pub crash_type: CrashType,
+    pub confidence: ClassificationConfidence,
+    pub evidence: Vec<&'static str>,
+    pub signals: Vec<CrashSignal>,
+}
+
+fn classify_crash_context(
+    crash_type: CrashType,
+    crash_type_source: Option<&str>,
+    error_message: Option<&str>,
+    structured_oom: bool,
+) -> CrashClassification {
+    let (confidence, evidence) = if crash_type == CrashType::Unknown {
+        (ClassificationConfidence::Low, Vec::new())
+    } else {
+        (
+            ClassificationConfidence::High,
+            vec!["crash_context.crash_type"],
+        )
+    };
+    let mut signals = Vec::new();
+    let crash_type_source = crash_type_source
+        .map(normalize_classification_text)
+        .unwrap_or_default();
+    let error_message = error_message
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let crash_type_oom = matches!(
+        crash_type_source.as_str(),
+        "oom" | "outofmemory" | "outofmemorycrash"
+    );
+    let error_oom = contains_any(
+        &error_message,
+        &[
+            "out of memory",
+            "out-of-memory",
+            "ran out of memory",
+            "oom allocation",
+        ],
+    );
+
+    if structured_oom || crash_type_oom || error_oom {
+        let mut evidence = Vec::new();
+        if structured_oom {
+            evidence.push("crash_context.memory_stats.is_oom");
+        }
+        if crash_type_oom {
+            evidence.push("crash_context.crash_type_oom");
+        }
+        if error_oom {
+            evidence.push("crash_context.error_message_oom");
+        }
+        signals.push(CrashSignal {
+            kind: CrashSignalKind::OutOfMemory,
+            confidence: if structured_oom || crash_type_oom {
+                ClassificationConfidence::High
+            } else {
+                ClassificationConfidence::Medium
+            },
+            evidence,
+        });
+    }
+
+    let crash_type_gpu = matches!(
+        crash_type_source.as_str(),
+        "gpucrash" | "gpucrashed" | "gputimeout"
+    );
+    let error_gpu = contains_any(
+        &error_message,
+        &[
+            "gpu crash",
+            "gpu crashed",
+            "gpu timeout",
+            "dxgi_error_device_removed",
+            "d3d device being lost",
+        ],
+    );
+
+    if crash_type_gpu || error_gpu {
+        let mut evidence = Vec::new();
+        if crash_type_gpu {
+            evidence.push("crash_context.crash_type_gpu");
+        }
+        if error_gpu {
+            evidence.push("crash_context.error_message_gpu");
+        }
+        signals.push(CrashSignal {
+            kind: CrashSignalKind::GpuCrash,
+            confidence: if crash_type_gpu {
+                ClassificationConfidence::High
+            } else {
+                ClassificationConfidence::Medium
+            },
+            evidence,
+        });
+    }
+
+    CrashClassification {
+        crash_type,
+        confidence,
+        evidence,
+        signals,
+    }
+}
+
+fn normalize_classification_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn contains_any(value: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| value.contains(pattern))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProjectLogTail {
     text: String,
     truncated: bool,
@@ -294,6 +443,21 @@ pub struct CrashContext<'input> {
 
 impl<'input> CrashContext<'input> {
     #[must_use]
+    pub fn classification(&self) -> CrashClassification {
+        let runtime = self.section("RuntimeProperties");
+        let crash_type_source = field_text(runtime, "CrashType");
+        let crash_type = crash_type_source.map_or(CrashType::Unknown, CrashType::classify);
+        let structured_oom = field_text(runtime, "MemoryStats.bIsOOM").is_some_and(truthy);
+
+        classify_crash_context(
+            crash_type,
+            crash_type_source,
+            field_text(runtime, "ErrorMessage"),
+            structured_oom,
+        )
+    }
+
+    #[must_use]
     pub fn extract(&self, options: CrashContextExtractionOptions) -> CrashContextData {
         let runtime = self.section("RuntimeProperties");
         let platform_properties = self.section("PlatformProperties");
@@ -512,9 +676,9 @@ mod tests {
     use cachelane_domain::{CrashType, NormalizedValue};
 
     use super::{
-        CRASH_CONTEXT_PARSER_VERSION, CrashContext, CrashContextExtractionOptions,
-        CrashContextField, CrashContextParser, CrashContextProperty, CrashContextSection,
-        CrashContextThread, ParseErrorKind, ProjectLogTail,
+        CRASH_CONTEXT_PARSER_VERSION, ClassificationConfidence, CrashContext,
+        CrashContextExtractionOptions, CrashContextField, CrashContextParser, CrashContextProperty,
+        CrashContextSection, CrashContextThread, CrashSignalKind, ParseErrorKind, ProjectLogTail,
     };
 
     const COMPLETE_CRASH_CONTEXT: &str = r"<FGenericCrashContext>
@@ -779,6 +943,76 @@ C:\Engine\Core.DLL</Modules>
             }]
         );
         assert!(data.unknown_fields.is_empty());
+    }
+
+    #[test]
+    fn classifies_structured_crash_types_with_high_confidence() {
+        for (value, expected) in [
+            ("Crash", CrashType::Crash),
+            ("Assert", CrashType::Assert),
+            ("Ensure", CrashType::Ensure),
+        ] {
+            let xml = format!(
+                "<FGenericCrashContext><RuntimeProperties><CrashType>{value}</CrashType></RuntimeProperties></FGenericCrashContext>"
+            );
+            let classification = parse(&xml).classification();
+
+            assert_eq!(classification.crash_type, expected);
+            assert_eq!(classification.confidence, ClassificationConfidence::High);
+            assert_eq!(classification.evidence, ["crash_context.crash_type"]);
+            assert!(classification.signals.is_empty());
+        }
+    }
+
+    #[test]
+    fn classifies_oom_and_gpu_evidence_without_copying_payloads() {
+        let classification = parse(
+            r"<FGenericCrashContext><RuntimeProperties>
+  <CrashType>GPU Crash</CrashType>
+  <ErrorMessage>DXGI_ERROR_DEVICE_REMOVED after out of memory: do-not-copy</ErrorMessage>
+  <MemoryStats.bIsOOM>true</MemoryStats.bIsOOM>
+</RuntimeProperties></FGenericCrashContext>",
+        )
+        .classification();
+        let json = serde_json::to_string(&classification)
+            .unwrap_or_else(|error| panic!("classification must serialize: {error}"));
+
+        assert_eq!(classification.crash_type, CrashType::Unknown);
+        assert_eq!(classification.confidence, ClassificationConfidence::Low);
+        assert_eq!(classification.signals.len(), 2);
+        assert_eq!(classification.signals[0].kind, CrashSignalKind::OutOfMemory);
+        assert_eq!(
+            classification.signals[0].confidence,
+            ClassificationConfidence::High
+        );
+        assert_eq!(classification.signals[1].kind, CrashSignalKind::GpuCrash);
+        assert_eq!(
+            classification.signals[1].confidence,
+            ClassificationConfidence::High
+        );
+        assert!(json.contains("crash_context.memory_stats.is_oom"));
+        assert!(json.contains("crash_context.crash_type_gpu"));
+        assert!(json.contains("crash_context.error_message_oom"));
+        assert!(json.contains("crash_context.error_message_gpu"));
+        assert!(!json.contains("do-not-copy"));
+    }
+
+    #[test]
+    fn pattern_only_signals_have_medium_confidence() {
+        let classification = parse(
+            r"<FGenericCrashContext><RuntimeProperties>
+  <CrashType>Crash</CrashType>
+  <ErrorMessage>GPU crashed because the process ran out of memory</ErrorMessage>
+</RuntimeProperties></FGenericCrashContext>",
+        )
+        .classification();
+
+        assert!(
+            classification
+                .signals
+                .iter()
+                .all(|signal| { signal.confidence == ClassificationConfidence::Medium })
+        );
     }
 
     #[test]
