@@ -6,7 +6,9 @@ use std::{
     process::ExitCode,
 };
 
-use cachelane_symbols::{ScanError, scan_artifacts};
+use cachelane_symbols::{
+    ScanError, SymbolicationError, SymbolicationLimits, scan_artifacts, symbolicate_minidump,
+};
 use cachelane_unreal::{
     CrashContextExtractionOptions, CrashContextParser, CrashRequestError, CrashRequestLimits,
     ParseError, inspect_crash_request,
@@ -34,8 +36,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CrashCommand {
-    Parse { path: PathBuf },
-    Unpack { path: PathBuf },
+    Parse {
+        path: PathBuf,
+    },
+    Unpack {
+        path: PathBuf,
+    },
+    Symbolicate {
+        dump: PathBuf,
+        #[arg(long)]
+        symbols: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -50,6 +61,7 @@ enum CliError {
     Parse(ParseError),
     RequestRead,
     Request(CrashRequestError),
+    Symbolicate(SymbolicationError),
     Scan(ScanError),
     Serialize(serde_json::Error),
     Write(io::Error),
@@ -67,6 +79,7 @@ impl fmt::Display for CliError {
             Self::Parse(error) => error.fmt(formatter),
             Self::RequestRead => write!(formatter, "failed to read crash request"),
             Self::Request(error) => error.fmt(formatter),
+            Self::Symbolicate(error) => error.fmt(formatter),
             Self::Scan(error) => error.fmt(formatter),
             Self::Serialize(error) => write!(formatter, "failed to serialize output: {error}"),
             Self::Write(error) => write!(formatter, "failed to write output: {error}"),
@@ -88,12 +101,25 @@ fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Some(Command::Crash(CrashCommand::Parse { path })) => parse_crash_context(&path),
         Some(Command::Crash(CrashCommand::Unpack { path })) => unpack_crash_request(&path),
+        Some(Command::Crash(CrashCommand::Symbolicate { dump, symbols })) => {
+            symbolicate_crash(&dump, &symbols)
+        }
         Some(Command::Symbols(SymbolsCommand::Scan { path })) => scan_symbols(&path),
         None => {
             println!("CacheLane CLI is ready");
             Ok(())
         }
     }
+}
+
+fn symbolicate_crash(dump: &Path, symbols: &Path) -> Result<(), CliError> {
+    let result = symbolicate_minidump(dump, symbols, SymbolicationLimits::default())
+        .map_err(CliError::Symbolicate)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+
+    serde_json::to_writer(&mut output, &result).map_err(CliError::Serialize)?;
+    writeln!(output).map_err(CliError::Write)
 }
 
 fn unpack_crash_request(path: &Path) -> Result<(), CliError> {
