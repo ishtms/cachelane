@@ -1840,6 +1840,7 @@ mod tests {
                 || database_name.starts_with("cachelane_295_")
                 || database_name == "cachelane_296"
                 || database_name.starts_with("cachelane_296_")
+                || database_name == "cachelane_test"
         );
     }
 

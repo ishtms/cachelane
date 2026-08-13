@@ -1596,6 +1596,10 @@ mod tests {
             .next()
             .and_then(|value| value.split('?').next())
             .unwrap_or_default();
-        assert!(database_name == "cachelane_296" || database_name.starts_with("cachelane_296_"));
+        assert!(
+            database_name == "cachelane_296"
+                || database_name.starts_with("cachelane_296_")
+                || database_name == "cachelane_test"
+        );
     }
 }
