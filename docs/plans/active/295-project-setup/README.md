@@ -138,6 +138,19 @@ Because the repository has no hosted staging target, the proposed staging eviden
 
 Human approval must state whether this local isolated environment satisfies the R3 staging gate. If hosted staging is required, implementation remains blocked because no hosted deployment target exists.
 
+### Completed staging evidence
+
+The approved local staging gate passed on August 13, 2026:
+
+- The isolated `cachelane295staging` Compose project used dedicated PostgreSQL, MinIO, network, volumes, and ports. No shared or production resource was used.
+- `cachelane-server migrate` succeeded twice against a clean PostgreSQL 17.6 database.
+- The PostgreSQL behavior test proved concurrent setup creates one complete tenant, only the SHA-256 key digest is stored, cross-organization lookup returns not found, and a fresh server state resolves the persisted active key.
+- The API, ingest, and production web processes passed `scripts/smoke` on loopback.
+- Installed Chrome completed project creation, one-time key display, configuration rendering, secret-free refresh, overlapping rotation, control-route denial, revocation, and active versus revoked ingest resolution.
+- Local and session storage remained empty, and the service logs contained no raw ingest key.
+- The pre-change `a928409` server built and answered readiness with the expanded database configuration, which confirms the additive schema does not block application rollback.
+- The dedicated containers, network, and test volumes were removed after evidence was collected.
+
 ## Compatibility, rollout, and rollback
 
 All schema changes are additive. The prior server binary must continue to start and answer health routes against the expanded schema. New project routes remain disabled unless bootstrap auth is explicitly configured. No production or public rollout is part of this issue.

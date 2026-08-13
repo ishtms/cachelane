@@ -11,18 +11,31 @@ if [[ -f .env ]]; then
 fi
 
 api_url="${CACHELANE_API_URL:-http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_API_PORT:-8080}}"
+ingest_url="${CACHELANE_INGEST_URL:-http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_INGEST_PORT:-8081}}"
 web_url="${CACHELANE_WEB_URL:-http://127.0.0.1:${CACHELANE_WEB_PORT:-3000}}"
 
 api_response="$(curl --fail --silent --show-error "$api_url/health/ready")"
+ingest_response="$(curl --fail --silent --show-error "$ingest_url/health/ready")"
 web_response="$(curl --fail --silent --show-error "$web_url")"
+setup_response="$(curl --fail --silent --show-error "$web_url/setup")"
 
 if [[ "$api_response" != *'"status":"ok"'* ]]; then
   echo "API readiness response is invalid" >&2
   exit 1
 fi
 
+if [[ "$ingest_response" != *'"status":"ok"'* ]]; then
+  echo "ingest readiness response is invalid" >&2
+  exit 1
+fi
+
 if [[ "$web_response" != *"Crash reports"* ]]; then
   echo "web response is invalid" >&2
+  exit 1
+fi
+
+if [[ "$setup_response" != *"Set up your first project"* ]]; then
+  echo "setup response is invalid" >&2
   exit 1
 fi
 
