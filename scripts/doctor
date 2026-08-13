@@ -35,7 +35,6 @@ check_command curl "install curl"
 check_command docker "install Docker Desktop or Docker Engine"
 check_command git "install Git"
 check_command node "install Node.js 24"
-check_command pnpm "run corepack enable"
 check_command rustup "install Rust with rustup"
 
 if ((failures > 0)); then
@@ -53,7 +52,7 @@ set +a
 
 echo "rust: $(rustc --version)"
 echo "node: $(node --version)"
-echo "pnpm: $(pnpm --version)"
+echo "pnpm: $(corepack pnpm --version)"
 echo "docker: $(docker --version)"
 
 if ! docker info >/dev/null 2>&1; then

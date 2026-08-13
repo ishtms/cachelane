@@ -7,6 +7,6 @@ cd "$repo_root"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
-pnpm --filter @cachelane/web format:check
-pnpm --filter @cachelane/web lint
-pnpm --filter @cachelane/web typecheck
+corepack pnpm --filter @cachelane/web format:check
+corepack pnpm --filter @cachelane/web lint
+corepack pnpm --filter @cachelane/web typecheck

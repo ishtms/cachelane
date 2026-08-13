@@ -12,14 +12,13 @@ for command in cargo corepack docker git node rustup; do
 done
 
 rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-corepack enable
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
   echo "created .env with development-only values"
 fi
 
-pnpm install --frozen-lockfile
+corepack pnpm install --frozen-lockfile
 cargo fetch --locked
 docker compose --env-file .env -f deploy/docker-compose/compose.yml config --quiet
 
