@@ -43,7 +43,12 @@ export FAULTLANE_API_URL="http://127.0.0.1:$FAULTLANE_API_PORT"
 export INGEST_BASE_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
 export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
 export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
+export FAULTLANE_GROUPING_ENABLED=true
 export FAULTLANE_PROCESSOR_IMAGE="$processor_image"
+
+proof_phase() {
+  echo "proof: $1" >&2
+}
 
 start_role() {
   local role="$1"
@@ -117,6 +122,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+proof_phase "starting PostgreSQL and object storage"
 docker compose \
   --project-name "$compose_project" \
   --env-file .env \
@@ -129,11 +135,13 @@ docker compose \
   -f deploy/docker-compose/compose.yml \
   run --rm minio-init >/dev/null
 
+proof_phase "building the current processor image"
 docker build --quiet --tag "$processor_base_image" --file deploy/processor/Dockerfile . >/dev/null
 docker build --quiet --tag "$processor_image" \
   --build-arg "PROCESSOR_IMAGE=$processor_base_image" \
   --file deploy/processor/proof.Dockerfile . >/dev/null
 
+proof_phase "verifying the processor sandbox boundary"
 mkdir "$proof_directory/boundary-input"
 docker create \
   --name "$boundary_container" \
@@ -204,6 +212,7 @@ fi
 docker rm --force "$boundary_container" >/dev/null
 boundary_container=""
 
+proof_phase "building the current server and CLI"
 cargo build --quiet --package faultlane-server --package faultlane-cli
 ./target/debug/faultlane-server migrate
 if FAULTLANE_PROCESSOR_IMAGE="faultlane-processor:missing-$proof_id" \
@@ -220,6 +229,7 @@ ingest_pid="$started_pid"
 start_role worker
 worker_pid="$started_pid"
 
+proof_phase "waiting for API and ingest readiness"
 for _ in $(seq 1 60); do
   if curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null \
     && curl --fail --silent "http://127.0.0.1:$FAULTLANE_INGEST_PORT/health/ready" >/dev/null; then
@@ -244,6 +254,48 @@ json_field() {
   ' "$path"
 }
 
+wait_for_event_state() {
+  local proof_event_id="$1"
+  local expected_state="$2"
+  local event_state=""
+  local current_state=""
+  for _ in $(seq 1 180); do
+    event_state="$(curl --fail --silent --show-error \
+      -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+      "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$proof_event_id")"
+    current_state="$(json_field state <<<"$event_state")"
+    if [[ "$current_state" == "$expected_state" ]]; then
+      printf '%s' "$event_state"
+      return 0
+    fi
+    if [[ "$current_state" =~ ^(failed|quarantined)$ ]]; then
+      cat "$proof_directory"/worker*.log >&2
+      echo "$event_state" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  cat "$proof_directory"/worker*.log >&2
+  echo "event $proof_event_id did not reach $expected_state" >&2
+  return 1
+}
+
+wait_for_release_ready() {
+  local release_id="$1"
+  local coverage=""
+  for _ in $(seq 1 180); do
+    coverage="$(curl --fail --silent --show-error \
+      -H "Authorization: Bearer $upload_token" \
+      "$FAULTLANE_API_URL/api/v1/releases/$release_id/coverage")"
+    if [[ "$(json_field coverage.ready <<<"$coverage")" == "true" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "release $release_id did not become ready" >&2
+  return 1
+}
+
 setup_response="$(curl --fail --silent --show-error \
   -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
   -H "Content-Type: application/json" \
@@ -259,20 +311,24 @@ token_response="$(curl --fail --silent --show-error \
 upload_token="$(json_field token <<<"$token_response")"
 
 run_upload() {
+  local release="$1"
+  local configuration="$2"
+  local build_timestamp="$3"
   FAULTLANE_TOKEN="$upload_token" ./target/debug/faultlane symbols upload \
     apps/cli/tests/fixtures/windows-symbolication \
     --project windows-game \
-    --release 1.0.0 \
-    --configuration shipping \
+    --release "$release" \
+    --configuration "$configuration" \
     --revision fixture \
     --channel staging \
-    --build-timestamp 2026-08-14T00:00:00Z \
+    --build-timestamp "$build_timestamp" \
     --ci-job isolated-proof \
     --api-url "$FAULTLANE_API_URL"
 }
 
-first_upload="$(run_upload)"
-second_upload="$(run_upload)"
+first_upload="$(run_upload 1.0.0 shipping 2026-08-14T00:00:00Z)"
+second_upload="$(run_upload 1.0.0 shipping 2026-08-14T00:00:00Z)"
+proof_phase "processing the initial, resource, and repeat events"
 
 stop_role "$worker_pid"
 worker_pid=""
@@ -283,6 +339,9 @@ repeat_path="$proof_directory/repeat.bundle"
 orphan_path="$proof_directory/orphan.bundle"
 storage_path="$proof_directory/storage-outage.bundle"
 database_path="$proof_directory/database-outage.bundle"
+distinct_path="$proof_directory/distinct.bundle"
+regression_path="$proof_directory/regression.bundle"
+ambiguous_path="$proof_directory/ambiguous.bundle"
 node -e '
   const fs = require("node:fs");
   const zlib = require("node:zlib");
@@ -298,12 +357,12 @@ node -e '
     output.write(value, 4, "ascii");
     return output;
   };
-  const create = (guid, outputPath) => {
+  const create = (guid, outputPath, buildVersion = "1.0.0", crashType = "Crash") => {
     const xml = Buffer.from(`
       <FGenericCrashContext><RuntimeProperties>
         <CrashGUID>${guid}</CrashGUID>
-        <CrashType>Crash</CrashType>
-        <BuildVersion>1.0.0</BuildVersion>
+        <CrashType>${crashType}</CrashType>
+        <BuildVersion>${buildVersion}</BuildVersion>
         <EngineVersion>5.8.1</EngineVersion>
         <PlatformName>Win64</PlatformName>
         <PlatformArchitecture>x86_64</PlatformArchitecture>
@@ -335,7 +394,10 @@ node -e '
   create("UECC-Windows-Orphan-311", process.argv[5]);
   create("UECC-Windows-Storage-311", process.argv[6]);
   create("UECC-Windows-Database-311", process.argv[7]);
-' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path"
+  create("UECC-Windows-Distinct-298", process.argv[8], "1.0.0", "Assert");
+  create("UECC-Windows-Regression-298", process.argv[9], "2.0.0");
+  create("UECC-Windows-Ambiguous-298", process.argv[10], "3.0.0", "Assert");
+' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path" "$distinct_path" "$regression_path" "$ambiguous_path"
 
 resource_response="$(curl --fail --silent --show-error \
   -H "Content-Type: application/octet-stream" \
@@ -425,10 +487,180 @@ if [[ "$(json_field state <<<"$repeat_state")" != "processed" ]]; then
   exit 1
 fi
 
+proof_phase "proving issue grouping, resolution, regression, and release ambiguity"
+distinct_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$distinct_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+distinct_event_id="$(json_field event_id <<<"$distinct_response")"
+distinct_state="$(wait_for_event_state "$distinct_event_id" processed)"
+
+repeated_issue_id="$(json_field issue_id <<<"$event_state")"
+repeat_issue_id="$(json_field issue_id <<<"$repeat_state")"
+distinct_issue_id="$(json_field issue_id <<<"$distinct_state")"
+first_release_id="$(json_field release.id <<<"$first_upload")"
+if [[ "$repeated_issue_id" != "$repeat_issue_id" \
+  || "$repeated_issue_id" == "$distinct_issue_id" ]]; then
+  echo "initial grouping did not join repeats and split the distinct crash" >&2
+  exit 1
+fi
+
+resolution_response="$(curl --fail --silent --show-error \
+  -X PUT \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  -H "Content-Type: application/json" \
+  --data "{\"release_id\":\"$first_release_id\"}" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/issues/$repeated_issue_id/resolution")"
+
+second_release_upload="$(run_upload 2.0.0 shipping 2026-08-15T00:00:00Z)"
+second_release_id="$(json_field release.id <<<"$second_release_upload")"
+wait_for_release_ready "$second_release_id"
+
+regression_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$regression_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=2.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+regression_event_id="$(json_field event_id <<<"$regression_response")"
+regression_state="$(wait_for_event_state "$regression_event_id" processed)"
+
+ambiguous_upload_one="$(run_upload 3.0.0 shipping 2026-08-16T00:00:00Z)"
+ambiguous_upload_two="$(run_upload 3.0.0 Shipping 2026-08-16T00:00:00Z)"
+ambiguous_release_one="$(json_field release.id <<<"$ambiguous_upload_one")"
+ambiguous_release_two="$(json_field release.id <<<"$ambiguous_upload_two")"
+wait_for_release_ready "$ambiguous_release_one"
+wait_for_release_ready "$ambiguous_release_two"
+
+ambiguous_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$ambiguous_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=3.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+ambiguous_event_id="$(json_field event_id <<<"$ambiguous_response")"
+ambiguous_state="$(wait_for_event_state "$ambiguous_event_id" awaiting_symbols)"
+
+issue_list="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/issues")"
+repeated_detail="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/issues/$repeated_issue_id")"
+distinct_detail="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/issues/$distinct_issue_id")"
+ambiguous_issue_id="$(json_field issue_id <<<"$ambiguous_state")"
+ambiguous_detail="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/issues/$ambiguous_issue_id")"
+grouping_database_evidence="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT (SELECT count(*) FROM issues), (SELECT count(*) FROM crash_events WHERE issue_id::text = '$repeated_issue_id'), (SELECT count(*) FROM crash_event_release_candidates WHERE event_id::text = '$ambiguous_event_id'), (SELECT count(*) FROM crash_events WHERE current_result_id IS NOT NULL AND (fingerprint_algorithm IS DISTINCT FROM 'stack' OR fingerprint_version IS DISTINCT FROM 1)), (SELECT count(*) FROM crash_events WHERE current_result_id IS NOT NULL), (SELECT count(*) FROM issue_variants), (SELECT count(*) FROM issue_releases);")"
+
+grouping_proof="$(EVENT_STATE="$event_state" REPEAT_STATE="$repeat_state" DISTINCT_STATE="$distinct_state" RESOLUTION_RESPONSE="$resolution_response" REGRESSION_STATE="$regression_state" AMBIGUOUS_STATE="$ambiguous_state" ISSUE_LIST="$issue_list" REPEATED_DETAIL="$repeated_detail" DISTINCT_DETAIL="$distinct_detail" AMBIGUOUS_DETAIL="$ambiguous_detail" GROUPING_DATABASE_EVIDENCE="$grouping_database_evidence" FIRST_RELEASE_ID="$first_release_id" SECOND_RELEASE_ID="$second_release_id" AMBIGUOUS_RELEASE_ONE="$ambiguous_release_one" AMBIGUOUS_RELEASE_TWO="$ambiguous_release_two" node -e '
+  const event = JSON.parse(process.env.EVENT_STATE);
+  const repeat = JSON.parse(process.env.REPEAT_STATE);
+  const distinct = JSON.parse(process.env.DISTINCT_STATE);
+  const resolution = JSON.parse(process.env.RESOLUTION_RESPONSE);
+  const regression = JSON.parse(process.env.REGRESSION_STATE);
+  const ambiguous = JSON.parse(process.env.AMBIGUOUS_STATE);
+  const list = JSON.parse(process.env.ISSUE_LIST);
+  const repeated = JSON.parse(process.env.REPEATED_DETAIL);
+  const distinctDetail = JSON.parse(process.env.DISTINCT_DETAIL);
+  const ambiguousDetail = JSON.parse(process.env.AMBIGUOUS_DETAIL);
+  const firstRelease = process.env.FIRST_RELEASE_ID;
+  const secondRelease = process.env.SECOND_RELEASE_ID;
+  const ambiguousReleases = [
+    process.env.AMBIGUOUS_RELEASE_ONE,
+    process.env.AMBIGUOUS_RELEASE_TWO,
+  ].sort();
+  if (event.grouping_state !== "grouped"
+      || event.fingerprint_algorithm !== "stack"
+      || event.fingerprint_version !== 1
+      || event.issue_id !== repeat.issue_id
+      || event.issue_id === distinct.issue_id) {
+    throw new Error("initial grouping evidence is invalid");
+  }
+  if (resolution.status !== "resolved" || resolution.regression_state !== "resolved") {
+    throw new Error("issue resolution evidence is invalid");
+  }
+  if (regression.issue_id !== event.issue_id
+      || regression.release_id !== secondRelease
+      || regression.release_mapping_state !== "matched") {
+    throw new Error("later release did not retain the stable issue");
+  }
+  if (ambiguous.state !== "awaiting_symbols"
+      || ambiguous.grouping_state !== "grouped"
+      || ambiguous.issue_id === event.issue_id
+      || ambiguous.issue_id === distinct.issue_id
+      || ambiguous.release_mapping_state !== "ambiguous"
+      || ambiguous.release_id !== null
+      || ambiguous.candidate_release_ids_truncated
+      || JSON.stringify([...ambiguous.candidate_release_ids].sort()) !== JSON.stringify(ambiguousReleases)) {
+    throw new Error("ambiguous release evidence is invalid");
+  }
+  if (list.items.length !== 3 || list.next_cursor !== null) {
+    throw new Error("issue list is not stable and bounded");
+  }
+  if (repeated.issue_id !== event.issue_id
+      || repeated.status !== "open"
+      || repeated.regression_state !== "regressed"
+      || repeated.event_count !== 3
+      || repeated.affected_release_count !== 2
+      || repeated.representative_event_id !== event.event_id
+      || repeated.first_release_id !== firstRelease
+      || repeated.last_release_id !== secondRelease
+      || repeated.resolved_in_release_id !== firstRelease
+      || repeated.release_mapping.matched !== 3
+      || repeated.release_mapping.missing !== 0
+      || repeated.release_mapping.ambiguous !== 0
+      || repeated.variants.length !== 1
+      || repeated.variants[0].event_count !== 3
+      || repeated.releases.length !== 2
+      || repeated.releases.reduce((count, release) => count + release.event_count, 0) !== 3
+      || repeated.variants_truncated
+      || repeated.releases_truncated) {
+    throw new Error("repeated issue aggregation or regression evidence is invalid");
+  }
+  if (distinctDetail.issue_id !== distinct.issue_id
+      || distinctDetail.event_count !== 1
+      || distinctDetail.affected_release_count !== 1
+      || distinctDetail.release_mapping.matched !== 1
+      || distinctDetail.release_mapping.ambiguous !== 0) {
+    throw new Error("distinct resolved issue aggregation is invalid");
+  }
+  if (ambiguousDetail.issue_id !== ambiguous.issue_id
+      || ambiguousDetail.event_count !== 1
+      || ambiguousDetail.affected_release_count !== 0
+      || ambiguousDetail.release_mapping.matched !== 0
+      || ambiguousDetail.release_mapping.ambiguous !== 1) {
+    throw new Error("ambiguous unresolved issue aggregation is invalid");
+  }
+  if (process.env.GROUPING_DATABASE_EVIDENCE.trim() !== "3|3|2|0|5|3|3") {
+    throw new Error(`grouping database evidence is invalid: ${process.env.GROUPING_DATABASE_EVIDENCE}`);
+  }
+  process.stdout.write(JSON.stringify({
+    issue_count: 3,
+    resolved_issue_count: 2,
+    repeated_issue_id: repeated.issue_id,
+    repeated_events: repeated.event_count,
+    distinct_issue_id: distinctDetail.issue_id,
+    affected_releases: repeated.affected_release_count,
+    variants: repeated.variants.length,
+    representative_event_id: repeated.representative_event_id,
+    regression_state: repeated.regression_state,
+    ambiguous_event_id: ambiguous.event_id,
+    ambiguous_issue_id: ambiguous.issue_id,
+    ambiguous_candidates: ambiguous.candidate_release_ids.length,
+  }));
+')"
+proof_phase "grouping behavior passed, verifying the kill switch and recovery paths"
+
 stop_role "$worker_pid"
 worker_pid=""
 stop_role "$worker_two_pid"
 worker_two_pid=""
+export FAULTLANE_GROUPING_ENABLED=false
 
 orphan_response="$(curl --fail --silent --show-error \
   -H "Content-Type: application/octet-stream" \
@@ -442,6 +674,7 @@ orphan_job_id="$(docker compose \
   exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
   "SELECT id::text FROM jobs WHERE event_id::text = '$orphan_event_id';")"
 
+proof_phase "verifying stale processor resource reconciliation"
 start_role worker orphan-worker
 worker_pid="$started_pid"
 old_container=""
@@ -523,6 +756,7 @@ storage_response="$(curl --fail --silent --show-error \
   --data-binary "@$storage_path" \
   "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
 storage_event_id="$(json_field event_id <<<"$storage_response")"
+proof_phase "verifying object storage outage recovery"
 docker compose \
   --project-name "$compose_project" \
   --env-file .env \
@@ -586,6 +820,7 @@ database_response="$(curl --fail --silent --show-error \
   --data-binary "@$database_path" \
   "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
 database_event_id="$(json_field event_id <<<"$database_response")"
+proof_phase "verifying database outage recovery"
 database_job_id="$(docker compose \
   --project-name "$compose_project" \
   --env-file .env \
@@ -686,6 +921,7 @@ if find "$proof_directory/worker-scratch" -mindepth 1 -maxdepth 1 \
   exit 1
 fi
 
+proof_phase "checking final API, database, log, and scratch evidence"
 database_evidence="$(docker compose \
   --project-name "$compose_project" \
   --env-file .env \
@@ -693,7 +929,7 @@ database_evidence="$(docker compose \
   exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
   "SELECT (SELECT count(*) FROM derived_symbol_caches WHERE state = 'available'), (SELECT count(*) FROM crash_processing_results WHERE event_id IN ('$event_id'::uuid, '$repeat_event_id'::uuid)), (SELECT jsonb_path_exists(result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') FROM crash_processing_results WHERE event_id::text = '$event_id' ORDER BY created_at DESC LIMIT 1), (SELECT state FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT resource_failures FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT processing_state FROM crash_events WHERE id::text = '$resource_event_id'), (SELECT count(*) FROM jobs WHERE job_type = 'generate_symcache'), (SELECT attempt FROM jobs WHERE event_id::text = '$storage_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$database_event_id');")"
 
-FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$database_evidence" EVENT_STATE="$event_state" RESOURCE_STATE="$resource_state" REPEAT_STATE="$repeat_state" ORPHAN_STATE="$orphan_state" STORAGE_STATE="$storage_state" DATABASE_STATE="$database_state" node -e '
+FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$database_evidence" EVENT_STATE="$event_state" RESOURCE_STATE="$resource_state" REPEAT_STATE="$repeat_state" ORPHAN_STATE="$orphan_state" STORAGE_STATE="$storage_state" DATABASE_STATE="$database_state" GROUPING_PROOF="$grouping_proof" node -e '
   const first = JSON.parse(process.env.FIRST_UPLOAD);
   const second = JSON.parse(process.env.SECOND_UPLOAD);
   const event = JSON.parse(process.env.EVENT_STATE);
@@ -702,6 +938,7 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
   const orphan = JSON.parse(process.env.ORPHAN_STATE);
   const storage = JSON.parse(process.env.STORAGE_STATE);
   const database = JSON.parse(process.env.DATABASE_STATE);
+  const grouping = JSON.parse(process.env.GROUPING_PROOF);
   if (first.uploaded !== 2 || first.bytes_transferred <= 0 || !first.coverage.ready) {
     throw new Error("first isolated upload failed");
   }
@@ -712,6 +949,9 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
   if (evidence.slice(0, 9).join("|") !== "1|2|t|failed|2|2|quarantined|1|2"
       || !["1", "2"].includes(evidence[9])) {
     throw new Error(`processing evidence is invalid: ${process.env.DATABASE_EVIDENCE}`);
+  }
+  if ([orphan, storage, database].some(event => event.grouping_state !== "disabled")) {
+    throw new Error("grouping kill switch did not preserve crash processing");
   }
   process.stdout.write(JSON.stringify({
     release_id: first.release.id,
@@ -741,6 +981,8 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
     database_state: database.state,
     database_attempts: Number(evidence[9]),
     database_retry_verified: true,
+    ...grouping,
+    grouping_kill_switch_verified: true,
     logs_and_scratch_verified: true,
   }) + "\n");
 '

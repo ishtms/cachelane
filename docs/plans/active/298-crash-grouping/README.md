@@ -2,7 +2,7 @@
 
 Issue: [#298](https://github.com/ishtms/faultlane/issues/298)
 
-Status: Ready for implementation.
+Status: In review.
 
 ## Outcome
 
@@ -14,7 +14,7 @@ Issue #311 publishes a validated, versioned processing result and updates the ev
 
 The current release lookup uses build version, normalized platform, architecture, and case-insensitive configuration only to select symbols. It returns missing symbols for both no match and multiple matches. The `releases` table already stores build timestamps, but `crash_events` does not retain a release or ambiguity evidence.
 
-The product sources have two naming and schedule discrepancies. The overview still calls M0 the current milestone, and the overview, PRD, and architecture use the former CacheLane name. GitHub milestone M1, issue #298, and the current repository use FaultLane. This plan follows the behavior requirements from GRP-01 through GRP-05 and REL-03 through REL-04, while using the current product name and milestone state.
+The product sources have two naming and schedule discrepancies. The overview still calls M0 the current milestone, and the overview, PRD, and architecture use superseded product naming. GitHub milestone M1, issue #298, and the current repository use FaultLane. This plan follows the behavior requirements from GRP-01 through GRP-05 and REL-03 through REL-04, while using the current product name and milestone state.
 
 The PRD's fingerprint inputs include exception reason and assertion text. The current symbolication result does not retain either stable field from `minidump-processor`. This change adds them to a new result version without storing exception addresses or instruction text.
 
@@ -71,7 +71,7 @@ Error-template normalization collapses whitespace and replaces addresses, GUIDs,
 
 The variant signature uses the issue components plus a bounded normalized faulting stack and classification evidence. Variants distinguish meaningful subpatterns inside one conservative issue without changing the stable issue URL.
 
-When no stable frame, module identity, assertion, or specific classified error remains, the crate returns `insufficient`. The event still records `stack` version `1`, release mapping, and processing state, but no issue is created. This is safer than merging unrelated stack-poor crashes by crash class alone.
+When no stable frame, module identity, specific assertion, or specific classified error remains, the crate returns `insufficient`. Generic assertion, GPU, and OOM phrases do not count as specific evidence. The event still records `stack` version `1`, release mapping, and processing state, but no issue is created. This is safer than merging unrelated stack-poor crashes by crash class alone.
 
 ## Processing contract change
 
@@ -86,7 +86,7 @@ It does not add the exception address, instruction bytes, process ID, timestamps
 
 ## Release mapping and ordering
 
-Resolve releases from the same structured fields used by symbol selection: project, build version, normalized platform, architecture, and case-insensitive configuration. Store all tenant-scoped candidates before selecting artifacts.
+Resolve releases from the same structured fields used by symbol selection: project, build version, normalized platform, architecture, and case-insensitive configuration. Candidate lookup and storage retain the first 101 tenant-scoped IDs in deterministic order. The API returns 100 and marks the evidence truncated when the sentinel candidate is present, which bounds pathological configuration-case collisions without guessing an exact release.
 
 Mapping states are:
 
@@ -96,7 +96,7 @@ Mapping states are:
 
 Only `matched` events contribute release rollups or regression state. Missing and ambiguous events still group by fingerprint and remain visible. Symbol selection uses the exact matched release only, so ambiguity is no longer silently presented as missing symbols.
 
-Release chronology uses a non-null `build_timestamp`. Different releases with equal timestamps are unordered. Created time, UUID order, lexical version order, and event arrival order are not release chronology and must not be used as substitutes.
+Release chronology uses a non-null `build_timestamp`. Once populated, the timestamp is write-once so repeated symbol negotiation cannot reorder existing issue evidence. Different releases with equal timestamps are unordered. Created time, UUID order, lexical version order, and event arrival order are not release chronology and must not be used as substitutes.
 
 The first matched occurrence makes an issue new in that release. A later ordered occurrence makes it ongoing unless the issue was resolved. Resolution requires a scoped release with a build timestamp. An event is a regression only when its matched release timestamp is strictly greater than the resolution release timestamp. Same-release, earlier, missing, ambiguous, or tied-timestamp events cannot reopen an issue as regressed.
 
@@ -114,7 +114,7 @@ Add to `crash_events`:
 - non-null fingerprint algorithm and version after a processing result is published;
 - grouping timestamp.
 
-Add `crash_event_release_candidates` keyed by event and release with organization and project in every key and foreign key. Exact and ambiguous mappings retain their candidate evidence; missing mappings have no candidate rows.
+Add `crash_event_release_candidates` keyed by event and release with organization and project in every key and foreign key. Exact and ambiguous mappings retain bounded candidate evidence; missing mappings have no candidate rows.
 
 Add `issues` with organization, project, algorithm, version, fingerprint, safe title, status, regression state, first and last seen, event count, representative event, first and last ordered release, resolution release, resolution time, and update time. A unique key on project, algorithm, version, and fingerprint creates one stable issue per versioned signature.
 
@@ -153,9 +153,9 @@ Add bounded cursor-based routes:
 - `PUT /api/v1/projects/{project_id}/issues/{issue_id}/resolution`;
 - `DELETE /api/v1/projects/{project_id}/issues/{issue_id}/resolution`.
 
-List and detail responses include stable issue path, algorithm and version, status, regression state, counts, timestamps, representative event ID, release mapping summaries, and variants. Detail includes bounded release and variant rows with deterministic ordering. Affected installations is omitted until a privacy-reviewed installation identifier exists.
+List and detail responses include stable issue path, algorithm and version, status, regression state, counts, timestamps, representative event ID, release mapping summaries, and variants. Detail includes bounded release and variant rows with deterministic ordering and reads all aggregates from one repeatable-read snapshot. Affected installations is omitted until a privacy-reviewed installation identifier exists.
 
-Resolution accepts one release ID. The release must belong to the same organization and project and have ordered build evidence. Reopen clears the active resolution anchor and sets the current state from retained occurrence evidence. Unauthorized and cross-tenant IDs remain indistinguishable from missing resources. Responses use `Cache-Control: no-store`.
+Resolution accepts one release ID. The release must belong to the same organization and project and have ordered build evidence. If retained, fully ordered occurrence evidence is already later than that release, the same operation records the resolution anchor and returns the issue as regressed instead of briefly reporting a false resolved state. Reopen clears the active resolution anchor and sets the current state from retained occurrence evidence. Unauthorized and cross-tenant IDs remain indistinguishable from missing resources. Responses use `Cache-Control: no-store`.
 
 The existing event state response gains issue path, fingerprint metadata, release mapping state, and candidate release IDs as additive optional fields.
 
@@ -214,13 +214,24 @@ The behavior proof creates two releases with distinct build timestamps, uploads 
 - one materially different known crash in the first release;
 - the equivalent crash again in the second release after resolving its issue against the first release.
 
-The proof queries the API and database to show two issues, three events under the repeated issue, one stable repeated issue ID across releases, exact variant and release counts, a deterministic representative, and `regressed` after the later occurrence. It also exercises an ambiguous release fixture and verifies that no guessed release affects regression state.
+The proof queries the API and database to show two resolved-stack issues, three events under the repeated issue, one stable repeated issue ID across releases, exact variant and release counts, a deterministic representative, and `regressed` after the later occurrence. It also exercises an ambiguous release fixture. Because ambiguous releases cannot select symbols, its unresolved module-identity fingerprint remains separate from the resolved-stack issue, retains both scoped candidates, and cannot affect regression state.
 
 Run the pre-change server against the expanded schema and verify readiness. Run `scripts/check` and `scripts/smoke` on the final head. Use dedicated local Compose resources for proof work and remove every created container, network, volume, image, log, and scratch directory afterward.
 
+### Final evidence
+
+- `cargo test -p faultlane-grouping` passed 11 tests, including golden joins and splits, generic stack-poor cases, bounded normalization, and version identity.
+- `cargo test -p faultlane-server --no-fail-fast` passed all 45 tests against a disposable PostgreSQL 16 database, including concurrency, stale lease, tenant isolation, bounded candidates, timestamp immutability, resolution, and kill-switch rollups.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`, formatting, `git diff --check`, and shell syntax checks passed.
+- The OpenAPI 3.1 description validated successfully. The only linter warnings were the three existing public health operations without 4xx responses.
+- The pre-change #311 server reached readiness against the expanded schema, proving application-before-migration rollback compatibility.
+- `scripts/prove-isolated-processing` passed with three events under one repeated issue, two affected releases, one variant, a separate known failure, a separate ambiguous unresolved issue with two candidates, and the repeated issue reopened as `regressed`. The proof also passed the processor boundary, stale resource, object-store outage, database outage, kill-switch, log, and scratch checks.
+- `scripts/doctor` and `scripts/check` passed, including the optimized Rust build, production web build, and repository policy checks.
+- `scripts/smoke` passed with isolated API, ingest, web, PostgreSQL, object-store, processor-image, and scratch resources. All created runtime resources were removed afterward.
+
 ## Rollout and rollback
 
-Add `FAULTLANE_GROUPING_ENABLED`. Keep it disabled until the migration and worker checks pass, then enable workers before exposing issue views. Disabling it leaves crash ingestion, isolated processing, event state, symbols, and stored grouping rows intact while stopping new issue assignment and regression transitions.
+Add `FAULTLANE_GROUPING_ENABLED`. Keep it disabled until the migration and worker checks pass, then enable workers before exposing issue views. Disabling it leaves crash ingestion, isolated processing, event state, symbols, and stored grouping rows intact while stopping new issue assignment and regression transitions. Reprocessing an event that is already grouped still refreshes exact counts and release rollups while preserving its current status and regression state.
 
 Rollback disables grouping and restores the prior application build. The additive tables, columns, immutable results, fingerprints, issue assignments, and rollups remain for a corrected build. Do not delete or reverse migrated data. A later contract migration may remove unused structures only after the rollback window closes.
 
