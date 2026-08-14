@@ -1,5 +1,5 @@
 [package]
-name = "cachelane-cli"
+name = "faultlane-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,13 @@ authors.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cachelane"
+name = "faultlane"
 path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
-cachelane-symbols = { path = "../../crates/symbols" }
-cachelane-unreal = { path = "../../crates/unreal" }
+faultlane-symbols = { path = "../../crates/symbols" }
+faultlane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true
 md-5.workspace = true
 reqwest.workspace = true

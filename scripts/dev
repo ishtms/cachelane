@@ -14,26 +14,26 @@ source .env
 set +a
 
 docker compose \
-  --project-name "${CACHELANE_COMPOSE_PROJECT:-cachelane}" \
+  --project-name "${FAULTLANE_COMPOSE_PROJECT:-faultlane}" \
   --env-file .env \
   -f deploy/docker-compose/compose.yml \
   up -d --wait postgres minio
 
 docker compose \
-  --project-name "${CACHELANE_COMPOSE_PROJECT:-cachelane}" \
+  --project-name "${FAULTLANE_COMPOSE_PROJECT:-faultlane}" \
   --env-file .env \
   -f deploy/docker-compose/compose.yml \
   run --rm minio-init
 
-cargo run --package cachelane-server -- migrate
+cargo run --package faultlane-server -- migrate
 
-cargo run --package cachelane-server -- api &
+cargo run --package faultlane-server -- api &
 api_pid=$!
 
-cargo run --package cachelane-server -- ingest &
+cargo run --package faultlane-server -- ingest &
 ingest_pid=$!
 
-PORT="${CACHELANE_WEB_PORT:-3000}" corepack pnpm --filter @cachelane/web dev &
+PORT="${FAULTLANE_WEB_PORT:-3000}" corepack pnpm --filter @faultlane/web dev &
 web_pid=$!
 
 cleanup() {
@@ -43,5 +43,5 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-echo "{\"event\":\"started\",\"api\":\"http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_API_PORT:-8080}\",\"ingest\":\"http://${CACHELANE_API_HOST:-127.0.0.1}:${CACHELANE_INGEST_PORT:-8081}\",\"web\":\"http://127.0.0.1:${CACHELANE_WEB_PORT:-3000}\"}"
+echo "{\"event\":\"started\",\"api\":\"http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_API_PORT:-8080}\",\"ingest\":\"http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_INGEST_PORT:-8081}\",\"web\":\"http://127.0.0.1:${FAULTLANE_WEB_PORT:-3000}\"}"
 wait "$api_pid" "$ingest_pid" "$web_pid"

@@ -1,6 +1,6 @@
 # Versioned crash context records
 
-Issue: [#49](https://github.com/ishtms/cachelane/issues/49)
+Issue: [#49](https://github.com/ishtms/faultlane/issues/49)
 
 ## Outcome
 
@@ -48,7 +48,7 @@ Extracted text remains sensitive untrusted input. Serialization must not log it 
 
 ## Verification
 
-- `cargo test -p cachelane-unreal`
+- `cargo test -p faultlane-unreal`
 - `./scripts/check-fast`
 - `./scripts/check`
 
@@ -69,7 +69,7 @@ The pull request references issue #49 without closing it. Issue #49 remains In P
 - Every extracted `CrashContextData` record carries parser version `1` from one public constant.
 - Complete records, properties, threads, normalized values, and unknown fields serialize deterministically.
 - Command-line data is absent by default and only serializes with explicit extraction permission.
-- `cargo test -p cachelane-unreal`, `./scripts/check-fast`, and `./scripts/check` passed locally.
+- `cargo test -p faultlane-unreal`, `./scripts/check-fast`, and `./scripts/check` passed locally.
 - Pull request CI, dependency review, and dependency audit passed.
 - Independent review found one issue-closing scope error. The plan and pull request now keep persistence and reprocessing work open in issue #49.
 

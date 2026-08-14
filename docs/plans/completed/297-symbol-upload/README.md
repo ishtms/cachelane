@@ -1,12 +1,12 @@
 # Missing symbol upload for a release
 
-Issue: [#297](https://github.com/ishtms/cachelane/issues/297)
+Issue: [#297](https://github.com/ishtms/faultlane/issues/297)
 
 Status: Completed through PR #345 on August 14, 2026. No production deployment was performed.
 
 ## Outcome
 
-When a build engineer runs `cachelane symbols upload <path> --project <slug> --release <version>`, CacheLane scans Windows PE and PDB artifacts locally, uploads only missing matching artifacts, resumes interrupted multipart work, and returns deterministic release coverage.
+When a build engineer runs `faultlane symbols upload <path> --project <slug> --release <version>`, FaultLane scans Windows PE and PDB artifacts locally, uploads only missing matching artifacts, resumes interrupted multipart work, and returns deterministic release coverage.
 
 ## Acceptance criteria
 
@@ -33,7 +33,7 @@ No production deployment, production credential, or production data is in scope.
 - Mint separate project-scoped artifact upload tokens through the loopback bootstrap control API. Store only a digest, return the raw token once, and support revocation. Issue #310 will replace bootstrap token management without widening token scope.
 - Default the CLI platform to Windows, infer architecture, and accept explicit configuration and revision flags. Store only scan-relative paths.
 - Deduplicate by validated identity and checksum inside one organization. Never expose cross-organization existence.
-- Gate all new routes with `CACHELANE_SYMBOL_UPLOAD_ENABLED`.
+- Gate all new routes with `FAULTLANE_SYMBOL_UPLOAD_ENABLED`.
 
 ### Architecture reconciliation
 
@@ -72,7 +72,7 @@ Use an isolated Compose project with unique ports, database, MinIO bucket, netwo
 
 The approved local staging gate passed on August 14, 2026:
 
-- The isolated `cachelane297staging` Compose project used PostgreSQL 17.6 and MinIO `RELEASE.2025-09-07T16-13-09Z` on dedicated ports, database names, network, and volumes. No shared or production resource was used.
+- The isolated `faultlane297staging` Compose project used PostgreSQL 17.6 and MinIO `RELEASE.2025-09-07T16-13-09Z` on dedicated ports, database names, network, and volumes. No shared or production resource was used.
 - Migrations succeeded twice against the clean final database.
 - `scripts/prove-symbol-upload` uploaded the checked-in Windows PE and PDB fixtures. The first run transferred 648,192 bytes. The second run transferred zero bytes with the same release and coverage: two available, zero missing, zero mismatch, and ready.
 - The final combined `scripts/smoke` run passed with durable ingest and symbol upload enabled against the same empty database. It stored one crash event, two artifacts totaling 648,192 bytes, two complete provenance rows, and two completed multipart sessions. Release metadata retained the staging channel and UTC build timestamp.

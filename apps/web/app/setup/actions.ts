@@ -6,7 +6,7 @@ import {
   type CreatedSetup,
   setupApi,
   setupErrorMessage,
-} from "../../lib/cachelane";
+} from "../../lib/faultlane";
 
 export type SetupActionState = {
   error?: string;

@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachelane_unreal::{CrashRequestLimits, inspect_crash_request, read_crash_request};
+use faultlane_unreal::{CrashRequestLimits, inspect_crash_request, read_crash_request};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

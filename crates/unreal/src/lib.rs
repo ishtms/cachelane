@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use cachelane_domain::{CrashType, NormalizedValue};
+use faultlane_domain::{CrashType, NormalizedValue};
 use serde::Serialize;
 
 mod request;
@@ -673,7 +673,7 @@ fn child_value(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use cachelane_domain::{CrashType, NormalizedValue};
+    use faultlane_domain::{CrashType, NormalizedValue};
 
     use super::{
         CRASH_CONTEXT_PARSER_VERSION, ClassificationConfidence, CrashContext,

@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from "next";
 import "./styles.css";
 
 export const metadata: Metadata = {
-  title: "CacheLane",
+  title: "FaultLane",
   description: "Unreal-native crash analytics and symbolication",
 };
 

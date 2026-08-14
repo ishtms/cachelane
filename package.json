@@ -1,5 +1,5 @@
 {
-  "name": "cachelane",
+  "name": "faultlane",
   "private": true,
   "packageManager": "pnpm@10.21.0",
   "engines": {
@@ -7,9 +7,9 @@
     "pnpm": ">=10.21.0"
   },
   "scripts": {
-    "build": "pnpm --filter @cachelane/web build",
-    "check": "pnpm --filter @cachelane/web check",
-    "dev": "pnpm --filter @cachelane/web dev"
+    "build": "pnpm --filter @faultlane/web build",
+    "check": "pnpm --filter @faultlane/web check",
+    "dev": "pnpm --filter @faultlane/web dev"
   },
   "devDependencies": {
     "yaml": "2.9.0"

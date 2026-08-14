@@ -11,7 +11,7 @@ mod symbol_upload;
 use project_setup::{ServerState, migrate, router};
 
 #[derive(Parser)]
-#[command(version, about = "CacheLane backend")]
+#[command(version, about = "FaultLane backend")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     match Cli::parse().command.unwrap_or(Command::Api) {
-        Command::Api => serve("api", "CACHELANE_API_PORT", 8080).await?,
-        Command::Ingest => serve("ingest", "CACHELANE_INGEST_PORT", 8081).await?,
+        Command::Api => serve("api", "FAULTLANE_API_PORT", 8080).await?,
+        Command::Ingest => serve("ingest", "FAULTLANE_INGEST_PORT", 8081).await?,
         Command::Worker => wait_for_shutdown("worker").await?,
         Command::Scheduler => wait_for_shutdown("scheduler").await?,
         Command::Migrate => migrate(&required_env("DATABASE_URL")?).await?,
@@ -49,7 +49,7 @@ async fn serve(
     port_variable: &str,
     default_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let host = env::var("CACHELANE_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let host = env::var("FAULTLANE_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
     let port = env::var(port_variable)
         .ok()
         .and_then(|value| value.parse().ok())

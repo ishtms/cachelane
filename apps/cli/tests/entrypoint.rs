@@ -26,14 +26,14 @@ struct TempInput {
 impl TempInput {
     fn new(name: &str, contents: &[u8]) -> Result<Self, std::io::Error> {
         let path =
-            std::env::temp_dir().join(format!("cachelane-cli-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("faultlane-cli-{}-{name}", std::process::id()));
         fs::write(&path, contents)?;
         Ok(Self { path })
     }
 
     fn with_size(name: &str, size: u64) -> Result<Self, std::io::Error> {
         let path =
-            std::env::temp_dir().join(format!("cachelane-cli-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("faultlane-cli-{}-{name}", std::process::id()));
         let file = fs::File::create(&path)?;
         file.set_len(size)?;
         Ok(Self { path })
@@ -47,33 +47,33 @@ impl Drop for TempInput {
 }
 
 fn run_parse(path: &Path) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .args(["crash", "parse"])
         .arg(path)
         .output()
 }
 
 fn run_unpack(path: &Path) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .args(["crash", "unpack"])
         .arg(path)
         .output()
 }
 
 fn run_scan(path: &Path) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .args(["symbols", "scan"])
         .arg(path)
         .output()
 }
 
 fn run_upload(path: &Path, api_url: &str) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .args(["symbols", "upload"])
         .arg(path)
         .args([
             "--project",
-            "cachelane-proof",
+            "faultlane-proof",
             "--release",
             "1.0.0",
             "--api-url",
@@ -87,7 +87,7 @@ fn run_upload(path: &Path, api_url: &str) -> Result<Output, std::io::Error> {
 }
 
 fn run_symbolicate(dump: &Path, symbols: &Path) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .args(["crash", "symbolicate"])
         .arg(dump)
         .arg("--symbols")
@@ -101,7 +101,7 @@ fn run_process(
     symbols: &Path,
     previous: Option<&Path>,
 ) -> Result<Output, std::io::Error> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cachelane"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_faultlane"));
     command
         .args(["crash", "process"])
         .arg(dump)
@@ -120,7 +120,7 @@ fn run_request_process(
     symbols: &Path,
     previous: Option<&Path>,
 ) -> Result<Output, std::io::Error> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cachelane"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_faultlane"));
     command
         .args(["crash", "process"])
         .arg(request)
@@ -284,7 +284,7 @@ fn handle_upload_request(
         assert!(!headers.contains_key("authorization"));
     }
     let (status, response_headers, response_body) = match (method.as_str(), path.as_str()) {
-        ("POST", "/api/v1/projects/cachelane-proof/artifact-uploads") => {
+        ("POST", "/api/v1/projects/faultlane-proof/artifact-uploads") => {
             let request: serde_json::Value = serde_json::from_slice(&body)?;
             assert_eq!(request["release"]["platform"], "windows");
             assert_eq!(request["release"]["configuration"], "shipping");
@@ -525,37 +525,37 @@ fn write_http_response(
 
 #[test]
 fn help_identifies_the_cli() -> Result<(), std::io::Error> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    let output = Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .arg("--help")
         .output()?;
 
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("CacheLane command line tools"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FaultLane command line tools"));
     Ok(())
 }
 
 #[test]
 fn version_matches_the_package() -> Result<(), std::io::Error> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cachelane"))
+    let output = Command::new(env!("CARGO_BIN_EXE_faultlane"))
         .arg("--version")
         .output()?;
 
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        format!("cachelane {}", env!("CARGO_PKG_VERSION"))
+        format!("faultlane {}", env!("CARGO_PKG_VERSION"))
     );
     Ok(())
 }
 
 #[test]
 fn no_arguments_keeps_the_readiness_message() -> Result<(), std::io::Error> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cachelane")).output()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_faultlane")).output()?;
 
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "CacheLane CLI is ready\n"
+        "FaultLane CLI is ready\n"
     );
     Ok(())
 }
@@ -718,7 +718,7 @@ fn parses_crash_context_to_stable_json() -> Result<(), Box<dyn Error>> {
 #[test]
 fn unpacks_crash_request_to_stable_json() -> Result<(), Box<dyn Error>> {
     let xml = b"<FGenericCrashContext/>";
-    let log = b"LogCacheLane: synthetic\n";
+    let log = b"LogFaultLane: synthetic\n";
     let unknown = b"future";
     let request = crash_request(&[
         ("CrashContext.runtime-xml", xml),
@@ -872,7 +872,7 @@ fn rejects_the_xml_node_limit() -> Result<(), Box<dyn Error>> {
 #[test]
 fn reports_missing_files_without_echoing_the_path() -> Result<(), Box<dyn Error>> {
     let missing = std::env::temp_dir().join(format!(
-        "cachelane-cli-{}-private-do-not-echo.xml",
+        "faultlane-cli-{}-private-do-not-echo.xml",
         std::process::id()
     ));
     let output = run_parse(&missing)?;
@@ -914,7 +914,7 @@ fn scans_windows_artifacts_to_stable_json() -> Result<(), Box<dyn Error>> {
 #[test]
 fn scan_errors_do_not_echo_the_root_path() -> Result<(), Box<dyn Error>> {
     let missing = std::env::temp_dir().join(format!(
-        "cachelane-symbols-{}-private-do-not-echo",
+        "faultlane-symbols-{}-private-do-not-echo",
         std::process::id()
     ));
     let output = run_scan(&missing)?;
@@ -930,7 +930,7 @@ fn scan_errors_do_not_echo_the_root_path() -> Result<(), Box<dyn Error>> {
 #[test]
 fn symbolicates_a_windows_minidump_to_stable_json() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = directory.join("cachelane-symbolication.dmp");
+    let dump = directory.join("faultlane-symbolication.dmp");
     let first = run_symbolicate(&dump, &directory)?;
     let second = run_symbolicate(&dump, &directory)?;
 
@@ -950,10 +950,10 @@ fn symbolicates_a_windows_minidump_to_stable_json() -> Result<(), Box<dyn Error>
             .ok_or("missing modules")?
             .iter()
             .any(|module| {
-                module["module"] == "cachelane-symbolication.exe"
+                module["module"] == "faultlane-symbolication.exe"
                     && module["status"] == "matched"
-                    && module["code_id"] == "823B128D8000"
-                    && module["debug_id"] == "80AC8B00-5C85-685B-8EF9-2D757F9A2125-3"
+                    && module["code_id"] == "14F736966000"
+                    && module["debug_id"] == "794DF05F-2D04-EFA3-A764-F49ED2297069-3"
             })
     );
     let frames = threads[0]["frames"].as_array().ok_or("missing frames")?;
@@ -962,7 +962,7 @@ fn symbolicates_a_windows_minidump_to_stable_json() -> Result<(), Box<dyn Error>
         .find(|frame| frame["function"] == "CrashFixture()")
         .ok_or("missing fixture frame")?;
     assert_eq!(crash["symbol_status"], "resolved");
-    assert_eq!(crash["source_file"], r"Z:\cachelane-fixture\source.cpp");
+    assert_eq!(crash["source_file"], r"Z:\source.cpp");
     assert_eq!(crash["source_line"], 16);
     assert!(crash["inlines"].as_array().is_some_and(|inlines| {
         inlines
@@ -975,11 +975,11 @@ fn symbolicates_a_windows_minidump_to_stable_json() -> Result<(), Box<dyn Error>
 #[test]
 fn keeps_partial_frames_for_missing_and_mismatched_symbols() -> Result<(), Box<dyn Error>> {
     let fixture_directory = fixture("windows-symbolication");
-    let dump = fixture_directory.join("cachelane-symbolication.dmp");
+    let dump = fixture_directory.join("faultlane-symbolication.dmp");
     let missing = TestDirectory::new("symbolicate-missing")?;
     fs::copy(
-        fixture_directory.join("cachelane-symbolication.exe"),
-        missing.path().join("cachelane-symbolication.exe"),
+        fixture_directory.join("faultlane-symbolication.exe"),
+        missing.path().join("faultlane-symbolication.exe"),
     )?;
     let missing_output = run_symbolicate(&dump, missing.path())?;
     assert!(missing_output.status.success());
@@ -988,7 +988,7 @@ fn keeps_partial_frames_for_missing_and_mismatched_symbols() -> Result<(), Box<d
         missing_result["modules"]
             .as_array()
             .is_some_and(|modules| modules.iter().any(|module| {
-                module["module"] == "cachelane-symbolication.exe"
+                module["module"] == "faultlane-symbolication.exe"
                     && module["status"] == "missing_pdb"
             }))
     );
@@ -1000,10 +1000,10 @@ fn keeps_partial_frames_for_missing_and_mismatched_symbols() -> Result<(), Box<d
 
     let mismatched = TestDirectory::new("symbolicate-mismatched")?;
     write_pe(
-        &mismatched.path().join("cachelane-symbolication.exe"),
+        &mismatched.path().join("faultlane-symbolication.exe"),
         GUID,
         1,
-        "cachelane-symbolication.pdb",
+        "faultlane-symbolication.pdb",
         false,
     )?;
     let mismatched_output = run_symbolicate(&dump, mismatched.path())?;
@@ -1013,7 +1013,7 @@ fn keeps_partial_frames_for_missing_and_mismatched_symbols() -> Result<(), Box<d
         mismatched_result["modules"]
             .as_array()
             .is_some_and(|modules| modules.iter().any(|module| {
-                module["module"] == "cachelane-symbolication.exe"
+                module["module"] == "faultlane-symbolication.exe"
                     && module["status"] == "mismatched"
             }))
     );
@@ -1037,7 +1037,7 @@ fn symbolication_errors_do_not_echo_private_inputs() -> Result<(), Box<dyn Error
 #[test]
 fn reprocesses_a_partial_crash_after_symbols_arrive() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = directory.join("cachelane-symbolication.dmp");
+    let dump = directory.join("faultlane-symbolication.dmp");
     let crash_context = fixture("crash-context.xml");
     let empty_symbols = TestDirectory::new("process-empty")?;
     let first = run_process(&dump, &crash_context, empty_symbols.path(), None)?;
@@ -1059,10 +1059,10 @@ fn reprocesses_a_partial_crash_after_symbols_arrive() -> Result<(), Box<dyn Erro
         partial["current"]["symbolication"]["modules"]
             .as_array()
             .is_some_and(|modules| modules.iter().any(|module| {
-                module["module"] == "cachelane-symbolication.exe"
+                module["module"] == "faultlane-symbolication.exe"
                     && module["status"] == "missing_pe"
-                    && module["code_id"] == "823B128D8000"
-                    && module["debug_id"] == "80AC8B00-5C85-685B-8EF9-2D757F9A2125-3"
+                    && module["code_id"] == "14F736966000"
+                    && module["debug_id"] == "794DF05F-2D04-EFA3-A764-F49ED2297069-3"
             }))
     );
     assert!(
@@ -1116,7 +1116,7 @@ fn reprocesses_a_partial_crash_after_symbols_arrive() -> Result<(), Box<dyn Erro
 #[test]
 fn rejects_invalid_previous_results_without_echoing_input() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = directory.join("cachelane-symbolication.dmp");
+    let dump = directory.join("faultlane-symbolication.dmp");
     let crash_context = fixture("crash-context.xml");
     let attempt = serde_json::json!({
         "processing_version": 1,
@@ -1196,7 +1196,7 @@ fn rejects_invalid_previous_results_without_echoing_input() -> Result<(), Box<dy
 #[test]
 fn process_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = directory.join("cachelane-symbolication.dmp");
+    let dump = directory.join("faultlane-symbolication.dmp");
     let missing_identity = TempInput::new(
         "missing-identity.xml",
         b"<FGenericCrashContext><RuntimeProperties/></FGenericCrashContext>",
@@ -1241,9 +1241,9 @@ fn process_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
 #[test]
 fn processes_a_complete_crash_request_and_reprocesses_it() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let dump = fs::read(directory.join("faultlane-symbolication.dmp"))?;
     let crash_context = fs::read(fixture("crash-context.xml"))?;
-    let log = b"LogCacheLane: old\nLogCacheLane: newest\n";
+    let log = b"LogFaultLane: old\nLogFaultLane: newest\n";
     let request = crash_request(&[
         ("CrashContext.runtime-xml", &crash_context),
         ("Synthetic.log", log),
@@ -1276,13 +1276,13 @@ fn processes_a_complete_crash_request_and_reprocesses_it() -> Result<(), Box<dyn
     assert_eq!(partial["log"]["name"], "Synthetic.log");
     assert_eq!(
         partial["log"]["tail"]["text"],
-        "LogCacheLane: old\nLogCacheLane: newest\n"
+        "LogFaultLane: old\nLogFaultLane: newest\n"
     );
     assert!(
         partial["current"]["symbolication"]["modules"]
             .as_array()
             .is_some_and(|modules| modules.iter().any(|module| {
-                module["module"] == "cachelane-symbolication.exe"
+                module["module"] == "faultlane-symbolication.exe"
                     && module["status"] == "missing_pe"
             }))
     );
@@ -1308,8 +1308,8 @@ fn processes_a_complete_crash_request_and_reprocesses_it() -> Result<(), Box<dyn
         .iter()
         .find(|frame| frame["function"] == "CrashFixture()")
         .ok_or("missing resolved fixture frame")?;
-    assert_eq!(crash["module"], "cachelane-symbolication.exe");
-    assert_eq!(crash["source_file"], r"Z:\cachelane-fixture\source.cpp");
+    assert_eq!(crash["module"], "faultlane-symbolication.exe");
+    assert_eq!(crash["source_file"], r"Z:\source.cpp");
     assert_eq!(crash["source_line"], 16);
     assert!(crash["trust"].as_str().is_some());
     assert!(crash["inlines"].as_array().is_some_and(|inlines| {
@@ -1323,7 +1323,7 @@ fn processes_a_complete_crash_request_and_reprocesses_it() -> Result<(), Box<dyn
 #[test]
 fn exposes_classification_evidence_through_request_processing() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let dump = fs::read(directory.join("faultlane-symbolication.dmp"))?;
     let crash_context = br"<FGenericCrashContext><RuntimeProperties>
   <CrashGUID>UECC-Synthetic-Signals</CrashGUID>
   <CrashType>GPU Crash</CrashType>
@@ -1364,7 +1364,7 @@ fn exposes_classification_evidence_through_request_processing() -> Result<(), Bo
 #[test]
 fn request_processing_errors_remain_fixed_and_safe() -> Result<(), Box<dyn Error>> {
     let directory = fixture("windows-symbolication");
-    let dump = fs::read(directory.join("cachelane-symbolication.dmp"))?;
+    let dump = fs::read(directory.join("faultlane-symbolication.dmp"))?;
     let context = fs::read(fixture("crash-context.xml"))?;
     let missing_context = crash_request(&[("UEMinidump.dmp", &dump)])?;
     let missing_dump = crash_request(&[("CrashContext.runtime-xml", &context)])?;

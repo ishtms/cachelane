@@ -22,7 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use cachelane_symbols::{
+use faultlane_symbols::{
     Architecture, ArtifactScanLimits, ArtifactType, scan_artifacts_with_limits,
 };
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,7 @@ impl SymbolUploads {
         host: &str,
     ) -> Result<Self, StartupError> {
         if role != "api"
-            || !env::var("CACHELANE_SYMBOL_UPLOAD_ENABLED")
+            || !env::var("FAULTLANE_SYMBOL_UPLOAD_ENABLED")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
         {
             return Ok(Self::disabled());
@@ -106,14 +106,14 @@ impl SymbolUploads {
                 secret_key,
                 None,
                 None,
-                "cachelane-object-store",
+                "faultlane-object-store",
             ))
             .endpoint_url(endpoint)
             .force_path_style(true)
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .build();
-        let spool_directory = env::var("CACHELANE_ARTIFACT_SPOOL_DIR").map_or_else(
-            |_| env::temp_dir().join("cachelane-artifacts"),
+        let spool_directory = env::var("FAULTLANE_ARTIFACT_SPOOL_DIR").map_or_else(
+            |_| env::temp_dir().join("faultlane-artifacts"),
             PathBuf::from,
         );
         validate_spool_directory(&spool_directory)?;
@@ -133,7 +133,7 @@ impl SymbolUploads {
         Self {
             pool: None,
             objects: ArtifactObjects::Disabled,
-            spool_directory: Arc::new(env::temp_dir().join("cachelane-artifacts-disabled")),
+            spool_directory: Arc::new(env::temp_dir().join("faultlane-artifacts-disabled")),
             enabled: false,
         }
     }
@@ -1853,7 +1853,7 @@ async fn verify_object(
     let spool_id = random_uuid().map_err(|_| VerifyError::Unavailable)?;
     let path = uploads
         .spool_directory
-        .join(format!("cachelane-{spool_id}.{extension}"));
+        .join(format!("faultlane-{spool_id}.{extension}"));
     let downloaded = uploads
         .objects
         .download_to(
@@ -2319,7 +2319,7 @@ mod tests {
         http::{Request, StatusCode, request::Builder},
     };
     use base64::Engine as _;
-    use cachelane_symbols::scan_artifacts;
+    use faultlane_symbols::scan_artifacts;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::Row;
@@ -2396,7 +2396,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn uploads_only_missing_artifacts_and_keeps_tenants_isolated() {
-        let Ok(database_url) = env::var("CACHELANE_TEST_DATABASE_URL") else {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
             return;
         };
         let _guard = DATABASE_TEST_LOCK.lock().await;
@@ -2413,7 +2413,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("test database must reset: {error}"));
         let spool = env::temp_dir().join(format!(
-            "cachelane-symbol-upload-test-{}",
+            "faultlane-symbol-upload-test-{}",
             std::process::id()
         ));
         let uploads = SymbolUploads::test(pool.clone(), spool.clone());
@@ -2427,8 +2427,8 @@ mod tests {
                         "owner_email": "owner@example.com",
                         "organization_name": "Example Studio",
                         "organization_slug": "example-studio",
-                        "project_name": "CacheLane Proof",
-                        "project_slug": "cachelane-proof"
+                        "project_name": "FaultLane Proof",
+                        "project_slug": "faultlane-proof"
                     })
                     .to_string(),
                 ))
@@ -2458,7 +2458,7 @@ mod tests {
             .unwrap_or_else(|| panic!("upload token ID must exist"));
 
         let fixture = FilePath::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../cli/tests/fixtures/windows-symbolication/cachelane-symbolication.pdb");
+            .join("../cli/tests/fixtures/windows-symbolication/faultlane-symbolication.pdb");
         let bytes = std::fs::read(&fixture)
             .unwrap_or_else(|error| panic!("fixture must be readable: {error}"));
         let scan =
@@ -2479,7 +2479,7 @@ mod tests {
                 "build_timestamp": "2026-08-14T00:00:00Z"
             },
             "artifacts": [{
-                "path": "symbols/cachelane-symbolication.pdb",
+                "path": "symbols/faultlane-symbolication.pdb",
                 "module": artifact.module,
                 "artifact_type": artifact_type_name(artifact.artifact_type),
                 "architecture": architecture_name(artifact.architecture.unwrap_or_else(|| panic!("architecture must exist"))),
@@ -2497,7 +2497,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))
@@ -2524,7 +2524,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))
@@ -2535,7 +2535,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))
@@ -2604,7 +2604,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))
@@ -2635,7 +2635,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(replaced.to_string()))
@@ -2644,7 +2644,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
         let manifest_checksum: Vec<u8> = sqlx::query_scalar(
-            "SELECT checksum FROM release_manifest_artifacts WHERE release_id::text = $1 AND source_path = 'symbols/cachelane-symbolication.pdb'",
+            "SELECT checksum FROM release_manifest_artifacts WHERE release_id::text = $1 AND source_path = 'symbols/faultlane-symbolication.pdb'",
         )
         .bind(release_id)
         .fetch_one(&pool)
@@ -2688,7 +2688,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))
@@ -2707,7 +2707,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(next_release.to_string()))
@@ -2728,7 +2728,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("provenance must persist: {error}"));
         assert_eq!(
             provenance.get::<String, _>("source_path"),
-            "symbols/cachelane-symbolication.pdb"
+            "symbols/faultlane-symbolication.pdb"
         );
         assert_eq!(provenance.get::<String, _>("cli_version"), "0.1.0");
         assert_eq!(
@@ -2762,7 +2762,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(mismatch_request.to_string()))
@@ -2942,7 +2942,7 @@ mod tests {
             bearer(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/projects/cachelane-proof/artifact-uploads"),
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
                 token,
             )
             .body(Body::from(request.to_string()))

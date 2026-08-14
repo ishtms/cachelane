@@ -2,7 +2,7 @@ mod support;
 
 use std::{error::Error, fs, fs::File};
 
-use cachelane_symbols::{
+use faultlane_symbols::{
     ArtifactErrorCode, ArtifactScanLimits, ArtifactType, MatchState, ScanError, scan_artifacts,
     scan_artifacts_with_limits,
 };
@@ -99,7 +99,7 @@ fn returns_safe_errors_and_stable_json() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn missing_root_errors_do_not_echo_the_path() {
-    let missing = std::env::temp_dir().join("cachelane-private-do-not-echo");
+    let missing = std::env::temp_dir().join("faultlane-private-do-not-echo");
     let Err(error) = scan_artifacts(&missing) else {
         panic!("missing root must fail");
     };
@@ -118,7 +118,7 @@ fn reads_large_dbi_identity_without_loading_the_stream() -> Result<(), Box<dyn E
     assert_eq!(scan.artifacts.len(), 1);
     assert_eq!(
         scan.artifacts[0].architecture,
-        Some(cachelane_symbols::Architecture::X86_64)
+        Some(faultlane_symbols::Architecture::X86_64)
     );
     assert_eq!(
         scan.artifacts[0].debug_id.as_deref(),

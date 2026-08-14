@@ -1,7 +1,7 @@
 const steps = [
   {
     number: "01",
-    title: "Point Unreal at CacheLane",
+    title: "Point Unreal at FaultLane",
     text: "Use Unreal Engine's built-in Crash Report Client with a project write key.",
   },
   {
@@ -20,11 +20,11 @@ export default function Home() {
   return (
     <main>
       <nav className="nav">
-        <a className="brand" href="#top" aria-label="CacheLane home">
+        <a className="brand" href="#top" aria-label="FaultLane home">
           <span className="brand-mark" aria-hidden="true">
-            C
+            F
           </span>
-          CacheLane
+          FaultLane
         </a>
         <span className="phase">Foundation</span>
       </nav>
@@ -39,14 +39,14 @@ export default function Home() {
           <span>made readable.</span>
         </h1>
         <p className="lede">
-          CacheLane turns Unreal crash artifacts and matching debug symbols into
+          FaultLane turns Unreal crash artifacts and matching debug symbols into
           grouped issues with useful stacks and clear diagnostics.
         </p>
         <div className="actions">
           <a className="primary" href="/setup">
             Set up a project
           </a>
-          <a className="primary" href="https://github.com/ishtms/cachelane">
+          <a className="primary" href="https://github.com/ishtms/faultlane">
             View repository
           </a>
           <a className="secondary" href="#workflow">
@@ -76,7 +76,7 @@ export default function Home() {
       </section>
 
       <footer>
-        <span>CacheLane</span>
+        <span>FaultLane</span>
         <span>Project foundation in progress</span>
       </footer>
     </main>

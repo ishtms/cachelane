@@ -1,8 +1,8 @@
 import { expect, test } from "@playwright/test";
 
 test("creates a project and manages one-time ingest keys", async ({ page }) => {
-  const apiUrl = process.env.CACHELANE_API_URL ?? "http://127.0.0.1:8080";
-  const ingestUrl = process.env.CACHELANE_INGEST_URL ?? "http://127.0.0.1:8081";
+  const apiUrl = process.env.FAULTLANE_API_URL ?? "http://127.0.0.1:8080";
+  const ingestUrl = process.env.FAULTLANE_INGEST_URL ?? "http://127.0.0.1:8081";
 
   await page.goto("/setup");
   await page.getByLabel("Owner email").fill("owner@example.com");

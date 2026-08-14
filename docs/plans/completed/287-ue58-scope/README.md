@@ -1,10 +1,10 @@
 # Unreal Engine 5.8 development scope
 
-Issue: [#287](https://github.com/ishtms/cachelane/issues/287)
+Issue: [#287](https://github.com/ishtms/faultlane/issues/287)
 
 ## Context
 
-CacheLane currently claims packaged Windows support for UE 5.4 and later, and M0 includes separate real-fixture work for UE 5.4 through UE 5.8. The available Windows environment has Unreal Engine 5.8.1 installed at `C:\Program Files\Epic Games\UE_5.8` with changelist 56057345 and Visual Studio Build Tools. UE 5.4 through UE 5.7 are not installed.
+FaultLane currently claims packaged Windows support for UE 5.4 and later, and M0 includes separate real-fixture work for UE 5.4 through UE 5.8. The available Windows environment has Unreal Engine 5.8.1 installed at `C:\Program Files\Epic Games\UE_5.8` with changelist 56057345 and Visual Studio Build Tools. UE 5.4 through UE 5.7 are not installed.
 
 Active development should prove one complete Windows path with the installed engine before expanding compatibility. UE 5.4 through UE 5.7 will be validated in a dedicated pre-launch milestone after M2 and before general availability. Other UE 5.8 patch releases remain unverified until that compatibility pass.
 
@@ -54,7 +54,7 @@ The change is reversible and does not alter authentication, authorization, billi
 
 ## Tests and operational verification
 
-- `cargo test -p cachelane-unreal`
+- `cargo test -p faultlane-unreal`
 - `./scripts/check-fast`
 - `./scripts/check`
 - `./scripts/smoke`
@@ -68,15 +68,15 @@ The change is reversible and does not alter authentication, authorization, billi
 
 No stored data, migration, API contract, tenant boundary, credential, or external processing system changes. Crash artifacts remain sensitive untrusted input and retain all existing parser and isolation requirements.
 
-The scope statement distinguishes tested support from tolerant behavior. Inputs from other Unreal versions may still parse, but CacheLane will not claim compatibility until the late pre-launch matrix passes. This avoids adding speculative engine-version branches while keeping future compatibility work possible.
+The scope statement distinguishes tested support from tolerant behavior. Inputs from other Unreal versions may still parse, but FaultLane will not claim compatibility until the late pre-launch matrix passes. This avoids adding speculative engine-version branches while keeping future compatibility work possible.
 
 ## Implementation evidence
 
 - Tracked product language, the landing page, Unreal fixtures, CLI fixture expectations, and relevant plans now use the UE 5.8 development target and UE 5.8.1 validation baseline.
 - Milestone 9 tracks UE 5.4 through UE 5.7 and additional UE 5.8 patch validation after M2. Issues #143 through #146 are open in that milestone and remain in Backlog.
 - Issues #6, #28, #147 through #150, #235, #236, #254, and #282 now distinguish the current UE 5.8 baseline from deferred or historical compatibility work.
-- `cargo test -p cachelane-unreal` passed with 23 tests.
-- `cargo test -p cachelane-cli` passed with 9 tests.
+- `cargo test -p faultlane-unreal` passed with 23 tests.
+- `cargo test -p faultlane-cli` passed with 9 tests.
 - `./scripts/check-fast` passed.
 - `./scripts/check` passed, including the release build and repository checks.
 - `./scripts/smoke` passed while `./scripts/dev` ran with isolated local ports and its own Compose project.
@@ -95,7 +95,7 @@ Roll back by reverting the repository change, restoring the previous issue title
 - Rejecting crash reports by engine version
 - Changing XML, minidump, PDB, PE, archive, or symbolication behavior
 - Editing historical comments or commit messages
-- Modifying the ignored `cachelane-windows-bootstrap-2026-08-13` snapshot
+- Modifying the ignored `faultlane-windows-bootstrap-2026-08-13` snapshot
 - Deployment or production changes
 
 ## Unresolved decisions

@@ -1,10 +1,10 @@
 # Local crash reprocessing
 
-Issue: [#293](https://github.com/ishtms/cachelane/issues/293)
+Issue: [#293](https://github.com/ishtms/faultlane/issues/293)
 
 ## Outcome
 
-Add `cachelane crash process <dump> --crash-context <xml> --symbols <path> [--previous <result>]` so a developer can retain a useful partial result, add exact matching symbols, and produce a readable result for the same crash identity with the prior processing attempt preserved.
+Add `faultlane crash process <dump> --crash-context <xml> --symbols <path> [--previous <result>]` so a developer can retain a useful partial result, add exact matching symbols, and produce a readable result for the same crash identity with the prior processing attempt preserved.
 
 ## Context
 
@@ -31,8 +31,8 @@ This composes two existing untrusted-input capabilities and adds a versioned loc
 
 ## Current behavior and evidence
 
-- `cachelane crash parse <xml>` emits stable normalized JSON with `parser_version`.
-- `cachelane crash symbolicate <dump> --symbols <path>` emits stable raw and resolved stack JSON with exact artifact identities and processor versions.
+- `faultlane crash parse <xml>` emits stable normalized JSON with `parser_version`.
+- `faultlane crash symbolicate <dump> --symbols <path>` emits stable raw and resolved stack JSON with exact artifact identities and processor versions.
 - Missing or mismatched symbols already produce successful partial results rather than hiding the crash.
 - The synthetic Windows fixture resolves `CrashFixture()` and its inline frame when the exact PE and PDB are available.
 - The existing CLI has no local processing result, prior-result input, or history validation.
@@ -50,7 +50,7 @@ This composes two existing untrusted-input capabilities and adds a versioned loc
 
 ## Verification
 
-- `cargo test -p cachelane-cli --test entrypoint`
+- `cargo test -p faultlane-cli --test entrypoint`
 - First fixture run against an empty symbol directory returns raw frames and `missing_pe` for the fixture module.
 - Second fixture run against the checked-in exact PE and PDB, using the first output as `--previous`, resolves `CrashFixture()` while retaining the partial attempt.
 - Repeating the second run with unchanged inputs produces byte-for-byte identical output and does not grow history.
@@ -81,7 +81,7 @@ Ship the command as an additive local feature. Roll back by reverting the pull r
 
 ## Result
 
-- `cachelane crash process` emits a versioned result with normalized crash context, the current symbolication attempt, and bounded prior attempts.
+- `faultlane crash process` emits a versioned result with normalized crash context, the current symbolication attempt, and bounded prior attempts.
 - Reprocessing the synthetic crash after exact PE and PDB artifacts arrive resolves `CrashFixture()` and retains the earlier missing-symbol frames and processor versions.
 - Unchanged reprocessing is byte-stable and does not grow history.
 - Prior results are capped at 64 MiB and 16 attempts. Malformed, nested, incompatible, excessive, and cross-crash input fails with fixed safe errors.

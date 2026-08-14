@@ -20,18 +20,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CACHELANE_TEST_DATABASE_URL: postgres://cachelane_test:cachelane_test_dev@127.0.0.1:5432/cachelane_test
+      FAULTLANE_TEST_DATABASE_URL: postgres://faultlane_test:faultlane_test_dev@127.0.0.1:5432/faultlane_test
     services:
       postgres:
         image: postgres:17.6-alpine
         env:
-          POSTGRES_DB: cachelane_test
-          POSTGRES_PASSWORD: cachelane_test_dev
-          POSTGRES_USER: cachelane_test
+          POSTGRES_DB: faultlane_test
+          POSTGRES_PASSWORD: faultlane_test_dev
+          POSTGRES_USER: faultlane_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U cachelane_test -d cachelane_test"
+          --health-cmd "pg_isready -U faultlane_test -d faultlane_test"
           --health-interval 3s
           --health-timeout 3s
           --health-retries 20

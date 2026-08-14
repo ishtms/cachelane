@@ -1,12 +1,12 @@
 # Project creation and write-only crash URLs
 
-Issue: [#295](https://github.com/ishtms/cachelane/issues/295)
+Issue: [#295](https://github.com/ishtms/faultlane/issues/295)
 
 Status: Completed through PR #342 on August 13, 2026. No production deployment was performed.
 
 ## Outcome
 
-When a bootstrap administrator uses the setup page, CacheLane creates an account, organization, and project, then shows one generated UE 5.8 `DataRouterUrl` whose key is recognized only by the ingest authorization boundary.
+When a bootstrap administrator uses the setup page, FaultLane creates an account, organization, and project, then shows one generated UE 5.8 `DataRouterUrl` whose key is recognized only by the ingest authorization boundary.
 
 ## Context
 
@@ -17,7 +17,7 @@ Issue #295 is the dependency root for durable ingest, symbol upload, hosted auth
 Two issue dependencies need an explicit interpretation before implementation:
 
 - #295 assumes an authenticated actor, while full GitHub and email authentication belongs to #310 and #310 currently depends on #295.
-- #295 asks its proof to submit to the ingest route, while durable crash acceptance belongs to #296. CacheLane must not return a successful ingest response before raw data and the processing job are durable.
+- #295 asks its proof to submit to the ingest route, while durable crash acceptance belongs to #296. FaultLane must not return a successful ingest response before raw data and the processing job are durable.
 
 The proposed resolution is a loopback-only bootstrap administrator adapter for local and staging proof. It creates the first user record and supplies an authenticated actor to the same Rust authorization boundary that #310 will later use. The generated ingest key can be resolved by the ingest authorization capability, but `POST /u/{key}` does not return success until #296 implements durable persistence.
 
@@ -44,10 +44,10 @@ The initial rollout remains local and staging-only. It does not configure a host
 
 ## Current behavior and evidence
 
-- `cachelane-server api` and `cachelane-server ingest` use the same Axum router and expose only health routes.
-- `cachelane-server migrate` logs a placeholder message and does not connect to PostgreSQL.
+- `faultlane-server api` and `faultlane-server ingest` use the same Axum router and expose only health routes.
+- `faultlane-server migrate` logs a placeholder message and does not connect to PostgreSQL.
 - `migrations/` contains no schema.
-- `openapi/cachelane.yaml` defines only health operations.
+- `openapi/faultlane.yaml` defines only health operations.
 - The web app has no forms, API client, authentication state, or behavior-test harness.
 - Docker Compose and `.env.example` already define local PostgreSQL and service URLs.
 - `ARCHITECTURE.md` makes PostgreSQL authoritative for users, organizations, memberships, projects, and credentials. It requires authorization in Rust and organization plus project scope on every row access.
@@ -78,7 +78,7 @@ The workspace currently lacks a PostgreSQL client and cryptographic credential p
 
 ### Ingest keys
 
-Generate at least 256 bits from the operating-system random source. Prefix the encoded value with a fixed CacheLane key marker so accidental misuse is recognizable. Hash the complete key before insertion and zero or drop the raw value after the one response is serialized. Never implement lookup by filename, user-supplied project ID, or a stored plaintext prefix.
+Generate at least 256 bits from the operating-system random source. Prefix the encoded value with a fixed FaultLane key marker so accidental misuse is recognizable. Hash the complete key before insertion and zero or drop the raw value after the one response is serialized. Never implement lookup by filename, user-supplied project ID, or a stored plaintext prefix.
 
 Rotation creates a new active key so a developer can update packaged builds without downtime. Revocation is a separate idempotent operation. List and setup responses expose key IDs, creation and revocation state, and a short suffix, never a recoverable key.
 
@@ -126,7 +126,7 @@ API behavior tests must exercise the real Axum router with PostgreSQL. Browser t
 Because the repository has no hosted staging target, the proposed staging evidence is an isolated Docker Compose project with unique ports and volumes:
 
 1. bootstrap a clean PostgreSQL instance;
-2. apply migrations through `cachelane-server migrate`;
+2. apply migrations through `faultlane-server migrate`;
 3. start the API and web roles on loopback with bootstrap auth explicitly enabled;
 4. create a project through the setup page;
 5. verify only the digest and suffix exist in PostgreSQL;
@@ -142,8 +142,8 @@ Human approval must state whether this local isolated environment satisfies the 
 
 The approved local staging gate passed on August 13, 2026:
 
-- The isolated `cachelane295staging` Compose project used dedicated PostgreSQL, MinIO, network, volumes, and ports. No shared or production resource was used.
-- `cachelane-server migrate` succeeded twice against a clean PostgreSQL 17.6 database.
+- The isolated `faultlane295staging` Compose project used dedicated PostgreSQL, MinIO, network, volumes, and ports. No shared or production resource was used.
+- `faultlane-server migrate` succeeded twice against a clean PostgreSQL 17.6 database.
 - The PostgreSQL behavior test proved concurrent setup creates one complete tenant, only the SHA-256 key digest is stored, cross-organization lookup returns not found, and a fresh server state resolves the persisted active key.
 - The API, ingest, and production web processes passed `scripts/smoke` on loopback.
 - Installed Chrome completed project creation, one-time key display, configuration rendering, secret-free refresh, overlapping rotation, control-route denial, revocation, and active versus revoked ingest resolution.

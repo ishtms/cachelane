@@ -1,5 +1,5 @@
 name: Bug
-description: Report reproducible incorrect CacheLane behavior
+description: Report reproducible incorrect FaultLane behavior
 title: ""
 labels:
   - bug
@@ -29,7 +29,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Include the CacheLane version, Unreal version, platform, architecture, and build configuration when relevant.
+      description: Include the FaultLane version, Unreal version, platform, architecture, and build configuration when relevant.
   - type: dropdown
     id: risk
     attributes:

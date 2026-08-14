@@ -5,12 +5,12 @@ import {
   type ExistingSetup,
   setupApi,
   setupErrorMessage,
-} from "../../lib/cachelane";
+} from "../../lib/faultlane";
 import { RevokeKey, RotateKey } from "./key-actions";
 import { SetupForm } from "./setup-form";
 
 export const metadata: Metadata = {
-  title: "Project setup | CacheLane",
+  title: "Project setup | FaultLane",
 };
 
 async function ExistingProject({ projectId }: { projectId: string }) {
@@ -60,11 +60,11 @@ export default async function SetupPage({
   return (
     <main>
       <nav className="nav">
-        <Link className="brand" href="/" aria-label="CacheLane home">
+        <Link className="brand" href="/" aria-label="FaultLane home">
           <span className="brand-mark" aria-hidden="true">
-            C
+            F
           </span>
-          CacheLane
+          FaultLane
         </Link>
         <span className="phase">Local bootstrap</span>
       </nav>

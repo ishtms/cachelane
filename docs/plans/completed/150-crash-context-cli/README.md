@@ -1,10 +1,10 @@
 # Crash context CLI parsing
 
-Issue: [#150](https://github.com/ishtms/cachelane/issues/150)
+Issue: [#150](https://github.com/ishtms/faultlane/issues/150)
 
 ## Outcome
 
-`cachelane crash parse <path>` reads one local `CrashContext.runtime-xml` file and prints the existing versioned deterministic normalized JSON representation.
+`faultlane crash parse <path>` reads one local `CrashContext.runtime-xml` file and prints the existing versioned deterministic normalized JSON representation.
 
 This is one bounded stage toward the M0 command-line prototype. Issue #150 remains open for real Windows report bundles, exact PDB and PE matching, and readable stacks.
 
@@ -34,7 +34,7 @@ The existing parser and serializer are sufficient. The CLI only needs to compose
 
 ## Implementation sequence
 
-1. Add existing workspace dependencies from `apps/cli` to `cachelane-unreal` and `serde_json`.
+1. Add existing workspace dependencies from `apps/cli` to `faultlane-unreal` and `serde_json`.
 2. Add the nested `crash parse` command and keep the existing top-level help and version behavior.
 3. Read at most 4 MiB plus one byte, reject oversized or invalid UTF-8 input, parse with a 100,000-node limit, and extract with default options.
 4. Write deterministic JSON to stdout and report safe failures on stderr with a non-zero exit code.
@@ -42,10 +42,10 @@ The existing parser and serializer are sufficient. The CLI only needs to compose
 
 ## Verification
 
-- `cargo test -p cachelane-cli`
+- `cargo test -p faultlane-cli`
 - `./scripts/check-fast`
 - `./scripts/check`
-- `cargo run -q -p cachelane-cli -- crash parse apps/cli/tests/fixtures/crash-context.xml`
+- `cargo run -q -p faultlane-cli -- crash parse apps/cli/tests/fixtures/crash-context.xml`
 - Run the proof command twice and compare stdout byte for byte.
 
 `./scripts/smoke` is not required for the PR stage because it checks the server and web roles, which do not change. The CLI proof exercises the changed runtime boundary directly.
@@ -72,11 +72,11 @@ Roll back by reverting the CLI dependency edges, command implementation, tests, 
 
 ## Result
 
-- `cachelane crash parse <path>` emits the existing parser-versioned normalized JSON with command-line data excluded.
+- `faultlane crash parse <path>` emits the existing parser-versioned normalized JSON with command-line data excluded.
 - File input is capped at 4 MiB and XML parsing is capped at 100,000 nodes.
 - Safe non-zero failures cover missing files, oversized input, invalid UTF-8, malformed XML, DTD declarations, wrong roots, and the node limit.
 - Nine CLI behavior tests pass, including exact JSON and repeated byte-for-byte output checks.
-- `cargo test -p cachelane-cli`, `./scripts/check-fast`, and `./scripts/check` passed locally.
+- `cargo test -p faultlane-cli`, `./scripts/check-fast`, and `./scripts/check` passed locally.
 - The runtime proof command produced the expected deterministic JSON from the synthetic fixture.
 
 ## Unresolved decisions

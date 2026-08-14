@@ -1,6 +1,6 @@
 # Crash context data extraction
 
-Issue: [#43](https://github.com/ishtms/cachelane/issues/43)
+Issue: [#43](https://github.com/ishtms/faultlane/issues/43)
 
 ## Context
 
@@ -45,7 +45,7 @@ The blast radius is limited to workspace builds and future callers of the Unreal
 
 ## Verification
 
-- `cargo test -p cachelane-unreal`
+- `cargo test -p faultlane-unreal`
 - `./scripts/check-fast`
 - `./scripts/check`
 
@@ -74,4 +74,4 @@ None. Real fixture evidence may add compatible source-field aliases without chan
 
 ## Result
 
-Crash-context data extraction shipped in [#279](https://github.com/ishtms/cachelane/pull/279). The extractor preserves source order, retains unknown-compatible data, excludes command lines by default, and has synthetic coverage for complete and partial runtime documents.
+Crash-context data extraction shipped in [#279](https://github.com/ishtms/faultlane/pull/279). The extractor preserves source order, retains unknown-compatible data, excludes command lines by default, and has synthetic coverage for complete and partial runtime documents.

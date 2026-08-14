@@ -296,7 +296,7 @@ fn run_symbolicator(
 
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("cachelane-symbolicator".to_owned())
+        .name("faultlane-symbolicator".to_owned())
         .spawn(move || {
             let _ = sender.send(operation());
         })
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn rejects_oversized_dumps_before_parsing() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!(
-            "cachelane-symbolicate-{}-oversized.dmp",
+            "faultlane-symbolicate-{}-oversized.dmp",
             std::process::id()
         ));
         let mut file = File::create(&path)?;

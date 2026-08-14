@@ -1,5 +1,5 @@
 name: Feature
-description: Propose executable CacheLane product behavior
+description: Propose executable FaultLane product behavior
 title: ""
 labels:
   - feature
@@ -9,7 +9,7 @@ body:
     attributes:
       label: Executable outcome
       description: Complete this sentence with a real command, API, UI, or runtime entrypoint.
-      placeholder: When <actor or input> uses <entrypoint>, CacheLane now <new observable result>.
+      placeholder: When <actor or input> uses <entrypoint>, FaultLane now <new observable result>.
     validations:
       required: true
   - type: textarea
