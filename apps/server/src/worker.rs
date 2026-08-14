@@ -1908,9 +1908,10 @@ mod tests {
     fn test_temp_directory() -> PathBuf {
         #[cfg(windows)]
         {
-            env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .map_or_else(env::temp_dir, |path| path.join("Temp"))
+            let Some(path) = env::var_os("USERPROFILE") else {
+                panic!("Windows test profile must exist");
+            };
+            PathBuf::from(path)
         }
         #[cfg(not(windows))]
         env::temp_dir()
