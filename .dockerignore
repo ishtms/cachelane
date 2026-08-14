@@ -12,3 +12,6 @@
 !apps/server/src/**
 !crates/
 !crates/**
+!deploy/
+!deploy/processor/
+!deploy/processor/proof-wrapper

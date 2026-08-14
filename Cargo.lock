@@ -1191,6 +1191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "faultlane-grouping"
+version = "0.1.0"
+dependencies = [
+ "faultlane-processing",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "faultlane-processing"
 version = "0.1.0"
 dependencies = [
@@ -1209,6 +1218,7 @@ dependencies = [
  "base64",
  "clap",
  "faultlane-domain",
+ "faultlane-grouping",
  "faultlane-processing",
  "faultlane-symbols",
  "faultlane-unreal",

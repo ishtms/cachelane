@@ -38,6 +38,7 @@ const DEFAULT_PROJECT_LIMIT: u32 = 120;
 const DEFAULT_IP_LIMIT: u32 = 60;
 const MAX_QUERY_BYTES: usize = 2048;
 const MAX_GUID_BYTES: usize = 128;
+const MAX_RELEASE_CANDIDATES: usize = 100;
 const RATE_LIMIT_PROJECT: &str = "project";
 const RATE_LIMIT_IP: &str = "ip";
 type HmacSha256 = Hmac<Sha256>;
@@ -148,6 +149,14 @@ impl CrashIngest {
     }
 
     #[cfg(test)]
+    pub(crate) fn control_test(pool: PgPool) -> Self {
+        Self {
+            pool: Some(pool),
+            ..Self::disabled()
+        }
+    }
+
+    #[cfg(test)]
     fn test(pool: PgPool, objects: Arc<dyn ObjectStore>, spool_directory: PathBuf) -> Self {
         validate_spool_directory(&spool_directory)
             .unwrap_or_else(|error| panic!("test spool directory must be valid: {error}"));
@@ -236,6 +245,18 @@ struct EventState {
     reason: Option<String>,
     retryable: bool,
     retry_at: Option<String>,
+    grouping_state: String,
+    fingerprint_algorithm: Option<String>,
+    fingerprint_version: Option<i32>,
+    fingerprint: Option<String>,
+    variant_fingerprint: Option<String>,
+    grouping_quality: Option<i32>,
+    issue_id: Option<String>,
+    issue_path: Option<String>,
+    release_mapping_state: String,
+    release_id: Option<String>,
+    candidate_release_ids: Vec<String>,
+    candidate_release_ids_truncated: bool,
     received_at: String,
     updated_at: String,
 }
@@ -413,14 +434,17 @@ pub(crate) async fn get_event_state(
     }
     let pool = state.crash_ingest().pool()?;
     let row = sqlx::query(
-        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1 AND e.id::text = $2",
+        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1 AND e.id::text = $2",
     )
-    .bind(project_id)
+    .bind(&project_id)
     .bind(event_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| IngestError::Internal)?
     .ok_or(IngestError::NotFound)?;
+    let issue_id: Option<String> = row.get("issue_id");
+    let (candidate_release_ids, candidate_release_ids_truncated) =
+        bounded_candidate_release_ids(row.get("candidate_release_ids"));
     let event = EventState {
         event_id: row.get("event_id"),
         project_id: row.get("project_id"),
@@ -430,6 +454,20 @@ pub(crate) async fn get_event_state(
         reason: row.get("state_reason"),
         retryable: row.get("retryable"),
         retry_at: row.get("retry_at"),
+        grouping_state: row.get("grouping_state"),
+        fingerprint_algorithm: row.get("fingerprint_algorithm"),
+        fingerprint_version: row.get("fingerprint_version"),
+        fingerprint: row.get("fingerprint"),
+        variant_fingerprint: row.get("variant_fingerprint"),
+        grouping_quality: row.get("grouping_quality"),
+        issue_path: issue_id
+            .as_ref()
+            .map(|issue_id| format!("/api/v1/projects/{project_id}/issues/{issue_id}")),
+        issue_id,
+        release_mapping_state: row.get("release_mapping_state"),
+        release_id: row.get("release_id"),
+        candidate_release_ids,
+        candidate_release_ids_truncated,
         received_at: row.get("received_at"),
         updated_at: row.get("updated_at"),
     };
@@ -937,6 +975,12 @@ fn processing_state(value: &str) -> Result<ProcessingState, IngestError> {
     }
 }
 
+fn bounded_candidate_release_ids(mut candidates: Vec<String>) -> (Vec<String>, bool) {
+    let truncated = candidates.len() > MAX_RELEASE_CANDIDATES;
+    candidates.truncate(MAX_RELEASE_CANDIDATES);
+    (candidates, truncated)
+}
+
 fn random_uuid() -> Result<String, IngestError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| IngestError::Internal)?;
@@ -1071,7 +1115,10 @@ mod tests {
 
     #[cfg(unix)]
     use super::validate_spool_directory;
-    use super::{CrashIngest, UnrealQuery, random_uuid, source_ip, usable_crash_guid};
+    use super::{
+        CrashIngest, UnrealQuery, bounded_candidate_release_ids, random_uuid, source_ip,
+        usable_crash_guid,
+    };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
     use axum::{
         body::{Body, to_bytes},
@@ -1153,6 +1200,16 @@ mod tests {
             UnrealQuery::parse(Some("UploadType=crashreports&UploadType=crashreports")).is_err()
         );
         assert!(UnrealQuery::parse(Some(&"a".repeat(super::MAX_QUERY_BYTES + 1))).is_err());
+    }
+
+    #[test]
+    fn candidate_release_evidence_is_bounded() {
+        let candidates = (0..=super::MAX_RELEASE_CANDIDATES)
+            .map(|index| index.to_string())
+            .collect();
+        let (candidates, truncated) = bounded_candidate_release_ids(candidates);
+        assert_eq!(candidates.len(), super::MAX_RELEASE_CANDIDATES);
+        assert!(truncated);
     }
 
     #[cfg(unix)]

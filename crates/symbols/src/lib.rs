@@ -21,9 +21,10 @@ mod symbolicate;
 mod symcache;
 
 pub use symbolicate::{
-    FrameSymbolStatus, InlineSymbol, ModuleSymbolStatus, SymbolicatedFrame, SymbolicatedModule,
-    SymbolicatedThread, SymbolicationError, SymbolicationErrorKind, SymbolicationLimits,
-    SymbolicationResult, ThreadUnwindStatus, symbolicate_minidump, symbolicate_minidump_bytes,
+    FrameSymbolStatus, InlineSymbol, ModuleSymbolStatus, SYMBOLICATION_SCHEMA_VERSION,
+    SymbolicatedFrame, SymbolicatedModule, SymbolicatedThread, SymbolicationError,
+    SymbolicationErrorKind, SymbolicationLimits, SymbolicationResult, ThreadUnwindStatus,
+    symbolicate_minidump, symbolicate_minidump_bytes,
 };
 pub use symcache::{
     SYMCACHE_FORMAT_VERSION, SYMCACHE_PROCESSOR_VERSION, SymCacheArtifact, SymCacheGenerationError,

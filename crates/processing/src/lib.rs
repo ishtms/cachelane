@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub const RESULT_SCHEMA_VERSION: u32 = 1;
-pub const PROCESSING_VERSION: u32 = 1;
+pub const PROCESSING_VERSION: u32 = 2;
 pub const MAX_PROCESSING_HISTORY: usize = 16;
 const MAX_CRASH_CONTEXT_NODES: u32 = 100_000;
 
@@ -247,6 +247,26 @@ pub fn validate_processing_result(
     result: &Value,
     expected_crash_guid: Option<&str>,
 ) -> Result<(), ProcessingResultError> {
+    validate_processing_contract(result, expected_crash_guid, false)
+}
+
+/// Validates a newly emitted result and requires the current processing contract.
+///
+/// # Errors
+///
+/// Returns an error when the result is historical or any shared contract field is invalid.
+pub fn validate_current_processing_result(
+    result: &Value,
+    expected_crash_guid: Option<&str>,
+) -> Result<(), ProcessingResultError> {
+    validate_processing_contract(result, expected_crash_guid, true)
+}
+
+fn validate_processing_contract(
+    result: &Value,
+    expected_crash_guid: Option<&str>,
+    require_current: bool,
+) -> Result<(), ProcessingResultError> {
     let result = result
         .as_object()
         .ok_or(ProcessingResultError::InvalidPrevious)?;
@@ -285,11 +305,16 @@ pub fn validate_processing_result(
     if history.len() > MAX_PROCESSING_HISTORY {
         return Err(ProcessingResultError::PreviousHistoryTooLong);
     }
-    validate_attempt(
-        result
-            .get("current")
-            .ok_or(ProcessingResultError::InvalidPrevious)?,
-    )?;
+    let current = result
+        .get("current")
+        .ok_or(ProcessingResultError::InvalidPrevious)?;
+    if require_current
+        && current.get("processing_version").and_then(Value::as_u64)
+            != Some(u64::from(PROCESSING_VERSION))
+    {
+        return Err(ProcessingResultError::UnsupportedPreviousProcessing);
+    }
+    validate_attempt(current)?;
     for attempt in history {
         validate_attempt(attempt)?;
     }
@@ -629,11 +654,13 @@ fn validate_attempt(attempt: &Value) -> Result<(), ProcessingResultError> {
     {
         return Err(ProcessingResultError::InvalidPrevious);
     }
-    match attempt.get("processing_version").and_then(Value::as_u64) {
-        Some(version) if version == u64::from(PROCESSING_VERSION) => {}
+    let processing_version = match attempt.get("processing_version").and_then(Value::as_u64) {
+        Some(version) if (1..=u64::from(PROCESSING_VERSION)).contains(&version) => {
+            u32::try_from(version).map_err(|_| ProcessingResultError::InvalidPrevious)?
+        }
         Some(_) => return Err(ProcessingResultError::UnsupportedPreviousProcessing),
         None => return Err(ProcessingResultError::InvalidPrevious),
-    }
+    };
     if !attempt.get("parser_version").is_some_and(Value::is_u64) {
         return Err(ProcessingResultError::InvalidPrevious);
     }
@@ -641,15 +668,19 @@ fn validate_attempt(attempt: &Value) -> Result<(), ProcessingResultError> {
         attempt
             .get("symbolication")
             .ok_or(ProcessingResultError::InvalidPrevious)?,
+        processing_version,
     )?;
     Ok(())
 }
 
-fn validate_symbolication(symbolication: &Value) -> Result<(), ProcessingResultError> {
+fn validate_symbolication(
+    symbolication: &Value,
+    processing_version: u32,
+) -> Result<(), ProcessingResultError> {
     let symbolication = symbolication
         .as_object()
         .ok_or(ProcessingResultError::InvalidPrevious)?;
-    validate_symbolication_header(symbolication)?;
+    validate_symbolication_header(symbolication, processing_version)?;
     validate_modules(
         symbolication
             .get("modules")
@@ -666,28 +697,42 @@ fn validate_symbolication(symbolication: &Value) -> Result<(), ProcessingResultE
 
 fn validate_symbolication_header(
     symbolication: &serde_json::Map<String, Value>,
+    processing_version: u32,
 ) -> Result<(), ProcessingResultError> {
-    if symbolication.len() != 10
-        || !only_keys(
-            symbolication,
-            &[
-                "schema_version",
-                "symbolicator_version",
-                "minidump_version",
-                "minidump_processor_version",
-                "minidump_unwind_version",
-                "platform",
-                "architecture",
-                "faulting_thread_id",
-                "modules",
-                "threads",
-            ],
-        )
-        || symbolication.get("schema_version").and_then(Value::as_u64) != Some(1)
+    let mut fields = vec![
+        "schema_version",
+        "symbolicator_version",
+        "minidump_version",
+        "minidump_processor_version",
+        "minidump_unwind_version",
+        "platform",
+        "architecture",
+        "faulting_thread_id",
+        "modules",
+        "threads",
+    ];
+    let expected_schema = if processing_version == 1 {
+        1
+    } else {
+        fields.extend(["exception_reason", "assertion"]);
+        2
+    };
+    if symbolication.len() != fields.len()
+        || !only_keys(symbolication, &fields)
+        || symbolication.get("schema_version").and_then(Value::as_u64) != Some(expected_schema)
         || symbolication.get("platform").and_then(Value::as_str) != Some("windows")
         || symbolication.get("architecture").and_then(Value::as_str) != Some("x86_64")
         || !symbolication.get("modules").is_some_and(Value::is_array)
         || !symbolication.get("threads").is_some_and(Value::is_array)
+    {
+        return Err(ProcessingResultError::InvalidPrevious);
+    }
+    if processing_version == 2
+        && ["exception_reason", "assertion"].iter().any(|field| {
+            symbolication
+                .get(*field)
+                .is_none_or(|value| !nullable_string(value))
+        })
     {
         return Err(ProcessingResultError::InvalidPrevious);
     }
@@ -906,7 +951,9 @@ fn only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool 
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{ProcessingResultError, validate_processing_result};
+    use super::{
+        ProcessingResultError, validate_current_processing_result, validate_processing_result,
+    };
 
     fn result() -> Value {
         json!({
@@ -983,6 +1030,30 @@ mod tests {
         assert_eq!(
             validate_processing_result(&wrong_identity, None),
             Err(ProcessingResultError::PreviousIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_version_one_history_but_requires_version_two_for_new_results() {
+        let historical = result();
+        assert_eq!(validate_processing_result(&historical, None), Ok(()));
+        assert_eq!(
+            validate_current_processing_result(&historical, None),
+            Err(ProcessingResultError::UnsupportedPreviousProcessing)
+        );
+
+        let mut current = historical;
+        current["current"]["processing_version"] = json!(2);
+        current["current"]["symbolication"]["schema_version"] = json!(2);
+        current["current"]["symbolication"]["exception_reason"] =
+            json!("EXCEPTION_ACCESS_VIOLATION_READ");
+        current["current"]["symbolication"]["assertion"] = Value::Null;
+        assert_eq!(validate_current_processing_result(&current, None), Ok(()));
+
+        current["current"]["symbolication"]["schema_version"] = json!(1);
+        assert_eq!(
+            validate_processing_result(&current, None),
+            Err(ProcessingResultError::InvalidPrevious)
         );
     }
 }

@@ -1054,8 +1054,15 @@ fn reprocesses_a_partial_crash_after_symbols_arrive() -> Result<(), Box<dyn Erro
     assert_eq!(partial["schema_version"], 1);
     assert_eq!(partial["crash_guid"], "UECC-Synthetic-150");
     assert_eq!(partial["crash_context"]["parser_version"], 1);
-    assert_eq!(partial["current"]["processing_version"], 1);
+    assert_eq!(partial["current"]["processing_version"], 2);
     assert_eq!(partial["current"]["parser_version"], 1);
+    assert_eq!(partial["current"]["symbolication"]["schema_version"], 2);
+    assert!(
+        partial["current"]["symbolication"]["exception_reason"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(partial["current"]["symbolication"]["assertion"].is_null());
     assert!(partial["history"].as_array().is_some_and(Vec::is_empty));
     assert!(
         partial["current"]["symbolication"]["modules"]
@@ -1135,7 +1142,7 @@ fn rejects_invalid_previous_results_without_echoing_input() -> Result<(), Box<dy
     let mut unsupported_schema = valid.clone();
     unsupported_schema["schema_version"] = 2.into();
     let mut unsupported_processing = valid.clone();
-    unsupported_processing["current"]["processing_version"] = 2.into();
+    unsupported_processing["current"]["processing_version"] = 3.into();
     let mut mismatch = valid.clone();
     mismatch["crash_guid"] = "private-do-not-echo".into();
     let mut excessive_history = valid.clone();

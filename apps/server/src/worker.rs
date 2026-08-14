@@ -29,6 +29,7 @@ const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SELECTED_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STORED_RELEASE_CANDIDATES: i64 = 101;
 const SCRATCH_MARKER: &[u8] = b"faultlane-worker-scratch-v1\n";
 
 pub(crate) async fn run() -> Result<(), WorkerStartupError> {
@@ -52,6 +53,8 @@ pub(crate) async fn run() -> Result<(), WorkerStartupError> {
         runner,
         scratch: Arc::new(scratch),
         instance_id: Arc::from(worker_id),
+        grouping_enabled: env::var("FAULTLANE_GROUPING_ENABLED")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
     };
     worker.reconcile_containers().await?;
     worker.run_loop().await
@@ -89,6 +92,7 @@ struct Worker {
     runner: ProcessorRunner,
     scratch: Arc<PathBuf>,
     instance_id: Arc<str>,
+    grouping_enabled: bool,
 }
 
 impl Worker {
@@ -483,7 +487,10 @@ impl Worker {
             .await?;
         let inspected: Value = strict_json(&inspection.stdout)?;
         validate_processing_result(&inspected, Some(&crash_guid))?;
-        let selection = self.materialize_symbols(job, &attempt, &inspected).await?;
+        let release = self.resolve_release(job, &inspected).await?;
+        let selection = self
+            .materialize_symbols(job, &attempt, &inspected, &release)
+            .await?;
         let (result, state, reason) = match selection {
             SymbolSelection::Dependency => return Err(JobError::Dependency),
             SymbolSelection::Missing => (inspected, "awaiting_symbols", "matching_symbols_missing"),
@@ -506,55 +513,58 @@ impl Worker {
                 }
             }
         };
-        self.publish_crash_result(job, event_id, result, state, reason)
+        if release.lookup != release_lookup(&result)? {
+            return Err(JobError::Deterministic("processor_output_invalid"));
+        }
+        self.publish_crash_result(job, event_id, result, state, reason, &release)
             .await
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keeps tenant-scoped symbol selection in one auditable flow"
-    )]
+    async fn resolve_release(
+        &self,
+        job: &Job,
+        result: &Value,
+    ) -> Result<ReleaseResolution, JobError> {
+        let Some(lookup) = release_lookup(result)? else {
+            return Ok(ReleaseResolution {
+                lookup: None,
+                candidates: Vec::new(),
+            });
+        };
+        let candidates = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM releases WHERE organization_id::text = $1 AND project_id::text = $2 AND version = $3 AND platform = $4 AND architecture = $5 AND lower(configuration) = lower($6) ORDER BY id LIMIT $7",
+        )
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(&lookup.version)
+        .bind(&lookup.platform)
+        .bind(&lookup.architecture)
+        .bind(&lookup.configuration)
+        .bind(MAX_STORED_RELEASE_CANDIDATES)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+        Ok(ReleaseResolution {
+            lookup: Some(lookup),
+            candidates,
+        })
+    }
+
     async fn materialize_symbols(
         &self,
         job: &Job,
         attempt: &AttemptDirectory,
         result: &Value,
+        release: &ReleaseResolution,
     ) -> Result<SymbolSelection, JobError> {
-        let context = result
-            .get("crash_context")
-            .and_then(Value::as_object)
+        let Some(release_id) = release.matched_id() else {
+            return Ok(SymbolSelection::Missing);
+        };
+        let architecture = release
+            .lookup
+            .as_ref()
+            .map(|lookup| lookup.architecture.as_str())
             .ok_or(JobError::Deterministic("processor_output_invalid"))?;
-        let Some(version) = context.get("build_version").and_then(Value::as_str) else {
-            return Ok(SymbolSelection::Missing);
-        };
-        let Some(platform) = context
-            .get("platform")
-            .and_then(|value| value.get("normalized"))
-            .and_then(Value::as_str)
-        else {
-            return Ok(SymbolSelection::Missing);
-        };
-        let Some(architecture) = context.get("architecture").and_then(Value::as_str) else {
-            return Ok(SymbolSelection::Missing);
-        };
-        let Some(configuration) = context.get("build_configuration").and_then(Value::as_str) else {
-            return Ok(SymbolSelection::Missing);
-        };
-        let releases = sqlx::query_scalar::<_, String>(
-            "SELECT id::text FROM releases WHERE organization_id::text = $1 AND project_id::text = $2 AND version = $3 AND platform = $4 AND architecture = $5 AND lower(configuration) = lower($6) ORDER BY id LIMIT 2",
-        )
-        .bind(&job.organization_id)
-        .bind(&job.project_id)
-        .bind(version)
-        .bind(platform)
-        .bind(architecture)
-        .bind(configuration)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| JobError::Transient("database_unavailable"))?;
-        let [release_id] = releases.as_slice() else {
-            return Ok(SymbolSelection::Missing);
-        };
         let modules = processing_modules(result)?;
         let rows = sqlx::query(
             "SELECT m.artifact_type, m.module_name, m.architecture, m.debug_id, m.code_id, o.id::text AS object_id, o.object_key, o.checksum, o.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id AND d.processing_status = 'available' JOIN artifact_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id AND o.lifecycle_state = 'stored' WHERE m.release_id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available'",
@@ -947,7 +957,10 @@ impl Worker {
         result: Value,
         state: &str,
         reason: &str,
+        release: &ReleaseResolution,
     ) -> Result<(), JobError> {
+        let (schema_version, processing_version) = processing_versions(&result)?;
+        let grouping = grouping_publication(self.grouping_enabled, &result)?;
         let bytes = serde_json::to_vec(&result)
             .map_err(|_| JobError::Deterministic("processor_output_invalid"))?;
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
@@ -958,18 +971,29 @@ impl Worker {
             .await
             .map_err(|_| JobError::Transient("database_unavailable"))?;
         lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
+        let existing = lock_event(&mut transaction, job, event_id).await?;
+        let existing_grouped = existing.state == "grouped";
         let stored_id: String = sqlx::query_scalar(
-            "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 1, 1, $5, $6) ON CONFLICT (event_id, processing_version, checksum) DO UPDATE SET checksum = EXCLUDED.checksum RETURNING id::text",
+            "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8) ON CONFLICT (event_id, processing_version, checksum) DO UPDATE SET checksum = EXCLUDED.checksum RETURNING id::text",
         )
         .bind(result_id)
         .bind(&job.organization_id)
         .bind(&job.project_id)
         .bind(event_id)
+        .bind(schema_version)
+        .bind(processing_version)
         .bind(result)
         .bind(checksum.as_slice())
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
+        record_release_mapping(&mut transaction, job, event_id, release).await?;
+        let issue_id = apply_grouping(&mut transaction, job, event_id, existing, &grouping).await?;
+        if let Some(issue_id) = issue_id.as_deref()
+            && (self.grouping_enabled || existing_grouped)
+        {
+            recompute_issue(&mut transaction, job, issue_id, self.grouping_enabled).await?;
+        }
         let updated = sqlx::query(
             "UPDATE crash_events SET current_result_id = $4::uuid, processing_state = $5, state_reason = CASE WHEN $5 = 'processed' THEN NULL ELSE $6 END, retryable = false, retry_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
         )
@@ -989,7 +1013,23 @@ impl Worker {
         transaction
             .commit()
             .await
-            .map_err(|_| JobError::Transient("database_unavailable"))
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+        info!(
+            event_id,
+            project_id = job.project_id,
+            issue_id = issue_id.as_deref().unwrap_or(""),
+            processing_state = state,
+            grouping_state = if existing_grouped {
+                "grouped"
+            } else {
+                grouping.state()
+            },
+            release_mapping_state = release.state(),
+            fingerprint_algorithm = faultlane_grouping::FINGERPRINT_ALGORITHM,
+            fingerprint_version = faultlane_grouping::FINGERPRINT_VERSION,
+            "crash grouping published"
+        );
+        Ok(())
     }
 
     async fn wait_for_dependency(&self, job: &Job) -> Result<(), JobError> {
@@ -1186,6 +1226,7 @@ struct Job {
     lease_token: String,
 }
 
+#[derive(Debug)]
 enum JobError {
     LostLease,
     Dependency,
@@ -1303,6 +1344,71 @@ enum SymbolSelection {
     Ready(Vec<CacheManifestEntry>),
 }
 
+enum GroupingPublication {
+    Disabled,
+    Insufficient,
+    Grouped(faultlane_grouping::Fingerprint),
+}
+
+impl GroupingPublication {
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Insufficient => "insufficient",
+            Self::Grouped(_) => "grouped",
+        }
+    }
+}
+
+struct ExistingGrouping {
+    state: String,
+    issue_id: Option<String>,
+}
+
+struct ReleaseEvidence {
+    id: String,
+    build_timestamp: Option<time::OffsetDateTime>,
+}
+
+struct ReleaseChronology {
+    first: Option<String>,
+    last: Option<String>,
+    last_timestamp: Option<time::OffsetDateTime>,
+    release_count: usize,
+    valid: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseLookup {
+    version: String,
+    platform: String,
+    architecture: String,
+    configuration: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseResolution {
+    lookup: Option<ReleaseLookup>,
+    candidates: Vec<String>,
+}
+
+impl ReleaseResolution {
+    fn state(&self) -> &'static str {
+        match self.candidates.len() {
+            0 => "missing",
+            1 => "matched",
+            _ => "ambiguous",
+        }
+    }
+
+    fn matched_id(&self) -> Option<&str> {
+        let [release_id] = self.candidates.as_slice() else {
+            return None;
+        };
+        Some(release_id)
+    }
+}
+
 struct ModuleIdentity {
     module: String,
     debug_id: Option<String>,
@@ -1369,6 +1475,407 @@ enum CacheState {
         checksum: [u8; 32],
         size: u64,
     },
+}
+
+fn processing_versions(result: &Value) -> Result<(i32, i32), JobError> {
+    let schema = result
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    let processing = result
+        .pointer("/current/processing_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    Ok((schema, processing))
+}
+
+fn grouping_publication(enabled: bool, result: &Value) -> Result<GroupingPublication, JobError> {
+    if !enabled {
+        return Ok(GroupingPublication::Disabled);
+    }
+    match faultlane_grouping::fingerprint(result)
+        .map_err(|_| JobError::Deterministic("processor_output_invalid"))?
+    {
+        faultlane_grouping::GroupingOutcome::Grouped(fingerprint) => {
+            Ok(GroupingPublication::Grouped(fingerprint))
+        }
+        faultlane_grouping::GroupingOutcome::Insufficient => Ok(GroupingPublication::Insufficient),
+    }
+}
+
+async fn lock_event(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+) -> Result<ExistingGrouping, JobError> {
+    let row = sqlx::query(
+        "SELECT grouping_state, issue_id::text AS issue_id FROM crash_events WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+    )
+    .bind(event_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?
+    .ok_or(JobError::LostLease)?;
+    Ok(ExistingGrouping {
+        state: row.get("grouping_state"),
+        issue_id: row.get("issue_id"),
+    })
+}
+
+async fn record_release_mapping(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+    release: &ReleaseResolution,
+) -> Result<(), JobError> {
+    sqlx::query(
+        "DELETE FROM crash_event_release_candidates WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(event_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    for release_id in &release.candidates {
+        sqlx::query(
+            "INSERT INTO crash_event_release_candidates (organization_id, project_id, event_id, release_id) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) ON CONFLICT DO NOTHING",
+        )
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(event_id)
+        .bind(release_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+    }
+    let updated = sqlx::query(
+        "UPDATE crash_events SET release_id = $4::uuid, release_mapping_state = $5, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+    )
+    .bind(event_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(release.matched_id())
+    .bind(release.state())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::LostLease)
+    }
+}
+
+async fn apply_grouping(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+    existing: ExistingGrouping,
+    grouping: &GroupingPublication,
+) -> Result<Option<String>, JobError> {
+    if existing.state == "grouped" {
+        return existing
+            .issue_id
+            .map(Some)
+            .ok_or(JobError::Deterministic("grouping_state_invalid"));
+    }
+    let GroupingPublication::Grouped(fingerprint) = grouping else {
+        let state = match grouping {
+            GroupingPublication::Disabled => "disabled",
+            GroupingPublication::Insufficient => "insufficient",
+            GroupingPublication::Grouped(_) => {
+                return Err(JobError::Deterministic("grouping_state_invalid"));
+            }
+        };
+        let updated = sqlx::query(
+            "UPDATE crash_events SET grouping_state = $4, fingerprint_algorithm = $5, fingerprint_version = $6, issue_id = NULL, fingerprint = NULL, variant_fingerprint = NULL, grouping_quality = NULL, grouped_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND grouping_state <> 'grouped'",
+        )
+        .bind(event_id)
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(state)
+        .bind(faultlane_grouping::FINGERPRINT_ALGORITHM)
+        .bind(i32::try_from(faultlane_grouping::FINGERPRINT_VERSION).unwrap_or(i32::MAX))
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+        return if updated.rows_affected() == 1 {
+            Ok(None)
+        } else {
+            Err(JobError::LostLease)
+        };
+    };
+    assign_issue(transaction, job, event_id, fingerprint).await
+}
+
+async fn assign_issue(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+    fingerprint: &faultlane_grouping::Fingerprint,
+) -> Result<Option<String>, JobError> {
+    let issue_id = random_uuid().map_err(|_| JobError::Transient("random_unavailable"))?;
+    let stored_issue: String = sqlx::query_scalar(
+        "INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, first_seen_at, last_seen_at, event_count) SELECT $1::uuid, e.organization_id, e.project_id, $5, $6, $7, $8, e.received_at, e.received_at, 1 FROM crash_events e WHERE e.id::text = $2 AND e.organization_id::text = $3 AND e.project_id::text = $4 ON CONFLICT (organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint) DO UPDATE SET updated_at = issues.updated_at RETURNING id::text",
+    )
+    .bind(issue_id)
+    .bind(event_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(faultlane_grouping::FINGERPRINT_ALGORITHM)
+    .bind(i32::try_from(faultlane_grouping::FINGERPRINT_VERSION).unwrap_or(i32::MAX))
+    .bind(&fingerprint.issue_fingerprint)
+    .bind(&fingerprint.title)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?
+    .ok_or(JobError::LostLease)?;
+    let updated = sqlx::query(
+        "UPDATE crash_events SET issue_id = $4::uuid, grouping_state = 'grouped', fingerprint_algorithm = $5, fingerprint_version = $6, fingerprint = $7, variant_fingerprint = $8, grouping_quality = $9, grouped_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND grouping_state <> 'grouped'",
+    )
+    .bind(event_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(&stored_issue)
+    .bind(faultlane_grouping::FINGERPRINT_ALGORITHM)
+    .bind(i32::try_from(faultlane_grouping::FINGERPRINT_VERSION).unwrap_or(i32::MAX))
+    .bind(&fingerprint.issue_fingerprint)
+    .bind(&fingerprint.variant_fingerprint)
+    .bind(fingerprint.grouping_quality)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(Some(stored_issue))
+    } else {
+        Err(JobError::LostLease)
+    }
+}
+
+async fn recompute_issue(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    issue_id: &str,
+    transitions_enabled: bool,
+) -> Result<(), JobError> {
+    let issue = sqlx::query(
+        "SELECT status, regression_state, resolved_in_release_id::text AS resolved_in_release_id FROM issues WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+    )
+    .bind(issue_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?
+    .ok_or(JobError::Deterministic("issue_missing"))?;
+    refresh_issue_memberships(transaction, job, issue_id).await?;
+    let chronology = load_release_chronology(transaction, job, issue_id).await?;
+    let status: String = issue.get("status");
+    let regression_state: String = issue.get("regression_state");
+    if !transitions_enabled {
+        return update_issue_chronology(
+            transaction,
+            job,
+            issue_id,
+            &chronology,
+            &status,
+            &regression_state,
+        )
+        .await;
+    }
+    let resolution_id: Option<String> = issue.get("resolved_in_release_id");
+    let resolution_timestamp = if let Some(release_id) = resolution_id.as_deref() {
+        sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+            "SELECT build_timestamp FROM releases WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        )
+        .bind(release_id)
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?
+        .flatten()
+    } else {
+        None
+    };
+    let later = chronology.valid
+        && resolution_timestamp
+            .zip(chronology.last_timestamp)
+            .is_some_and(|(resolved, latest)| latest > resolved);
+    let (next_status, regression_state) = if status == "resolved" {
+        if later {
+            ("open", "regressed")
+        } else {
+            ("resolved", "resolved")
+        }
+    } else if resolution_id.is_some() {
+        if later {
+            ("open", "regressed")
+        } else {
+            ("open", "unknown")
+        }
+    } else if !chronology.valid {
+        ("open", "unknown")
+    } else if chronology.release_count == 1 {
+        ("open", "new")
+    } else {
+        ("open", "ongoing")
+    };
+    update_issue_chronology(
+        transaction,
+        job,
+        issue_id,
+        &chronology,
+        next_status,
+        regression_state,
+    )
+    .await
+}
+
+async fn refresh_issue_memberships(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    issue_id: &str,
+) -> Result<(), JobError> {
+    sqlx::query(
+        "DELETE FROM issue_variants WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(issue_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    sqlx::query(
+        "INSERT INTO issue_variants (organization_id, project_id, issue_id, variant_fingerprint, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(issue_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    sqlx::query(
+        "DELETE FROM issue_releases WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(issue_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    sqlx::query(
+        "INSERT INTO issue_releases (organization_id, project_id, issue_id, release_id, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.release_id, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.release_mapping_state = 'matched' GROUP BY e.organization_id, e.project_id, e.issue_id, e.release_id",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(issue_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    let updated = sqlx::query(
+        "WITH aggregate AS (SELECT min(e.received_at) AS first_seen_at, max(e.received_at) AS last_seen_at, count(*) AS event_count, (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] AS representative_event_id FROM crash_events e WHERE e.organization_id::text = $2 AND e.project_id::text = $3 AND e.issue_id::text = $1) UPDATE issues i SET first_seen_at = aggregate.first_seen_at, last_seen_at = aggregate.last_seen_at, event_count = aggregate.event_count, representative_event_id = aggregate.representative_event_id, updated_at = now() FROM aggregate WHERE i.id::text = $1 AND i.organization_id::text = $2 AND i.project_id::text = $3 AND aggregate.event_count > 0",
+    )
+    .bind(issue_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::Deterministic("issue_missing"))
+    }
+}
+
+async fn load_release_chronology(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    issue_id: &str,
+) -> Result<ReleaseChronology, JobError> {
+    let rows = sqlx::query(
+        "SELECT r.id::text AS id, r.build_timestamp FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id::text = $1 AND ir.project_id::text = $2 AND ir.issue_id::text = $3 ORDER BY r.build_timestamp NULLS LAST, r.id",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(issue_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    Ok(release_chronology(
+        &rows
+            .iter()
+            .map(|row| ReleaseEvidence {
+                id: row.get("id"),
+                build_timestamp: row.get("build_timestamp"),
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn release_chronology(evidence: &[ReleaseEvidence]) -> ReleaseChronology {
+    let mut ordered = evidence
+        .iter()
+        .filter_map(|release| {
+            release
+                .build_timestamp
+                .map(|timestamp| (timestamp, release.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort();
+    let valid = !ordered.is_empty()
+        && ordered.len() == evidence.len()
+        && !ordered.windows(2).any(|pair| pair[0].0 == pair[1].0);
+    if !valid {
+        return ReleaseChronology {
+            first: None,
+            last: None,
+            last_timestamp: None,
+            release_count: evidence.len(),
+            valid: false,
+        };
+    }
+    ReleaseChronology {
+        first: ordered.first().map(|(_, id)| id.clone()),
+        last: ordered.last().map(|(_, id)| id.clone()),
+        last_timestamp: ordered.last().map(|(timestamp, _)| *timestamp),
+        release_count: ordered.len(),
+        valid: true,
+    }
+}
+
+async fn update_issue_chronology(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    issue_id: &str,
+    chronology: &ReleaseChronology,
+    status: &str,
+    regression_state: &str,
+) -> Result<(), JobError> {
+    let updated = sqlx::query(
+        "UPDATE issues SET first_release_id = $4::uuid, last_release_id = $5::uuid, status = $6, regression_state = $7, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+    )
+    .bind(issue_id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(chronology.first.as_deref())
+    .bind(chronology.last.as_deref())
+    .bind(status)
+    .bind(regression_state)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::Deterministic("issue_missing"))
+    }
 }
 
 async fn lock_lease(
@@ -1471,15 +1978,57 @@ fn processing_modules(result: &Value) -> Result<Vec<ModuleIdentity>, JobError> {
         .collect()
 }
 
+fn release_lookup(result: &Value) -> Result<Option<ReleaseLookup>, JobError> {
+    let context = result
+        .get("crash_context")
+        .and_then(Value::as_object)
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    let Some(version) = context
+        .get("build_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(platform) = context
+        .get("platform")
+        .and_then(|value| value.get("normalized"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(architecture) = context
+        .get("architecture")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(configuration) = context
+        .get("build_configuration")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReleaseLookup {
+        version: version.to_owned(),
+        platform: platform.to_owned(),
+        architecture: architecture.to_owned(),
+        configuration: configuration.to_owned(),
+    }))
+}
+
 fn validate_processing_result(result: &Value, expected_guid: Option<&str>) -> Result<(), JobError> {
-    faultlane_processing::validate_processing_result(result, expected_guid).map_err(|error| {
-        match error {
+    faultlane_processing::validate_current_processing_result(result, expected_guid).map_err(
+        |error| match error {
             faultlane_processing::ProcessingResultError::PreviousIdentityMismatch => {
                 JobError::Deterministic("crash_identity_mismatch")
             }
             _ => JobError::Deterministic("processor_output_invalid"),
-        }
-    })?;
+        },
+    )?;
     processing_modules(result).map(|_| ())
 }
 
@@ -1901,9 +2450,10 @@ mod tests {
     use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
     use super::{
-        JobError, ModuleIdentity, SelectedArtifact, Worker, attempt_identity, claim_job,
-        container_name, has_resolved_frame, lock_lease, owned_attempt, prepare_worker_scratch,
-        processor_scope, random_uuid, selected_artifact_size_valid, set_private_permissions,
+        Job, JobError, ModuleIdentity, ReleaseEvidence, ReleaseLookup, ReleaseResolution,
+        SelectedArtifact, Worker, attempt_identity, claim_job, container_name, has_resolved_frame,
+        lock_lease, owned_attempt, prepare_worker_scratch, processor_scope, random_uuid,
+        release_chronology, release_lookup, selected_artifact_size_valid, set_private_permissions,
         strict_json, valid_internal_uuid,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, migrate};
@@ -2118,6 +2668,7 @@ mod tests {
             runner: ProcessorRunner::test(),
             scratch: Arc::new(root.clone()),
             instance_id: Arc::from("reconciliation-test"),
+            grouping_enabled: false,
         };
         worker
             .reconcile_attempt_directories()
@@ -2183,6 +2734,66 @@ mod tests {
         assert!(has_resolved_frame(&result));
     }
 
+    #[test]
+    fn release_lookup_requires_the_complete_structured_identity() {
+        let mut result = json!({"crash_context": {
+            "build_version": "1.0.0",
+            "platform": {"normalized": "windows"},
+            "architecture": "x86_64",
+            "build_configuration": "Shipping"
+        }});
+        let lookup = release_lookup(&result)
+            .unwrap_or_else(|_| panic!("release lookup must parse"))
+            .unwrap_or_else(|| panic!("complete release lookup must exist"));
+        assert_eq!(lookup.version, "1.0.0");
+        assert_eq!(lookup.platform, "windows");
+
+        result["crash_context"]["build_configuration"] = Value::Null;
+        assert!(
+            release_lookup(&result)
+                .unwrap_or_else(|_| panic!("missing release lookup must parse"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn release_chronology_rejects_missing_and_tied_timestamps() {
+        let first = time::OffsetDateTime::from_unix_timestamp(100)
+            .unwrap_or_else(|error| panic!("first timestamp must parse: {error}"));
+        let second = time::OffsetDateTime::from_unix_timestamp(200)
+            .unwrap_or_else(|error| panic!("second timestamp must parse: {error}"));
+        let ordered = release_chronology(&[
+            ReleaseEvidence {
+                id: "first".to_owned(),
+                build_timestamp: Some(first),
+            },
+            ReleaseEvidence {
+                id: "second".to_owned(),
+                build_timestamp: Some(second),
+            },
+        ]);
+        assert!(ordered.valid);
+        assert_eq!(ordered.first.as_deref(), Some("first"));
+        assert_eq!(ordered.last.as_deref(), Some("second"));
+
+        let tied = release_chronology(&[
+            ReleaseEvidence {
+                id: "first".to_owned(),
+                build_timestamp: Some(first),
+            },
+            ReleaseEvidence {
+                id: "second".to_owned(),
+                build_timestamp: Some(first),
+            },
+        ]);
+        assert!(!tied.valid);
+        let missing = release_chronology(&[ReleaseEvidence {
+            id: "first".to_owned(),
+            build_timestamp: None,
+        }]);
+        assert!(!missing.valid);
+    }
+
     async fn insert_event_job(
         pool: &PgPool,
         organization_id: &str,
@@ -2229,6 +2840,844 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap_or_else(|error| panic!("job must insert: {error}"))
+    }
+
+    async fn lease_exact_job(pool: &PgPool, job_id: &str, owner: &str) -> Job {
+        let lease_token =
+            random_uuid().unwrap_or_else(|error| panic!("lease token must generate: {error}"));
+        let row = sqlx::query(
+            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token",
+        )
+        .bind(job_id)
+        .bind(owner)
+        .bind(&lease_token)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("job must lease: {error}"));
+        Job {
+            id: row.get("id"),
+            organization_id: row.get("organization_id"),
+            project_id: row.get("project_id"),
+            event_id: row.get("event_id"),
+            artifact_upload_id: row.get("artifact_upload_id"),
+            derived_cache_id: row.get("derived_cache_id"),
+            kind: row.get("job_type"),
+            attempt: row.get("attempt"),
+            max_attempt: row.get("max_attempt"),
+            resource_failures: row.get("resource_failures"),
+            lease_token: row.get("lease_token"),
+        }
+    }
+
+    fn publication_worker(pool: PgPool, owner: &str, grouping_enabled: bool) -> Worker {
+        Worker {
+            pool,
+            objects: ArtifactObjects::Memory(Arc::new(Mutex::new(MemoryObjects::default()))),
+            runner: ProcessorRunner::test(),
+            scratch: Arc::new(env::temp_dir()),
+            instance_id: Arc::from(owner.to_owned()),
+            grouping_enabled,
+        }
+    }
+
+    fn processing_result(crash_guid: &str, version: &str, function: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "crash_guid": crash_guid,
+            "crash_context": {
+                "parser_version": 1,
+                "crash_guid": crash_guid,
+                "crash_type": "crash",
+                "error_message": null,
+                "build_version": version,
+                "engine_version": "5.8.1",
+                "platform": {"original": "Win64", "normalized": "windows"},
+                "architecture": "x86_64",
+                "build_configuration": "Shipping",
+                "modules": [],
+                "threads": [],
+                "system_metadata": [],
+                "user_comment": null,
+                "game_data": [],
+                "unknown_fields": {}
+            },
+            "classification": {
+                "crash_type": "crash",
+                "confidence": "high",
+                "evidence": [],
+                "signals": []
+            },
+            "current": {
+                "processing_version": 2,
+                "parser_version": 1,
+                "symbolication": {
+                    "schema_version": 2,
+                    "symbolicator_version": "0.1.0",
+                    "minidump_version": "0.27.0",
+                    "minidump_processor_version": "0.27.0",
+                    "minidump_unwind_version": "0.27.0",
+                    "platform": "windows",
+                    "architecture": "x86_64",
+                    "faulting_thread_id": 7,
+                    "exception_reason": "EXCEPTION_ACCESS_VIOLATION_READ",
+                    "assertion": null,
+                    "modules": [{
+                        "module": "Game.exe",
+                        "base_address": "0x0000000140000000",
+                        "size": 4096,
+                        "code_id": "CODE-A",
+                        "debug_id": "DEBUG-A",
+                        "status": "matched",
+                        "pe": "game.exe",
+                        "pdb": "game.pdb"
+                    }],
+                    "threads": [{
+                        "thread_id": 7,
+                        "faulting": true,
+                        "name": "GameThread",
+                        "unwind_status": "ok",
+                        "frames_truncated": false,
+                        "frames": [{
+                            "instruction": "0x0000000140001000",
+                            "module": "Game.exe",
+                            "module_relative": "0x1000",
+                            "trust": "context",
+                            "symbol_status": "resolved",
+                            "function": function,
+                            "source_file": "Game/Source/Arena.cpp",
+                            "source_line": 42,
+                            "inlines": []
+                        }]
+                    }]
+                }
+            },
+            "history": []
+        })
+    }
+
+    fn release_resolution(version: &str, candidates: Vec<String>) -> ReleaseResolution {
+        ReleaseResolution {
+            lookup: Some(ReleaseLookup {
+                version: version.to_owned(),
+                platform: "windows".to_owned(),
+                architecture: "x86_64".to_owned(),
+                configuration: "Shipping".to_owned(),
+            }),
+            candidates,
+        }
+    }
+
+    async fn publish_new_event(
+        worker: &Worker,
+        organization_id: &str,
+        project_id: &str,
+        suffix: &str,
+        result: Value,
+        release: &ReleaseResolution,
+        received_at: &str,
+    ) -> (String, String) {
+        let job_id = insert_event_job(&worker.pool, organization_id, project_id, suffix).await;
+        let job = lease_exact_job(&worker.pool, &job_id, worker.instance_id.as_ref()).await;
+        let event_id = job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("crash job must have an event"));
+        sqlx::query("UPDATE crash_events SET received_at = $2::timestamptz WHERE id::text = $1")
+            .bind(&event_id)
+            .bind(received_at)
+            .execute(&worker.pool)
+            .await
+            .unwrap_or_else(|error| panic!("event timestamp must update: {error}"));
+        worker
+            .publish_crash_result(
+                &job,
+                &event_id,
+                result,
+                "processed",
+                "processing_complete",
+                release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("event publication must succeed: {error:?}"));
+        (job_id, event_id)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn publication_groups_repeats_maps_releases_and_flags_regressions_when_configured() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ('Grouping test', 'grouping-test') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("organization must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Game', 'game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project must insert: {error}"));
+        let releases = sqlx::query(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '1.0.0', 'windows', 'x86_64', 'Shipping', '2026-01-01T00:00:00Z'), ($1::uuid, $2::uuid, '2.0.0', 'windows', 'x86_64', 'Shipping', '2026-02-01T00:00:00Z') RETURNING id::text AS id, version",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("ordered releases must insert: {error}"));
+        let first_release: String = releases
+            .iter()
+            .find(|row| row.get::<String, _>("version") == "1.0.0")
+            .map_or_else(|| panic!("first release must exist"), |row| row.get("id"));
+        let second_release: String = releases
+            .iter()
+            .find(|row| row.get::<String, _>("version") == "2.0.0")
+            .map_or_else(|| panic!("second release must exist"), |row| row.get("id"));
+        let worker = publication_worker(pool.clone(), "grouping-worker", true);
+        let first_mapping = release_resolution("1.0.0", vec![first_release.clone()]);
+        let (first_job, first_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-first",
+            processing_result("UECC-Windows-Group-1", "1.0.0", "Arena::Tick()"),
+            &first_mapping,
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        let issue_id: String =
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+                .bind(&first_event)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("first issue must load: {error}"));
+
+        let retry = lease_exact_job(&pool, &first_job, worker.instance_id.as_ref()).await;
+        worker
+            .publish_crash_result(
+                &retry,
+                &first_event,
+                processing_result("UECC-Windows-Group-1", "1.0.0", "Arena::Tick()"),
+                "processed",
+                "processing_complete",
+                &first_mapping,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("retry must remain idempotent: {error:?}"));
+
+        let (_, second_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-second",
+            processing_result("UECC-Windows-Group-2", "1.0.0", "Arena::Tick()"),
+            &first_mapping,
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        let (_, distinct_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-distinct",
+            processing_result("UECC-Windows-Distinct", "1.0.0", "Arena::Load()"),
+            &first_mapping,
+            "2026-01-04T00:00:00Z",
+        )
+        .await;
+        let distinct_issue: String =
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+                .bind(&distinct_event)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("distinct issue must load: {error}"));
+        assert_ne!(issue_id, distinct_issue);
+
+        sqlx::query(
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+        )
+        .bind(&issue_id)
+        .bind(&first_release)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("issue must resolve: {error}"));
+        let second_mapping = release_resolution("2.0.0", vec![second_release.clone()]);
+        let (_, later_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-later",
+            processing_result("UECC-Windows-Group-3", "2.0.0", "Arena::Tick()"),
+            &second_mapping,
+            "2026-02-02T00:00:00Z",
+        )
+        .await;
+
+        let issue = sqlx::query(
+            "SELECT status, regression_state, event_count, representative_event_id::text AS representative_event_id, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+        )
+        .bind(&issue_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("grouped issue must load: {error}"));
+        assert_eq!(issue.get::<String, _>("status"), "open");
+        assert_eq!(issue.get::<String, _>("regression_state"), "regressed");
+        assert_eq!(issue.get::<i64, _>("event_count"), 3);
+        assert_eq!(
+            issue.get::<String, _>("representative_event_id"),
+            first_event
+        );
+        assert_eq!(issue.get::<String, _>("first_release_id"), first_release);
+        assert_eq!(issue.get::<String, _>("last_release_id"), second_release);
+        let repeated_ids = sqlx::query_scalar::<_, String>(
+            "SELECT issue_id::text FROM crash_events WHERE id::text = ANY($1)",
+        )
+        .bind(vec![second_event, later_event])
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("repeat assignments must load: {error}"));
+        assert!(repeated_ids.iter().all(|id| id == &issue_id));
+        let variants: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM issue_variants WHERE issue_id::text = $1")
+                .bind(&issue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("variant count must load: {error}"));
+        assert_eq!(variants, 1);
+        let release_counts = sqlx::query(
+            "SELECT release_id::text AS release_id, event_count FROM issue_releases WHERE issue_id::text = $1 ORDER BY release_id",
+        )
+        .bind(&issue_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release counts must load: {error}"));
+        assert_eq!(release_counts.len(), 2);
+        assert_eq!(
+            release_counts
+                .iter()
+                .map(|row| row.get::<i64, _>("event_count"))
+                .sum::<i64>(),
+            3
+        );
+        let first_results: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+        )
+        .bind(&first_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("processing result count must load: {error}"));
+        assert_eq!(first_results, 1);
+
+        let ambiguous = sqlx::query_scalar::<_, String>(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '9.0.0', 'windows', 'x86_64', 'Shipping', '2026-09-01T00:00:00Z'), ($1::uuid, $2::uuid, '9.0.0', 'windows', 'x86_64', 'shipping', '2026-09-02T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("ambiguous releases must insert: {error}"));
+        let (_, ambiguous_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-ambiguous",
+            processing_result("UECC-Windows-Ambiguous", "9.0.0", "Ambiguous::Root()"),
+            &release_resolution("9.0.0", ambiguous.clone()),
+            "2026-09-03T00:00:00Z",
+        )
+        .await;
+        let (_, missing_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "group-missing",
+            processing_result("UECC-Windows-Missing", "404.0.0", "Missing::Root()"),
+            &release_resolution("404.0.0", Vec::new()),
+            "2026-09-04T00:00:00Z",
+        )
+        .await;
+        let mappings = sqlx::query(
+            "SELECT id::text AS event_id, release_mapping_state, release_id::text AS release_id, (SELECT count(*) FROM crash_event_release_candidates c WHERE c.event_id = e.id) AS candidates FROM crash_events e WHERE id::text = ANY($1)",
+        )
+        .bind(vec![ambiguous_event, missing_event])
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release mappings must load: {error}"));
+        let ambiguous_row = mappings
+            .iter()
+            .find(|row| row.get::<String, _>("release_mapping_state") == "ambiguous")
+            .unwrap_or_else(|| panic!("ambiguous mapping must exist"));
+        assert_eq!(ambiguous_row.get::<i64, _>("candidates"), 2);
+        assert!(
+            ambiguous_row
+                .get::<Option<String>, _>("release_id")
+                .is_none()
+        );
+        let missing_row = mappings
+            .iter()
+            .find(|row| row.get::<String, _>("release_mapping_state") == "missing")
+            .unwrap_or_else(|| panic!("missing mapping must exist"));
+        assert_eq!(missing_row.get::<i64, _>("candidates"), 0);
+        assert!(missing_row.get::<Option<String>, _>("release_id").is_none());
+        let without_identity: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_events WHERE current_result_id IS NOT NULL AND (fingerprint_algorithm IS NULL OR fingerprint_version IS NULL)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("fingerprint identity count must load: {error}"));
+        assert_eq!(without_identity, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn publication_converges_concurrently_and_honors_leases_and_the_kill_switch() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ('Concurrency test', 'concurrency-test') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("organization must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Game', 'game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project must insert: {error}"));
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '1.0.0', 'windows', 'x86_64', 'Shipping', '2026-01-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release must insert: {error}"));
+        let worker = publication_worker(pool.clone(), "concurrent-worker", true);
+        let first_job_id =
+            insert_event_job(&pool, &organization_id, &project_id, "concurrent-first").await;
+        let second_job_id =
+            insert_event_job(&pool, &organization_id, &project_id, "concurrent-second").await;
+        let first_job = lease_exact_job(&pool, &first_job_id, worker.instance_id.as_ref()).await;
+        let second_job = lease_exact_job(&pool, &second_job_id, worker.instance_id.as_ref()).await;
+        let first_event = first_job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("first event must exist"));
+        let second_event = second_job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("second event must exist"));
+        let release = release_resolution("1.0.0", vec![release_id]);
+        let (first, second) = tokio::join!(
+            worker.publish_crash_result(
+                &first_job,
+                &first_event,
+                processing_result("UECC-Concurrent-1", "1.0.0", "Race::Root()"),
+                "processed",
+                "processing_complete",
+                &release,
+            ),
+            worker.publish_crash_result(
+                &second_job,
+                &second_event,
+                processing_result("UECC-Concurrent-2", "1.0.0", "Race::Root()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+        );
+        assert!(first.is_ok(), "first concurrent publication: {first:?}");
+        assert!(second.is_ok(), "second concurrent publication: {second:?}");
+        let issue = sqlx::query(
+            "SELECT id::text AS issue_id, count(*) OVER () AS issues, event_count FROM issues WHERE project_id::text = $1",
+        )
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("concurrent issue must load: {error}"));
+        assert_eq!(issue.get::<i64, _>("issues"), 1);
+        assert_eq!(issue.get::<i64, _>("event_count"), 2);
+        let concurrent_issue_id: String = issue.get("issue_id");
+
+        for mask in 0..102_u16 {
+            let configuration = "shipping"
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    if mask & (1 << index) == 0 {
+                        character
+                    } else {
+                        character.to_ascii_uppercase()
+                    }
+                })
+                .collect::<String>();
+            sqlx::query(
+                "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, 'bounded', 'windows', 'x86_64', $3, '2026-01-02T00:00:00Z')",
+            )
+            .bind(&organization_id)
+            .bind(&project_id)
+            .bind(configuration)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("bounded release must insert: {error}"));
+        }
+        let bounded = worker
+            .resolve_release(
+                &first_job,
+                &processing_result("UECC-Bounded", "bounded", "Bounded::Root()"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("bounded release lookup must succeed: {error:?}"));
+        assert_eq!(
+            bounded.candidates.len(),
+            usize::try_from(super::MAX_STORED_RELEASE_CANDIDATES)
+                .unwrap_or_else(|error| panic!("candidate limit must fit usize: {error}"))
+        );
+        assert_eq!(bounded.state(), "ambiguous");
+
+        let stale_job_id =
+            insert_event_job(&pool, &organization_id, &project_id, "stale-publication").await;
+        let stale_job = lease_exact_job(&pool, &stale_job_id, worker.instance_id.as_ref()).await;
+        let stale_event = stale_job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("stale event must exist"));
+        sqlx::query(
+            "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+        )
+        .bind(&stale_job.id)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("lease must expire: {error}"));
+        let stale = worker
+            .publish_crash_result(
+                &stale_job,
+                &stale_event,
+                processing_result("UECC-Stale", "1.0.0", "Stale::Root()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await;
+        assert!(matches!(stale, Err(JobError::LostLease)));
+        let stale_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+        )
+        .bind(&stale_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("stale result count must load: {error}"));
+        assert_eq!(stale_rows, 0);
+        let stale_candidates: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_event_release_candidates WHERE event_id::text = $1",
+        )
+        .bind(&stale_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("stale candidate count must load: {error}"));
+        assert_eq!(stale_candidates, 0);
+
+        let disabled = publication_worker(pool.clone(), "disabled-worker", false);
+        let second_release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '2.0.0', 'windows', 'x86_64', 'Shipping', '2026-02-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("second release must insert: {error}"));
+        let disabled_reprocessing =
+            lease_exact_job(&pool, &first_job_id, disabled.instance_id.as_ref()).await;
+        disabled
+            .publish_crash_result(
+                &disabled_reprocessing,
+                &first_event,
+                processing_result("UECC-Concurrent-1", "2.0.0", "Race::Root()"),
+                "processed",
+                "processing_complete",
+                &release_resolution("2.0.0", vec![second_release_id]),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("disabled reprocessing must retain exact rollups: {error:?}")
+            });
+        let retained = sqlx::query(
+            "SELECT i.event_count, (SELECT count(*) FROM issue_releases ir WHERE ir.issue_id = i.id) AS releases FROM issues i WHERE i.id::text = $1",
+        )
+        .bind(&concurrent_issue_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("retained issue rollups must load: {error}"));
+        assert_eq!(retained.get::<i64, _>("event_count"), 2);
+        assert_eq!(retained.get::<i64, _>("releases"), 2);
+
+        let disabled_job_id =
+            insert_event_job(&pool, &organization_id, &project_id, "disabled-grouping").await;
+        let disabled_job =
+            lease_exact_job(&pool, &disabled_job_id, disabled.instance_id.as_ref()).await;
+        let disabled_event = disabled_job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("disabled event must exist"));
+        disabled
+            .publish_crash_result(
+                &disabled_job,
+                &disabled_event,
+                processing_result("UECC-Disabled", "1.0.0", "Disabled::Root()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("disabled grouping must still process: {error:?}"));
+        let disabled_state = sqlx::query(
+            "SELECT grouping_state, fingerprint_algorithm, fingerprint_version, issue_id::text AS issue_id, current_result_id::text AS current_result_id FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&disabled_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("disabled state must load: {error}"));
+        assert_eq!(
+            disabled_state.get::<String, _>("grouping_state"),
+            "disabled"
+        );
+        assert_eq!(
+            disabled_state.get::<String, _>("fingerprint_algorithm"),
+            "stack"
+        );
+        assert_eq!(disabled_state.get::<i32, _>("fingerprint_version"), 1);
+        assert!(
+            disabled_state
+                .get::<Option<String>, _>("issue_id")
+                .is_none()
+        );
+        assert!(
+            disabled_state
+                .get::<Option<String>, _>("current_result_id")
+                .is_some()
+        );
+
+        let insufficient_job_id = insert_event_job(
+            &pool,
+            &organization_id,
+            &project_id,
+            "insufficient-grouping",
+        )
+        .await;
+        let insufficient_job =
+            lease_exact_job(&pool, &insufficient_job_id, worker.instance_id.as_ref()).await;
+        let insufficient_event = insufficient_job
+            .event_id
+            .clone()
+            .unwrap_or_else(|| panic!("insufficient event must exist"));
+        let mut insufficient = processing_result("UECC-Insufficient", "1.0.0", "Unused::Root()");
+        insufficient["current"]["symbolication"]["threads"][0]["frames"] = json!([]);
+        worker
+            .publish_crash_result(
+                &insufficient_job,
+                &insufficient_event,
+                insufficient,
+                "awaiting_symbols",
+                "matching_symbols_missing",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("insufficient event must process: {error:?}"));
+        let insufficient_state: String =
+            sqlx::query_scalar("SELECT grouping_state FROM crash_events WHERE id::text = $1")
+                .bind(&insufficient_event)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("insufficient state must load: {error}"));
+        assert_eq!(insufficient_state, "insufficient");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn publication_does_not_guess_regressions_from_late_or_tied_releases() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(6)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ('Ordering test', 'ordering-test') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("organization must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Game', 'game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project must insert: {error}"));
+        let releases = sqlx::query(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '1.0.0', 'windows', 'x86_64', 'Shipping', '2026-01-01T00:00:00Z'), ($1::uuid, $2::uuid, '2.0.0', 'windows', 'x86_64', 'Shipping', '2026-02-01T00:00:00Z'), ($1::uuid, $2::uuid, '2.0.1', 'windows', 'x86_64', 'Shipping', '2026-02-01T00:00:00Z') RETURNING id::text AS id, version",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("ordering releases must insert: {error}"));
+        let release_id = |version: &str| {
+            releases
+                .iter()
+                .find(|row| row.get::<String, _>("version") == version)
+                .map_or_else(
+                    || panic!("release {version} must exist"),
+                    |row| row.get("id"),
+                )
+        };
+        let older: String = release_id("1.0.0");
+        let resolved: String = release_id("2.0.0");
+        let tied: String = release_id("2.0.1");
+        let worker = publication_worker(pool.clone(), "ordering-worker", true);
+
+        let (_, late_root_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "ordering-late-root",
+            processing_result("UECC-Ordering-Late-1", "2.0.0", "Late::Root()"),
+            &release_resolution("2.0.0", vec![resolved.clone()]),
+            "2026-02-02T00:00:00Z",
+        )
+        .await;
+        let late_issue: String =
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+                .bind(&late_root_event)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("late issue must load: {error}"));
+        sqlx::query(
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+        )
+        .bind(&late_issue)
+        .bind(&resolved)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("late issue must resolve: {error}"));
+        let _ = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "ordering-late-older",
+            processing_result("UECC-Ordering-Late-2", "1.0.0", "Late::Root()"),
+            &release_resolution("1.0.0", vec![older.clone()]),
+            "2026-03-01T00:00:00Z",
+        )
+        .await;
+        let late_state = sqlx::query(
+            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+        )
+        .bind(&late_issue)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("late state must load: {error}"));
+        assert_eq!(late_state.get::<String, _>("status"), "resolved");
+        assert_eq!(late_state.get::<String, _>("regression_state"), "resolved");
+        assert_eq!(late_state.get::<String, _>("first_release_id"), older);
+        assert_eq!(late_state.get::<String, _>("last_release_id"), resolved);
+
+        let (_, tied_root_event) = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "ordering-tied-root",
+            processing_result("UECC-Ordering-Tied-1", "2.0.0", "Tie::Root()"),
+            &release_resolution("2.0.0", vec![resolved.clone()]),
+            "2026-02-03T00:00:00Z",
+        )
+        .await;
+        let tied_issue: String =
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+                .bind(&tied_root_event)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("tied issue must load: {error}"));
+        sqlx::query(
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+        )
+        .bind(&tied_issue)
+        .bind(&resolved)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("tied issue must resolve: {error}"));
+        let _ = publish_new_event(
+            &worker,
+            &organization_id,
+            &project_id,
+            "ordering-tied-repeat",
+            processing_result("UECC-Ordering-Tied-2", "2.0.1", "Tie::Root()"),
+            &release_resolution("2.0.1", vec![tied]),
+            "2026-02-04T00:00:00Z",
+        )
+        .await;
+        let tied_state = sqlx::query(
+            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+        )
+        .bind(&tied_issue)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("tied state must load: {error}"));
+        assert_eq!(tied_state.get::<String, _>("status"), "resolved");
+        assert_eq!(tied_state.get::<String, _>("regression_state"), "resolved");
+        assert!(
+            tied_state
+                .get::<Option<String>, _>("first_release_id")
+                .is_none()
+        );
+        assert!(
+            tied_state
+                .get::<Option<String>, _>("last_release_id")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2394,6 +3843,7 @@ mod tests {
             runner: ProcessorRunner::test(),
             scratch: Arc::new(env::temp_dir()),
             instance_id: Arc::from("worker-resource"),
+            grouping_enabled: false,
         };
         let first = claim_job(&pool, "worker-resource")
             .await
