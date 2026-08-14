@@ -67,6 +67,9 @@ pub enum SymbolicationErrorKind {
     TooManyThreads,
     TooManyModules,
     InvalidSymbolRoot,
+    InvalidSymCache,
+    SymCacheTooLarge,
+    SymCacheIdentityMismatch,
     ArtifactScan,
     UnsafeArtifactPath,
     RuntimeFailed,
@@ -85,6 +88,9 @@ pub enum SymbolicationError {
     TooManyThreads,
     TooManyModules,
     InvalidSymbolRoot,
+    InvalidSymCache,
+    SymCacheTooLarge,
+    SymCacheIdentityMismatch,
     ArtifactScan(ScanError),
     UnsafeArtifactPath,
     RuntimeFailed(io::Error),
@@ -105,6 +111,9 @@ impl SymbolicationError {
             Self::TooManyThreads => SymbolicationErrorKind::TooManyThreads,
             Self::TooManyModules => SymbolicationErrorKind::TooManyModules,
             Self::InvalidSymbolRoot => SymbolicationErrorKind::InvalidSymbolRoot,
+            Self::InvalidSymCache => SymbolicationErrorKind::InvalidSymCache,
+            Self::SymCacheTooLarge => SymbolicationErrorKind::SymCacheTooLarge,
+            Self::SymCacheIdentityMismatch => SymbolicationErrorKind::SymCacheIdentityMismatch,
             Self::ArtifactScan(_) => SymbolicationErrorKind::ArtifactScan,
             Self::UnsafeArtifactPath => SymbolicationErrorKind::UnsafeArtifactPath,
             Self::RuntimeFailed(_) => SymbolicationErrorKind::RuntimeFailed,
@@ -128,6 +137,13 @@ impl fmt::Display for SymbolicationError {
             Self::TooManyThreads => formatter.write_str("minidump thread limit exceeded"),
             Self::TooManyModules => formatter.write_str("minidump module limit exceeded"),
             Self::InvalidSymbolRoot => formatter.write_str("invalid symbol directory"),
+            Self::InvalidSymCache => formatter.write_str("invalid derived symbol cache"),
+            Self::SymCacheTooLarge => {
+                formatter.write_str("derived symbol cache size limit exceeded")
+            }
+            Self::SymCacheIdentityMismatch => {
+                formatter.write_str("derived symbol cache identity does not match")
+            }
             Self::ArtifactScan(error) => error.fmt(formatter),
             Self::UnsafeArtifactPath => formatter.write_str("unsafe symbol artifact path"),
             Self::RuntimeFailed(_) => formatter.write_str("failed to start minidump processor"),
@@ -168,6 +184,8 @@ pub struct SymbolicatedModule {
     pub status: ModuleSymbolStatus,
     pub pe: Option<String>,
     pub pdb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symcache_format: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -518,6 +536,7 @@ fn prepare_modules(
             status: selection.status,
             pe: selection.pe.map(|artifact| artifact.path.clone()),
             pdb: selection.pdb.map(|artifact| artifact.path.clone()),
+            symcache_format: None,
         });
     }
 

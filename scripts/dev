@@ -25,6 +25,11 @@ docker compose \
   -f deploy/docker-compose/compose.yml \
   run --rm minio-init
 
+docker build \
+  --tag "${FAULTLANE_PROCESSOR_IMAGE:-faultlane-processor:dev}" \
+  --file deploy/processor/Dockerfile \
+  .
+
 cargo run --package faultlane-server -- migrate
 
 cargo run --package faultlane-server -- api &
@@ -33,15 +38,18 @@ api_pid=$!
 cargo run --package faultlane-server -- ingest &
 ingest_pid=$!
 
+cargo run --package faultlane-server -- worker &
+worker_pid=$!
+
 PORT="${FAULTLANE_WEB_PORT:-3000}" corepack pnpm --filter @faultlane/web dev &
 web_pid=$!
 
 cleanup() {
-  kill "$api_pid" "$ingest_pid" "$web_pid" >/dev/null 2>&1 || true
-  wait "$api_pid" "$ingest_pid" "$web_pid" >/dev/null 2>&1 || true
+  kill "$api_pid" "$ingest_pid" "$worker_pid" "$web_pid" >/dev/null 2>&1 || true
+  wait "$api_pid" "$ingest_pid" "$worker_pid" "$web_pid" >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT INT TERM
 
 echo "{\"event\":\"started\",\"api\":\"http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_API_PORT:-8080}\",\"ingest\":\"http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_INGEST_PORT:-8081}\",\"web\":\"http://127.0.0.1:${FAULTLANE_WEB_PORT:-3000}\"}"
-wait "$api_pid" "$ingest_pid" "$web_pid"
+wait "$api_pid" "$ingest_pid" "$worker_pid" "$web_pid"

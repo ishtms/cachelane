@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 2 ] \
+  && [ "$1" = "processor" ] \
+  && [ "$2" = "process-crash" ]; then
+  /usr/local/bin/faultlane-real "$@" > /scratch/proof-result.json
+  if grep -q "UECC-Windows-Orphan-311" /scratch/proof-result.json; then
+    sleep 15
+    cat /scratch/proof-result.json
+  elif grep -q "UECC-Windows-Database-311" /scratch/proof-result.json; then
+    sleep 15
+    cat /scratch/proof-result.json
+  elif grep -q "UECC-Windows-Resource-311" /scratch/proof-result.json; then
+    dd if=/dev/zero bs=1048576 count=17 2>/dev/null
+  else
+    cat /scratch/proof-result.json
+  fi
+  exit 0
+fi
+
+exec /usr/local/bin/faultlane-real "$@"

@@ -1,0 +1,14 @@
+*
+!Cargo.lock
+!Cargo.toml
+!apps/
+!apps/cli/
+!apps/cli/Cargo.toml
+!apps/cli/src/
+!apps/cli/src/**
+!apps/server/
+!apps/server/Cargo.toml
+!apps/server/src/
+!apps/server/src/**
+!crates/
+!crates/**
