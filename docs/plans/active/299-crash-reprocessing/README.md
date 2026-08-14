@@ -65,7 +65,7 @@ Publishing a new result deletes the event's prior waiters and inserts the new bo
 
 Add `crash_reprocessing_requests` and `crash_reprocessing_request_events`.
 
-A request records its source, scope, stable selection snapshot, input cursor, limit, selection cursor, next cursor, state, counts, fixed failure code, requester for manual work, and timestamps. Manual idempotency keys are stored only as SHA-256 digests. Automatic requests are unique by manifest artifact and trigger version.
+A request records its source, scope, stable selection snapshot, input cursor, limit, selection cursor, next cursor, state, counts, fixed failure code, requester for manual work, and timestamps. Manual idempotency keys are stored only as SHA-256 digests. Automatic requests are unique by manifest artifact checksum and trigger version, so an identical upload is deduplicated while a corrected artifact at the same source path creates new work.
 
 The request row is also the scheduling queue. It has a random lease token, owner, expiry, bounded attempts, and safe failure code. New workers claim requests with `FOR UPDATE SKIP LOCKED`. The existing worker queue remains authoritative for actual event processing.
 
@@ -79,7 +79,7 @@ Add requested and completed reprocessing generations to `crash_events`. Each req
 
 The worker snapshots the requested generation when it leases a process job. Publication advances the completed generation and completes every request event through that generation. If a newer generation appeared during processing, publication returns the canonical job to `pending` instead of completing it. This closes the artifact-arrival race without parallel work for one event.
 
-The isolated processor receives a bounded `previous.json` at a fixed guest path when a current result exists. It validates the same crash identity and supported versions through the existing processing contract. A changed attempt appends the previous current attempt to bounded history; an unchanged attempt does not grow history.
+The isolated processor receives a bounded `previous.json` at a fixed guest path when a current result exists. It validates the same crash identity and supported versions through the existing processing contract. A changed attempt appends the previous current attempt to bounded history; an unchanged attempt does not grow history. Once the embedded history reaches 16 attempts, it drops the oldest entry while the immutable database result remains queryable.
 
 The publication transaction updates the immutable result row, event pointer, release mapping, waiters, grouping rollups, request events, generation, and job state under the same lease token. A stale worker changes none of them.
 
@@ -114,12 +114,13 @@ The POST requires an `Idempotency-Key` header and returns `202`. Repeating the s
 
 ## Database compatibility
 
-Use one additive migration:
+Use additive migrations:
 
 - add requested and completed generations to `crash_events`;
 - add the tenant-scoped waiter table and exact lookup indexes;
 - add request and request-event tables, leases, bounds, state checks, idempotency digest, and scoped foreign keys;
 - add indexes for request claims, project progress, event completion, manual scope selection, and exact artifact waiter lookup.
+- add available-artifact identity indexes in a follow-up migration so the applied reprocessing migration remains immutable.
 
 Do not add a new `jobs.job_type` or remove the existing unique event job. The previous application ignores the new tables and columns. The previous worker can still process a reactivated `process_crash` row if rollback occurs, though rollout disables reprocessing and drains or leaves reprocessing requests before restoring the prior application.
 
@@ -174,6 +175,19 @@ Unit and database tests prove:
 The isolated behavior proof uses dedicated PostgreSQL, MinIO, processor image, ports, network, volumes, bucket, and scratch resources. It ingests a synthetic crash before artifacts exist, observes a partial current result and exact waiters, uploads the matching PE and PDB, observes one automatic request, and polls the same event until `CrashFixture()` has function, file, and line data. It verifies the old result remains immutable, result history contains the partial attempt once, the raw object and event ID are unchanged, and duplicate upload transfers zero bytes without another generation.
 
 The proof also uploads a mismatched artifact, runs concurrent workers and requests, injects one reprocessing failure without losing the prior result, exercises every manual selector, interrupts PostgreSQL and MinIO, verifies recovery, and checks fixed logs and cleanup. Start the pre-change #298 server and worker against the expanded schema and show that normal initial processing still works. Remove every dedicated container, image, network, volume, log, and scratch directory afterward.
+
+### Completed evidence
+
+Verification completed on August 14, 2026:
+
+- The PostgreSQL-backed server suite passed all 53 tests. It covered request idempotency and conflicts, the five-request cap, all seven manual selectors, stable cursor snapshots, tenant isolation, exact PDB and PE waiters, 501-event automatic paging, generation coalescing, a trigger during a lease, stale and exhausted leases, failure state preservation, result history, duplicate upload, artifact replacement, and artifact reuse.
+- Review regressions cover both artifact and waiter commit orders, enqueue-time snapshots, checksum-aware replacement triggers, final-attempt request recovery, and rolling 16-attempt embedded history. Exact waiter and available-artifact indexes keep publication lookups scoped to one tenant, project, release, and embedded identity.
+- `bash scripts/prove-isolated-processing` passed from an empty dedicated environment. The same event moved from `awaiting_symbols` to `processed`, its automatic request completed, seven manual selector requests completed, two immutable result rows remained, the prior attempt appeared once in history, and the duplicate upload transferred zero bytes without advancing the event generation.
+- The behavior proof also passed processor isolation, two concurrent workers, resource quarantine, grouping and reprocessing kill switches, stale processor cleanup, PostgreSQL recovery, MinIO recovery, fixed-log inspection, and scratch cleanup. Its dedicated containers, images, network, volumes, logs, and scratch directory were removed.
+- The unmodified #298 server, worker, CLI, and processor completed their full isolated processing proof after this migration was applied. Normal ingest, symbolication, grouping, retries, and outage recovery remained compatible with the expanded schema. The temporary local proof hook was removed and the #298 worktree was clean afterward.
+- `bash scripts/check-fast` passed, including Clippy, formatting, web lint and type checks, and all Rust tests.
+- `bash scripts/check` passed, including the production web build, repository policy checks, and release workspace build.
+- `bash scripts/smoke` passed with the canonical development lifecycle while the API, ingest, worker, and web processes remained healthy. The existing development database accepted the follow-up migration without changing the checksum of the applied reprocessing migration. Application processes and the owned scratch directory were stopped and removed afterward. The two containers created by the run were removed without deleting the existing development volumes, network, or processor image.
 
 ## Rollout and rollback
 
