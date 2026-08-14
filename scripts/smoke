@@ -10,9 +10,9 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-api_url="${FAULTLANE_API_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_API_PORT:-8080}}"
-ingest_url="${FAULTLANE_INGEST_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_INGEST_PORT:-8081}}"
-web_url="${FAULTLANE_WEB_URL:-http://127.0.0.1:${FAULTLANE_WEB_PORT:-3000}}"
+api_url="${FAULTLANE_SMOKE_API_URL:-${FAULTLANE_API_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_API_PORT:-8080}}}"
+ingest_url="${FAULTLANE_SMOKE_INGEST_URL:-${FAULTLANE_INGEST_URL:-http://${FAULTLANE_API_HOST:-127.0.0.1}:${FAULTLANE_INGEST_PORT:-8081}}}"
+web_url="${FAULTLANE_SMOKE_WEB_URL:-${FAULTLANE_WEB_URL:-http://127.0.0.1:${FAULTLANE_WEB_PORT:-3000}}}"
 
 api_response="$(curl --fail --silent --show-error "$api_url/health/ready")"
 ingest_response="$(curl --fail --silent --show-error "$ingest_url/health/ready")"

@@ -24,10 +24,14 @@ proof_temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 proof_name="$(basename "$proof_directory")"
 export FAULTLANE_WORKER_SCRATCH_DIR="$(cygpath -w "$proof_directory/worker-scratch")"
 server_executable="$(cygpath -w "$repo_root/target/debug/faultlane-server.exe")"
+node_executable="$(cygpath -w "$(command -v node).exe")"
+web_directory="$(cygpath -w "$repo_root/apps/web")"
+next_executable="$(cygpath -w "$repo_root/apps/web/node_modules/next/dist/bin/next")"
 api_pid=""
 ingest_pid=""
 worker_pid=""
 worker_two_pid=""
+web_pid=""
 started_pid=""
 
 export POSTGRES_DB="faultlane_311_proof"
@@ -41,10 +45,19 @@ export FAULTLANE_API_PORT="${FAULTLANE_PROOF_API_PORT:-58090}"
 export FAULTLANE_INGEST_PORT="${FAULTLANE_PROOF_INGEST_PORT:-58091}"
 export FAULTLANE_API_URL="http://127.0.0.1:$FAULTLANE_API_PORT"
 export INGEST_BASE_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
+export FAULTLANE_WEB_PORT="${FAULTLANE_PROOF_WEB_PORT:-53090}"
+export FAULTLANE_WEB_URL="http://127.0.0.1:$FAULTLANE_WEB_PORT"
+export FAULTLANE_INGEST_SPOOL_DIR="$(cygpath -w "$proof_directory/ingest-spool")"
+export FAULTLANE_BOOTSTRAP_ENABLED=true
+export FAULTLANE_BOOTSTRAP_SECRET="faultlane-proof-bootstrap-secret-$proof_id"
+export FAULTLANE_RATE_LIMIT_SECRET="faultlane-proof-rate-limit-secret-$proof_id"
+export FAULTLANE_TRUSTED_PROXY_CIDRS=""
 export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
 export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
 export FAULTLANE_GROUPING_ENABLED=true
 export FAULTLANE_REPROCESSING_ENABLED=true
+export FAULTLANE_DASHBOARD_ENABLED=true
+export FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED=true
 export FAULTLANE_PROCESSOR_IMAGE="$processor_image"
 
 proof_phase() {
@@ -80,6 +93,31 @@ stop_role() {
   fi
 }
 
+start_web() {
+  local stdout_log
+  local stderr_log
+  local pid_file
+  stdout_log="$(cygpath -w "$proof_directory/web.log")"
+  stderr_log="$(cygpath -w "$proof_directory/web-error.log")"
+  pid_file="$(cygpath -w "$proof_directory/web.pid")"
+  powershell.exe -NoProfile -NonInteractive -Command \
+    "\$process = Start-Process -FilePath '$node_executable' -ArgumentList '$next_executable', 'start', '--hostname', '127.0.0.1', '--port', '$FAULTLANE_WEB_PORT' -WorkingDirectory '$web_directory' -RedirectStandardOutput '$stdout_log' -RedirectStandardError '$stderr_log' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_file', \$process.Id.ToString())" \
+    >/dev/null
+  web_pid="$(tr -d '\r\n' <"$proof_directory/web.pid")"
+  if [[ ! "$web_pid" =~ ^[0-9]+$ ]]; then
+    echo "failed to start the production web server" >&2
+    exit 1
+  fi
+}
+
+stop_web() {
+  if [[ -n "$web_pid" ]]; then
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Get-Process -Id $web_pid -ErrorAction SilentlyContinue; if (\$null -ne \$process -and [IO.Path]::GetFullPath(\$process.Path) -eq [IO.Path]::GetFullPath('$node_executable')) { Stop-Process -Id $web_pid -Force; Wait-Process -Id $web_pid -Timeout 10 -ErrorAction SilentlyContinue }" >/dev/null
+    web_pid=""
+  fi
+}
+
 cleanup() {
   local status="$?"
   if [[ "$status" -ne 0 ]]; then
@@ -106,6 +144,7 @@ cleanup() {
   for pid in "$api_pid" "$ingest_pid" "$worker_pid" "$worker_two_pid"; do
     stop_role "$pid" || true
   done
+  stop_web || true
   docker rm --force "$boundary_container" >/dev/null 2>&1 || true
   docker compose \
     --project-name "$compose_project" \
@@ -351,15 +390,18 @@ run_upload() {
 negotiate_release_without_upload() {
   local release="$1"
   local build_timestamp="$2"
+  local artifact_root="${3:-apps/cli/tests/fixtures/windows-symbolication}"
+  local node_artifact_root
   local scan
   local request
-  scan="$(./target/debug/faultlane symbols scan apps/cli/tests/fixtures/windows-symbolication)"
-  request="$(SCAN="$scan" RELEASE="$release" BUILD_TIMESTAMP="$build_timestamp" node -e '
+  node_artifact_root="$(cygpath -w "$artifact_root")"
+  scan="$(./target/debug/faultlane symbols scan "$artifact_root")"
+  request="$(SCAN="$scan" RELEASE="$release" BUILD_TIMESTAMP="$build_timestamp" ARTIFACT_ROOT="$node_artifact_root" node -e '
     const crypto = require("node:crypto");
     const fs = require("node:fs");
     const path = require("node:path");
     const scan = JSON.parse(process.env.SCAN);
-    const root = "apps/cli/tests/fixtures/windows-symbolication";
+    const root = process.env.ARTIFACT_ROOT;
     const artifacts = scan.artifacts.map(artifact => ({
       path: artifact.path,
       module: artifact.module,
@@ -411,6 +453,7 @@ distinct_path="$proof_directory/distinct.bundle"
 regression_path="$proof_directory/regression.bundle"
 ambiguous_path="$proof_directory/ambiguous.bundle"
 reprocessing_path="$proof_directory/reprocessing.bundle"
+dashboard_missing_path="$proof_directory/dashboard-missing.bundle"
 node -e '
   const fs = require("node:fs");
   const zlib = require("node:zlib");
@@ -426,24 +469,32 @@ node -e '
     output.write(value, 4, "ascii");
     return output;
   };
-  const create = (guid, outputPath, buildVersion = "1.0.0", crashType = "Crash") => {
+  const create = (guid, outputPath, buildVersion = "1.0.0", crashType = "Crash", errorMessage = "&lt;img src=x onerror=globalThis.pwned=true&gt;; $env:SECRET") => {
     const xml = Buffer.from(`
       <FGenericCrashContext><RuntimeProperties>
         <CrashGUID>${guid}</CrashGUID>
         <CrashType>${crashType}</CrashType>
+        <ErrorMessage>${errorMessage}</ErrorMessage>
         <BuildVersion>${buildVersion}</BuildVersion>
         <EngineVersion>5.8.1</EngineVersion>
         <PlatformName>Win64</PlatformName>
         <PlatformArchitecture>x86_64</PlatformArchitecture>
         <BuildConfiguration>Shipping</BuildConfiguration>
-      </RuntimeProperties></FGenericCrashContext>
+        <UserDescription><![CDATA[</textarea><script>globalThis.pwned=true</script>]]></UserDescription>
+        <Misc.OSVersionMajor>Windows 11 Pro</Misc.OSVersionMajor>
+      </RuntimeProperties><PlatformProperties>
+        <PlatformIsRunningWindows>1</PlatformIsRunningWindows>
+      </PlatformProperties><GameData>
+        <MapName>C:\\Game\\Maps\\Arena;$(calc)</MapName>
+      </GameData></FGenericCrashContext>
     `);
+    const log = Buffer.from("LogFaultLane: old line\nLogFaultLane: </pre><script>globalThis.pwned=true</script>\n");
     const parts = [
       Buffer.from("CR1"),
       field(guid),
       field(`${guid}.uecrash`),
       integer(0),
-      integer(2),
+      integer(3),
       integer(0),
       field("CrashContext.runtime-xml"),
       integer(xml.length),
@@ -452,6 +503,10 @@ node -e '
       field("UEMinidump.dmp"),
       integer(dump.length),
       dump,
+      integer(2),
+      field("Project.log"),
+      integer(log.length),
+      log,
     ];
     const expanded = Buffer.concat(parts);
     expanded.writeInt32LE(expanded.length, 531);
@@ -467,7 +522,8 @@ node -e '
   create("UECC-Windows-Regression-298", process.argv[9], "2.0.0");
   create("UECC-Windows-Ambiguous-298", process.argv[10], "3.0.0", "Assert");
   create("UECC-Windows-Reprocessing-299", process.argv[11], "5.0.0");
- ' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path" "$distinct_path" "$regression_path" "$ambiguous_path" "$reprocessing_path"
+  create("UECC-Windows-Dashboard-Missing-300", process.argv[12], "6.0.0", "Assert", "Dashboard missing symbols 300");
+ ' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path" "$distinct_path" "$regression_path" "$ambiguous_path" "$reprocessing_path" "$dashboard_missing_path"
 
 resource_response="$(curl --fail --silent --show-error \
   -H "Content-Type: application/octet-stream" \
@@ -1224,10 +1280,359 @@ if [[ "$(json_field state <<<"$database_state")" != "processed" ]]; then
   exit 1
 fi
 
+proof_phase "seeding and proving the issue dashboard"
+stop_role "$worker_pid"
+worker_pid=""
+stop_role "$worker_two_pid"
+worker_two_pid=""
+stop_role "$api_pid"
+api_pid=""
+export FAULTLANE_GROUPING_ENABLED=true
+export FAULTLANE_REPROCESSING_ENABLED=true
+export FAULTLANE_DASHBOARD_ENABLED=true
+export FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED=true
+start_role api dashboard-api
+api_pid="$started_pid"
+start_role worker dashboard-worker
+worker_pid="$started_pid"
+for _ in $(seq 1 60); do
+  if curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null
+
+dashboard_symbol_root="$proof_directory/dashboard-symbols"
+mkdir "$dashboard_symbol_root"
+cp apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.exe "$dashboard_symbol_root/"
+cp apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.pdb "$dashboard_symbol_root/"
+printf '\0' >>"$dashboard_symbol_root/faultlane-symbolication.pdb"
+dashboard_missing_release="$(negotiate_release_without_upload 6.0.0 2026-08-19T00:00:00Z "$dashboard_symbol_root")"
+dashboard_missing_release_id="$(json_field release.id <<<"$dashboard_missing_release")"
+dashboard_missing_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$dashboard_missing_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=6.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+dashboard_missing_event_id="$(json_field event_id <<<"$dashboard_missing_response")"
+dashboard_missing_state="$(wait_for_event_state "$dashboard_missing_event_id" awaiting_symbols)"
+dashboard_missing_issue_id="$(json_field issue_id <<<"$dashboard_missing_state")"
+if [[ -z "$dashboard_missing_issue_id" \
+  || "$(json_field release_id <<<"$dashboard_missing_state")" != "$dashboard_missing_release_id" ]]; then
+  echo "missing-symbol dashboard fixture is invalid: $dashboard_missing_state" >&2
+  exit 1
+fi
+
+primary_organization_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT organization_id::text FROM projects WHERE id::text = '$project_id';")"
+primary_ingest_key_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT id::text FROM project_ingest_keys WHERE project_id::text = '$project_id' AND revoked_at IS NULL LIMIT 1;")"
+primary_release_id="$(json_field release.id <<<"$first_upload")"
+empty_project_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "WITH inserted AS (INSERT INTO projects (organization_id, name, slug) VALUES ('$primary_organization_id', 'Empty Windows Game', 'empty-windows-game') RETURNING id) SELECT id::text FROM inserted;")"
+outside_project_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "WITH outside_organization AS (INSERT INTO organizations (name, slug) VALUES ('Outside Dashboard Proof', 'outside-dashboard-proof') RETURNING id), outside_project AS (INSERT INTO projects (organization_id, name, slug) SELECT id, 'Outside Windows Game', 'outside-windows-game' FROM outside_organization RETURNING id) SELECT id::text FROM outside_project;")"
+
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL >/dev/null
+SET synchronous_commit = off;
+CREATE TEMP TABLE dashboard_seed AS
+SELECT
+  seed_number,
+  gen_random_uuid() AS issue_id,
+  gen_random_uuid() AS event_id,
+  gen_random_uuid() AS object_id,
+  gen_random_uuid() AS result_id,
+  'UECC-Windows-Dashboard-Seed-' || seed_number::text AS crash_guid,
+  md5('dashboard-issue-a-' || seed_number::text)
+    || md5('dashboard-issue-b-' || seed_number::text) AS fingerprint,
+  now() - ((10001 - seed_number) * interval '1 second') AS observed_at
+FROM generate_series(1, 10000) AS seeds(seed_number);
+
+INSERT INTO crash_event_objects (
+  id, organization_id, project_id, object_key, checksum, byte_size, media_type
+)
+SELECT
+  object_id,
+  '$primary_organization_id',
+  '$project_id',
+  'proof/dashboard/' || object_id::text,
+  decode(
+    md5('dashboard-object-a-' || seed_number::text)
+      || md5('dashboard-object-b-' || seed_number::text),
+    'hex'
+  ),
+  128,
+  'application/octet-stream'
+FROM dashboard_seed;
+
+INSERT INTO crash_events (
+  id, organization_id, project_id, ingest_key_id, raw_object_id, crash_guid,
+  environment, processing_state, release_id, release_mapping_state,
+  grouping_state, received_at, updated_at
+)
+SELECT
+  event_id,
+  '$primary_organization_id',
+  '$project_id',
+  '$primary_ingest_key_id',
+  object_id,
+  crash_guid,
+  'production',
+  'processed',
+  '$primary_release_id',
+  'matched',
+  'pending',
+  observed_at,
+  observed_at
+FROM dashboard_seed;
+
+INSERT INTO crash_processing_results (
+  id, organization_id, project_id, event_id, schema_version,
+  processing_version, result, checksum, created_at
+)
+SELECT
+  seed.result_id,
+  '$primary_organization_id',
+  '$project_id',
+  seed.event_id,
+  template.schema_version,
+  template.processing_version,
+  jsonb_set(
+    jsonb_set(template.result, '{crash_guid}', to_jsonb(seed.crash_guid), true),
+    '{crash_context,crash_guid}',
+    to_jsonb(seed.crash_guid),
+    true
+  ),
+  decode(
+    md5('dashboard-result-a-' || seed.seed_number::text)
+      || md5('dashboard-result-b-' || seed.seed_number::text),
+    'hex'
+  ),
+  seed.observed_at
+FROM dashboard_seed seed
+CROSS JOIN LATERAL (
+  SELECT schema_version, processing_version, result
+  FROM crash_processing_results
+  WHERE event_id::text = '$event_id'
+  ORDER BY created_at DESC
+  LIMIT 1
+) template;
+
+INSERT INTO crash_event_search (
+  organization_id, project_id, event_id, result_id, search_text,
+  crash_type, platform, architecture, engine_version, symbolication_state
+)
+SELECT
+  '$primary_organization_id',
+  '$project_id',
+  seed.event_id,
+  seed.result_id,
+  concat_ws(
+    chr(31),
+    result.result #>> '{crash_context,error_message}',
+    result.result #>> '{crash_context,user_comment}',
+    (
+      SELECT string_agg(module ->> 'module', chr(31) ORDER BY module_index)
+      FROM jsonb_array_elements(result.result #> '{current,symbolication,modules}')
+        WITH ORDINALITY AS modules(module, module_index)
+      WHERE module ->> 'module' IS NOT NULL
+    ),
+    (
+      SELECT string_agg(frame ->> 'function', chr(31) ORDER BY thread_index, frame_index)
+      FROM jsonb_array_elements(result.result #> '{current,symbolication,threads}')
+        WITH ORDINALITY AS threads(thread, thread_index)
+      CROSS JOIN LATERAL jsonb_array_elements(thread -> 'frames')
+        WITH ORDINALITY AS frames(frame, frame_index)
+      WHERE frame ->> 'function' IS NOT NULL
+    ),
+    (
+      SELECT string_agg(
+        inline ->> 'function',
+        chr(31) ORDER BY thread_index, frame_index, inline_index
+      )
+      FROM jsonb_array_elements(result.result #> '{current,symbolication,threads}')
+        WITH ORDINALITY AS threads(thread, thread_index)
+      CROSS JOIN LATERAL jsonb_array_elements(thread -> 'frames')
+        WITH ORDINALITY AS frames(frame, frame_index)
+      CROSS JOIN LATERAL jsonb_array_elements(frame -> 'inlines')
+        WITH ORDINALITY AS inlines(inline, inline_index)
+      WHERE inline ->> 'function' IS NOT NULL
+    )
+  ),
+  result.result #>> '{crash_context,crash_type}',
+  result.result #>> '{crash_context,platform,normalized}',
+  result.result #>> '{crash_context,architecture}',
+  result.result #>> '{crash_context,engine_version}',
+  'readable'
+FROM dashboard_seed seed
+JOIN crash_processing_results result ON result.id = seed.result_id;
+
+INSERT INTO issues (
+  id, organization_id, project_id, fingerprint_algorithm, fingerprint_version,
+  fingerprint, title, status, regression_state, first_seen_at, last_seen_at,
+  event_count, representative_event_id, first_release_id, last_release_id,
+  created_at, updated_at
+)
+SELECT
+  issue_id,
+  '$primary_organization_id',
+  '$project_id',
+  'stack',
+  1,
+  fingerprint,
+  'Browser seed ' || seed_number::text,
+  'open',
+  CASE WHEN seed_number % 3 = 0 THEN 'new' ELSE 'ongoing' END,
+  observed_at,
+  observed_at,
+  1,
+  event_id,
+  '$primary_release_id',
+  '$primary_release_id',
+  observed_at,
+  observed_at
+FROM dashboard_seed;
+
+UPDATE crash_events event
+SET current_result_id = seed.result_id,
+    grouping_state = 'grouped',
+    fingerprint_algorithm = 'stack',
+    fingerprint_version = 1,
+    fingerprint = seed.fingerprint,
+    variant_fingerprint = seed.fingerprint,
+    grouping_quality = 100,
+    grouped_at = seed.observed_at,
+    issue_id = seed.issue_id
+FROM dashboard_seed seed
+WHERE event.id = seed.event_id;
+
+INSERT INTO issue_variants (
+  organization_id, project_id, issue_id, variant_fingerprint,
+  first_seen_at, last_seen_at, event_count, representative_event_id
+)
+SELECT
+  '$primary_organization_id', '$project_id', issue_id, fingerprint,
+  observed_at, observed_at, 1, event_id
+FROM dashboard_seed;
+
+INSERT INTO issue_releases (
+  organization_id, project_id, issue_id, release_id,
+  first_seen_at, last_seen_at, event_count, representative_event_id
+)
+SELECT
+  '$primary_organization_id', '$project_id', issue_id, '$primary_release_id',
+  observed_at, observed_at, 1, event_id
+FROM dashboard_seed;
+
+ANALYZE issues;
+ANALYZE crash_events;
+ANALYZE crash_processing_results;
+ANALYZE crash_event_search;
+SQL
+
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL >"$proof_directory/dashboard-query-plan.log"
+SET statement_timeout = '2s';
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT i.id
+FROM issues i
+WHERE i.organization_id = '$primary_organization_id'::uuid
+  AND i.project_id = '$project_id'::uuid
+ORDER BY i.last_seen_at DESC, i.id DESC
+LIMIT 101;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT i.id
+FROM issues i
+WHERE i.organization_id = '$primary_organization_id'::uuid
+  AND i.project_id = '$project_id'::uuid
+  AND (
+    i.title ILIKE '%dashboard-worst-case-no-match%' ESCAPE chr(92)
+    OR EXISTS (
+      SELECT 1
+      FROM crash_events e
+      JOIN crash_event_search search
+        ON search.organization_id = e.organization_id
+       AND search.project_id = e.project_id
+       AND search.event_id = e.id
+       AND search.result_id = e.current_result_id
+      WHERE e.organization_id = i.organization_id
+        AND e.project_id = i.project_id
+        AND e.issue_id = i.id
+        AND search.search_text ILIKE '%dashboard-worst-case-no-match%' ESCAPE chr(92)
+    )
+  )
+ORDER BY i.last_seen_at DESC, i.id DESC
+LIMIT 101;
+SQL
+
+corepack pnpm --filter @faultlane/web build
+start_web
+for _ in $(seq 1 120); do
+  if curl --fail --silent "$FAULTLANE_WEB_URL/projects/$project_id" >/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+curl --fail --silent "$FAULTLANE_WEB_URL/projects/$project_id" >/dev/null
+
+proof_phase "running canonical runtime smoke"
+FAULTLANE_SMOKE_API_URL="$FAULTLANE_API_URL" \
+  FAULTLANE_SMOKE_INGEST_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT" \
+  FAULTLANE_SMOKE_WEB_URL="$FAULTLANE_WEB_URL" \
+  bash scripts/smoke
+
+export FAULTLANE_PROOF_PROJECT_ID="$project_id"
+export FAULTLANE_PROOF_READABLE_ISSUE_ID="$repeated_issue_id"
+export FAULTLANE_PROOF_MISSING_ISSUE_ID="$dashboard_missing_issue_id"
+export FAULTLANE_PROOF_EMPTY_PROJECT_ID="$empty_project_id"
+export FAULTLANE_PROOF_OUTSIDE_PROJECT_ID="$outside_project_id"
+corepack pnpm --filter @faultlane/web exec playwright test e2e/dashboard.spec.ts --workers=1
+
+dashboard_reprocessing_count="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT count(*) FROM crash_reprocessing_requests WHERE organization_id::text = '$primary_organization_id' AND project_id::text = '$project_id' AND source = 'manual' AND scope_kind = 'event' AND scope_value = '$event_id';")"
+if [[ "$dashboard_reprocessing_count" != "1" ]]; then
+  echo "dashboard action created $dashboard_reprocessing_count manual requests" >&2
+  exit 1
+fi
+
+stop_role "$api_pid"
+api_pid=""
+corepack pnpm --filter @faultlane/web exec playwright test e2e/dashboard-error.spec.ts --workers=1
+stop_web
+
 for sensitive in \
   "$POSTGRES_PASSWORD" \
   "$MINIO_ROOT_PASSWORD" \
   "$FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_RATE_LIMIT_SECRET" \
   "$ingest_key" \
   "$upload_token" \
   "$reprocessing_ingest_key" \

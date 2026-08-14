@@ -2,7 +2,7 @@
 
 Issue: [#300](https://github.com/ishtms/faultlane/issues/300)
 
-Status: Approved for implementation.
+Status: Implemented and locally verified, awaiting pull request review.
 
 ## Outcome
 
@@ -16,7 +16,7 @@ Issues #311, #298, and #299 now provide isolated processing results, stable issu
 
 The Next.js app has only the landing and local setup routes. It has no project shell, issue list, issue detail, loading boundary, route error boundary, pagination, reprocess action, copy control, attachment proxy, or dashboard browser test.
 
-The product sources have three known discrepancies. The overview still calls M0 current, and the overview, PRD, and architecture retain the former CacheLane name. GitHub milestone M1 and the repository use FaultLane. The #300 issue asks for a usage view, while #302 owns authoritative billing-cycle metering, plan limits, retention, and quota enforcement. This change therefore shows explicitly labeled observed event and retained-byte totals from current durable rows. It does not call them billable usage or make admission decisions. #302 will replace that snapshot with the authoritative usage ledger and plan state.
+The product sources have three known discrepancies. The overview still calls M0 current, and the overview, PRD, and architecture retain the former product name. GitHub milestone M1 and the repository use FaultLane. The #300 issue asks for a usage view, while #302 owns authoritative billing-cycle metering, plan limits, retention, and quota enforcement. This change therefore shows explicitly labeled observed event and retained-byte totals from current durable rows. It does not call them billable usage or make admission decisions. #302 will replace that snapshot with the authoritative usage ledger and plan state.
 
 Project data rules and configurable redaction belong to #312. Until then, comments, log tails, GameData, system fields, and raw downloads are available only through the current owner-only control boundary, never through public ingest credentials. The API returns only explicit bounded fields and never returns `unknown_fields`, command lines, raw result JSON, object keys, processor stderr, symbol files, or storage credentials.
 
@@ -44,7 +44,7 @@ Risk: R3.
 
 This change exposes sensitive crash-derived content and retained raw artifacts through new API and browser surfaces, adds cross-component queries and object streaming, and adds an operator-triggered reprocessing action. A defect could cross tenant boundaries, disclose a minidump or comment, turn stored text into script or shell execution, expose object-store credentials, produce misleading health data, create unstable pagination, or overload PostgreSQL with an unbounded search.
 
-The schema change is additive and index-only unless implementation evidence proves a small read projection is required. No hosted deployment, production credential, production data, billing decision, destructive migration, dependency, service, external search engine, or direct browser-to-database access is in scope.
+The schema change is additive and includes tenant-leading indexes plus a small current-result read projection. No hosted deployment, production credential, production data, billing decision, destructive migration, dependency, service, external search engine, or direct browser-to-database access is in scope.
 
 ## Selected API design
 
@@ -83,9 +83,9 @@ The response calls this `observed_usage`, includes `authoritative: false`, and r
 
 Issue ordering is `last_seen_at DESC, id DESC`. Event ordering is `received_at DESC, id DESC`. The opaque cursor is a versioned URL-safe base64 payload containing the ordering timestamp, UUID, project ID, route kind, and SHA-256 of normalized filters. Decoding is bounded before allocation. A cursor cannot be reused with a different project, endpoint, or filter set.
 
-Filters match any current event assigned to the issue, not only its representative. Search examines only these explicit current-result fields: issue title, crash error message, user comment, symbolicated function, and module. Search text is limited, normalized as Unicode text, escaped as a literal `ILIKE` pattern, and never interpreted as SQL, regular expression, or JSONPath. GameData search waits for #312 because only owner-allowlisted keys may become indexed search fields.
+Filters match any current event assigned to the issue, not only its representative. Search examines only these explicit current-result fields: issue title, crash error message, user comment, symbolicated function, and module. Search text is limited, normalized as Unicode text, escaped as a literal `ILIKE` pattern, and never interpreted as SQL, regular expression, or JSONPath. The per-event search document is limited to 65,536 Unicode scalar values, enforced by both the worker and database. Search reads use a two-second PostgreSQL statement timeout. GameData search waits for #312 because only owner-allowlisted keys may become indexed search fields.
 
-No Elasticsearch, ClickHouse, Redis, client-side filtering, new dependency, or unbounded JSON serialization is introduced. Add tenant-leading indexes for actual query predicates shown by `EXPLAIN (ANALYZE, BUFFERS)` on the seeded volume. If the explicit JSON field search cannot meet the query budget, add one additive event read-projection table populated in the existing lease-fenced publication transaction. Do not index raw unknown fields, command lines, full logs, or unredacted GameData.
+No Elasticsearch, ClickHouse, Redis, client-side filtering, new dependency, or unbounded JSON serialization is introduced. Measured worst-case JSON search exceeded the two-second budget, so the additive `crash_event_search` projection stores only the approved search document, bounded user comment, dashboard dimensions, and symbolication state. The worker updates it in the existing lease-fenced current-result publication transaction. It does not index raw unknown fields, command lines, full logs, or unredacted GameData.
 
 ## Event projection and bounds
 
@@ -107,7 +107,7 @@ Response bounds are independent of the larger processor limits:
 
 Every bounded collection or string reports truncation. String truncation occurs on valid Unicode scalar boundaries. Event detail omits crash context thread register text, raw call-stack strings, unknown XML fields, and command lines because the normalized stack already owns presentation and those fields add disclosure without meeting #300.
 
-Missing-symbol rows come from `crash_symbol_waiters` joined through the exact event, current result, matched release, organization, and project. The corrective command is assembled from the validated project slug and release fields. Each PowerShell argument is single-quoted with embedded single quotes doubled, and the build path remains the literal placeholder `<build-directory>`.
+Missing-symbol rows merge current-result `crash_symbol_waiters` with missing or mismatched artifacts from the event's exact release manifest. The union is tenant-scoped, deduplicated by exact identity, and bounded before projection. The corrective command is assembled from the validated project slug and release fields. Each PowerShell argument is single-quoted with embedded single quotes doubled, and the build path remains the literal placeholder `<build-directory>`.
 
 Processing history joins immutable result rows and bounded reprocessing request-event rows under the same scope. It returns result ID, versions, checksum, creation time, current marker, request ID, request source, state, and fixed failure code. It never returns old raw result bodies.
 
@@ -146,7 +146,7 @@ All customer-controlled text is rendered through normal React text nodes. There 
 
 ## Database and compatibility
 
-Prefer an index-only additive migration. Expected candidates include project, issue, received time, processing state, current result, and release predicates. Create an event search projection only if measured query plans require it, and keep it additive, tenant-scoped, versioned, and populated atomically with current-result publication.
+The additive migration adds project, issue, received-time, processing-state, current-result, and release indexes. It also creates the measured event search projection, keeps it tenant-scoped, links it to one immutable result, backfills current results, and populates it atomically with current-result publication.
 
 Do not change or rewrite an applied migration. The prior #299 API, ingest, and worker must start and process normal events against the expanded schema. The prior web build remains compatible with unchanged setup APIs.
 
