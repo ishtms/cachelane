@@ -2,7 +2,7 @@
 
 Issue: [#352](https://github.com/ishtms/faultlane/issues/352)
 
-Status: Proposed. R3 implementation awaits approval of this plan and the source-of-truth decision below.
+Status: Approved on August 15, 2026. Track the seven authoritative documents using option 1 below.
 
 ## Outcome
 
@@ -136,11 +136,11 @@ Rollback in this order:
 - Long continuous fuzzing, distributed fuzz infrastructure, or external corpora
 - Changes to customer retention, billing, authentication, or authorization
 
-## Decision required
+## Approved source-of-truth decision
 
-Choose one option before implementation:
+Option 1 was approved on August 15, 2026:
 
 1. Allow exact `.gitignore` exceptions for `docs/product/overview.md`, `PRD.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/security/threat-model.md`, `docs/operations/deployment.md`, and `docs/operations/rollback.md`. Update their stale product name and milestone state before adding them normally as tracked files. No force-add remains necessary.
 2. Allow exact `.gitignore` and staging exceptions for `AGENTS.md`, then update it so tracked GitHub issues, milestones, decisions, and plans become authoritative instead of the ignored local product and architecture Markdown. Leave the seven ignored documents local and non-authoritative.
 
-Option 1 is recommended because it keeps architecture and product rationale reviewable beside the code while preserving GitHub as the execution roadmap. Either option is a specific exception to current repository rules. No implementation proceeds until the choice is explicit.
+Option 1 keeps architecture and product rationale reviewable beside the code while preserving GitHub as the execution roadmap. The approval is a narrow exception to modify `.gitignore` only for these seven paths. `AGENTS.md` remains unstaged and unchanged.
