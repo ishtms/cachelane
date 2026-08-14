@@ -33,6 +33,7 @@ pub(crate) struct ServerState {
     bootstrap: BootstrapAuthorization,
     ingest_base_url: String,
     crash_ingest: crate::crash_ingest::CrashIngest,
+    reprocessing_enabled: bool,
     symbol_uploads: crate::symbol_upload::SymbolUploads,
 }
 
@@ -85,6 +86,8 @@ impl ServerState {
             bootstrap,
             ingest_base_url,
             crash_ingest: crate::crash_ingest::CrashIngest::postgres(pool, role)?,
+            reprocessing_enabled: env::var("FAULTLANE_REPROCESSING_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             symbol_uploads,
         })
     }
@@ -99,6 +102,7 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            reprocessing_enabled: false,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
     }
@@ -115,6 +119,7 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest,
+            reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
     }
@@ -131,6 +136,7 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            reprocessing_enabled: true,
             symbol_uploads,
         }
     }
@@ -143,6 +149,7 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
     }
@@ -169,6 +176,10 @@ impl ServerState {
 
     pub(crate) fn symbol_uploads(&self) -> &crate::symbol_upload::SymbolUploads {
         &self.symbol_uploads
+    }
+
+    pub(crate) fn reprocessing_enabled(&self) -> bool {
+        self.reprocessing_enabled
     }
 
     #[cfg_attr(
@@ -280,6 +291,14 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
                 put(crate::issues::resolve_issue)
                     .delete(crate::issues::reopen_issue)
                     .layer(DefaultBodyLimit::max(4 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/reprocessing",
+                post(crate::reprocessing::create_request).layer(DefaultBodyLimit::max(4 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/reprocessing/{request_id}",
+                get(crate::reprocessing::get_request),
             )
             .route(
                 "/api/v1/projects/{project_id}/artifact-upload-tokens",

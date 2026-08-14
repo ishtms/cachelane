@@ -19,3 +19,11 @@ The scratch root and every attempt directory are private. A new root receives a 
 Object-store failures return a job to bounded backoff without changing customer-visible results. A database outage can leave a job leased until its recorded lease expires because no durable transition is possible while PostgreSQL is unavailable. After recovery, the same or another worker claims the expired lease, and token checks reject publication by the old attempt.
 
 Rollback sets `FAULTLANE_ISOLATED_PROCESSING_ENABLED=false`, which keeps the API available but disables symbol-upload routes in the current build, stops workers and their owned processor containers, and restores the previous application build. The migration is additive. Original objects, pending jobs, results, and derived caches remain available for a corrected worker. Do not remove queue rows or objects during rollback.
+
+## Reprocessing rollout
+
+Apply migrations and start the current API and worker with `FAULTLANE_REPROCESSING_ENABLED=false`. Confirm normal crash processing, artifact publication, and queue health before enabling the flag on both roles. New crash jobs retain priority 100. Reactivated crash jobs use priority 200, and the worker schedules at most one request page after every 20 ordinary jobs or when the queue is idle.
+
+The flag prevents manual request creation and stops workers from selecting requests or reactivating event jobs. Progress reads remain available. Exact symbol waiters and automatic requests may still be recorded while disabled so an artifact arrival is not lost.
+
+To roll back, disable reprocessing before restoring the prior application and worker. Leave the additive schema, request rows, generations, waiters, jobs, raw objects, and immutable results in place. A prior worker understands the reused `process_crash` job and ignores the new request tables. When the current worker returns, it reconciles unfinished request events whose canonical job was completed by an older worker.

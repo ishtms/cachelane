@@ -332,6 +332,72 @@ paths:
           $ref: "#/components/responses/IssueNotFound"
         "500":
           $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/reprocessing:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createProjectReprocessingRequest
+      summary: Start one bounded project reprocessing request
+      security:
+        - bootstrapAuthorization: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: ^[!-~]+$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateReprocessingRequest"
+      responses:
+        "202":
+          description: Reprocessing request accepted or replayed idempotently
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReprocessingRequest"
+        "400":
+          $ref: "#/components/responses/ReprocessingInvalidRequest"
+        "404":
+          $ref: "#/components/responses/ReprocessingNotFound"
+        "409":
+          $ref: "#/components/responses/ReprocessingConflict"
+        "429":
+          $ref: "#/components/responses/ReprocessingLimitReached"
+        "500":
+          $ref: "#/components/responses/ReprocessingInternalError"
+  /api/v1/projects/{project_id}/reprocessing/{request_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/ReprocessingRequestId"
+    get:
+      operationId: getProjectReprocessingRequest
+      summary: Get bounded reprocessing progress and failure counts
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Current reprocessing request progress
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReprocessingRequest"
+        "404":
+          $ref: "#/components/responses/ReprocessingNotFound"
+        "500":
+          $ref: "#/components/responses/ReprocessingInternalError"
   /api/v1/projects/{project_id}/artifact-upload-tokens:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -681,6 +747,13 @@ components:
       schema:
         type: string
         format: uuid
+    ReprocessingRequestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   headers:
     CacheControlNoStore:
       description: Prevent storage of sensitive control and artifact metadata responses.
@@ -807,6 +880,51 @@ components:
             $ref: "#/components/schemas/Error"
     IssueInternalError:
       description: Issue request could not be completed
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReprocessingInvalidRequest:
+      description: Reprocessing request validation failed
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReprocessingNotFound:
+      description: The request is unavailable, disabled, unauthorized, or outside the project
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReprocessingConflict:
+      description: The idempotency key was used with another request body
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReprocessingLimitReached:
+      description: Five manual requests are already unfinished for this project
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReprocessingInternalError:
+      description: Reprocessing request state could not be read or changed
       headers:
         Cache-Control:
           $ref: "#/components/headers/CacheControlNoStore"
@@ -1077,6 +1195,244 @@ components:
         - string
         - "null"
       pattern: ^[a-f0-9]{64}$
+    CreateReprocessingRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - scope
+      properties:
+        scope:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - event_id
+              properties:
+                kind:
+                  type: string
+                  const: event
+                event_id:
+                  type: string
+                  format: uuid
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - issue_id
+              properties:
+                kind:
+                  type: string
+                  const: issue
+                issue_id:
+                  type: string
+                  format: uuid
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - release_id
+              properties:
+                kind:
+                  type: string
+                  const: release
+                release_id:
+                  type: string
+                  format: uuid
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+              properties:
+                kind:
+                  type: string
+                  const: project
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - parser_version
+              properties:
+                kind:
+                  type: string
+                  const: parser_version
+                parser_version:
+                  type: integer
+                  minimum: 1
+                  maximum: 2147483647
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - symbolicator_version
+              properties:
+                kind:
+                  type: string
+                  const: symbolicator_version
+                symbolicator_version:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  pattern: ^[A-Za-z0-9._+-]+$
+            - type: object
+              additionalProperties: false
+              required:
+                - kind
+                - fingerprint_version
+              properties:
+                kind:
+                  type: string
+                  const: fingerprint_version
+                fingerprint_version:
+                  type: integer
+                  minimum: 1
+                  maximum: 2147483647
+        cursor:
+          type:
+            - string
+            - "null"
+          format: uuid
+        limit:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+          maximum: 1000
+    ReprocessingSource:
+      type: string
+      enum:
+        - automatic
+        - manual
+    ReprocessingScopeKind:
+      type: string
+      enum:
+        - artifact
+        - event
+        - issue
+        - release
+        - project
+        - parser_version
+        - symbolicator_version
+        - fingerprint_version
+    ReprocessingState:
+      type: string
+      enum:
+        - pending
+        - scheduling
+        - running
+        - completed
+        - partial
+        - failed
+    ReprocessingFailureCount:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - count
+      properties:
+        code:
+          type: string
+          pattern: ^[a-z0-9][a-z0-9_]{0,63}$
+        count:
+          type: integer
+          minimum: 1
+    ReprocessingRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - request_id
+        - source
+        - scope_kind
+        - scope_value
+        - state
+        - cursor
+        - limit
+        - selection_complete
+        - selection_truncated
+        - next_cursor
+        - selected_count
+        - queued_count
+        - running_count
+        - completed_count
+        - failed_count
+        - failure_code
+        - failure_codes
+        - failure_codes_truncated
+        - created_at
+        - updated_at
+        - completed_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        source:
+          $ref: "#/components/schemas/ReprocessingSource"
+        scope_kind:
+          $ref: "#/components/schemas/ReprocessingScopeKind"
+        scope_value:
+          type:
+            - string
+            - "null"
+        state:
+          $ref: "#/components/schemas/ReprocessingState"
+        cursor:
+          type:
+            - string
+            - "null"
+          format: uuid
+        limit:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+          maximum: 1000
+        selection_complete:
+          type: boolean
+        selection_truncated:
+          type: boolean
+        next_cursor:
+          type:
+            - string
+            - "null"
+          format: uuid
+        selected_count:
+          type: integer
+          minimum: 0
+        queued_count:
+          type: integer
+          minimum: 0
+        running_count:
+          type: integer
+          minimum: 0
+        completed_count:
+          type: integer
+          minimum: 0
+        failed_count:
+          type: integer
+          minimum: 0
+        failure_code:
+          type:
+            - string
+            - "null"
+          pattern: ^[a-z0-9][a-z0-9_]{0,63}$
+        failure_codes:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/ReprocessingFailureCount"
+        failure_codes_truncated:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - "null"
+          format: date-time
     IssueStatus:
       type: string
       enum:

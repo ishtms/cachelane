@@ -44,6 +44,7 @@ export INGEST_BASE_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
 export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
 export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
 export FAULTLANE_GROUPING_ENABLED=true
+export FAULTLANE_REPROCESSING_ENABLED=true
 export FAULTLANE_PROCESSOR_IMAGE="$processor_image"
 
 proof_phase() {
@@ -280,6 +281,26 @@ wait_for_event_state() {
   return 1
 }
 
+wait_for_reprocessing_request() {
+  local request_id="$1"
+  local request_state=""
+  local current_state=""
+  for _ in $(seq 1 240); do
+    request_state="$(curl --fail --silent --show-error \
+      -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+      "$FAULTLANE_API_URL/api/v1/projects/$project_id/reprocessing/$request_id")"
+    current_state="$(json_field state <<<"$request_state")"
+    if [[ "$current_state" =~ ^(completed|partial|failed)$ ]]; then
+      printf '%s' "$request_state"
+      return 0
+    fi
+    sleep 0.5
+  done
+  cat "$proof_directory"/worker*.log >&2
+  echo "reprocessing request $request_id did not finish" >&2
+  return 1
+}
+
 wait_for_release_ready() {
   local release_id="$1"
   local coverage=""
@@ -302,6 +323,7 @@ setup_response="$(curl --fail --silent --show-error \
   --data '{"owner_email":"owner@example.com","organization_name":"FaultLane Processing Proof","organization_slug":"faultlane-processing-proof","project_name":"Windows Game","project_slug":"windows-game"}' \
   "$FAULTLANE_API_URL/api/v1/setup")"
 project_id="$(json_field setup.project.id <<<"$setup_response")"
+project_slug="windows-game"
 ingest_key="$(json_field ingest_key.value <<<"$setup_response")"
 
 token_response="$(curl --fail --silent --show-error \
@@ -316,7 +338,7 @@ run_upload() {
   local build_timestamp="$3"
   FAULTLANE_TOKEN="$upload_token" ./target/debug/faultlane symbols upload \
     apps/cli/tests/fixtures/windows-symbolication \
-    --project windows-game \
+    --project "$project_slug" \
     --release "$release" \
     --configuration "$configuration" \
     --revision fixture \
@@ -324,6 +346,52 @@ run_upload() {
     --build-timestamp "$build_timestamp" \
     --ci-job isolated-proof \
     --api-url "$FAULTLANE_API_URL"
+}
+
+negotiate_release_without_upload() {
+  local release="$1"
+  local build_timestamp="$2"
+  local scan
+  local request
+  scan="$(./target/debug/faultlane symbols scan apps/cli/tests/fixtures/windows-symbolication)"
+  request="$(SCAN="$scan" RELEASE="$release" BUILD_TIMESTAMP="$build_timestamp" node -e '
+    const crypto = require("node:crypto");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const scan = JSON.parse(process.env.SCAN);
+    const root = "apps/cli/tests/fixtures/windows-symbolication";
+    const artifacts = scan.artifacts.map(artifact => ({
+      path: artifact.path,
+      module: artifact.module,
+      artifact_type: artifact.artifact_type,
+      architecture: artifact.architecture,
+      byte_size: artifact.size,
+      sha256: crypto.createHash("sha256")
+        .update(fs.readFileSync(path.join(root, artifact.path)))
+        .digest("hex"),
+      debug_id: artifact.debug_id,
+      code_id: artifact.code_id,
+    }));
+    process.stdout.write(JSON.stringify({
+      release: {
+        version: process.env.RELEASE,
+        platform: "windows",
+        architecture: "x86_64",
+        configuration: "shipping",
+        revision: "fixture",
+        channel: "staging",
+        build_timestamp: process.env.BUILD_TIMESTAMP,
+      },
+      artifacts,
+      cli_version: "0.1.0",
+      ci_job: "isolated-proof",
+    }));
+  ')"
+  curl --fail --silent --show-error \
+    -H "Authorization: Bearer $upload_token" \
+    -H "Content-Type: application/json" \
+    --data "$request" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_slug/artifact-uploads"
 }
 
 first_upload="$(run_upload 1.0.0 shipping 2026-08-14T00:00:00Z)"
@@ -342,6 +410,7 @@ database_path="$proof_directory/database-outage.bundle"
 distinct_path="$proof_directory/distinct.bundle"
 regression_path="$proof_directory/regression.bundle"
 ambiguous_path="$proof_directory/ambiguous.bundle"
+reprocessing_path="$proof_directory/reprocessing.bundle"
 node -e '
   const fs = require("node:fs");
   const zlib = require("node:zlib");
@@ -397,7 +466,8 @@ node -e '
   create("UECC-Windows-Distinct-298", process.argv[8], "1.0.0", "Assert");
   create("UECC-Windows-Regression-298", process.argv[9], "2.0.0");
   create("UECC-Windows-Ambiguous-298", process.argv[10], "3.0.0", "Assert");
-' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path" "$distinct_path" "$regression_path" "$ambiguous_path"
+  create("UECC-Windows-Reprocessing-299", process.argv[11], "5.0.0");
+ ' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path" "$distinct_path" "$regression_path" "$ambiguous_path" "$reprocessing_path"
 
 resource_response="$(curl --fail --silent --show-error \
   -H "Content-Type: application/octet-stream" \
@@ -654,6 +724,228 @@ grouping_proof="$(EVENT_STATE="$event_state" REPEAT_STATE="$repeat_state" DISTIN
     ambiguous_candidates: ambiguous.candidate_release_ids.length,
   }));
 ')"
+
+proof_phase "proving automatic and manual crash reprocessing"
+stop_role "$worker_pid"
+worker_pid=""
+stop_role "$worker_two_pid"
+worker_two_pid=""
+
+primary_project_id="$project_id"
+primary_project_slug="$project_slug"
+primary_ingest_key="$ingest_key"
+primary_upload_token="$upload_token"
+reprocessing_organization_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "WITH inserted AS (INSERT INTO organizations (name, slug) VALUES ('FaultLane Reprocessing Proof', 'faultlane-reprocessing-proof') RETURNING id) SELECT id::text FROM inserted;")"
+reprocessing_user_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT id::text FROM users WHERE bootstrap_subject = 'local-bootstrap';")"
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('$reprocessing_organization_id'::uuid, '$reprocessing_user_id'::uuid, 'owner');" \
+  >/dev/null
+reprocessing_project_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "WITH inserted AS (INSERT INTO projects (organization_id, name, slug) VALUES ('$reprocessing_organization_id'::uuid, 'Reprocessing Game', 'reprocessing-game') RETURNING id) SELECT id::text FROM inserted;")"
+reprocessing_ingest_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$reprocessing_project_id/ingest-keys")"
+reprocessing_ingest_key="$(json_field ingest_key.value <<<"$reprocessing_ingest_response")"
+reprocessing_token_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$reprocessing_project_id/artifact-upload-tokens")"
+reprocessing_upload_token="$(json_field token <<<"$reprocessing_token_response")"
+project_id="$reprocessing_project_id"
+project_slug="reprocessing-game"
+ingest_key="$reprocessing_ingest_key"
+upload_token="$reprocessing_upload_token"
+missing_release="$(negotiate_release_without_upload 5.0.0 2026-08-18T00:00:00Z)"
+reprocessing_release_id="$(json_field release.id <<<"$missing_release")"
+reprocessing_ingest="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$reprocessing_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=5.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+reprocessing_event_id="$(json_field event_id <<<"$reprocessing_ingest")"
+start_role worker reprocessing-worker
+worker_pid="$started_pid"
+reprocessing_partial_state="$(wait_for_event_state "$reprocessing_event_id" awaiting_symbols)"
+reprocessing_before="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT e.raw_object_id::text || '|' || e.current_result_id::text || '|' || (SELECT count(*) FROM crash_processing_results r WHERE r.event_id = e.id)::text || '|' || (SELECT count(*) FROM crash_symbol_waiters w WHERE w.event_id = e.id)::text || '|' || e.requested_reprocessing_generation::text FROM crash_events e WHERE e.id::text = '$reprocessing_event_id';")"
+IFS='|' read -r reprocessing_raw_id reprocessing_partial_result_id reprocessing_before_results reprocessing_before_waiters reprocessing_before_generation <<<"$reprocessing_before"
+if [[ "$reprocessing_before_results" != "1" \
+  || "$reprocessing_before_waiters" -lt 1 \
+  || "$reprocessing_before_generation" != "0" ]]; then
+  echo "partial reprocessing evidence is invalid: $reprocessing_before" >&2
+  exit 1
+fi
+
+reprocessing_upload="$(run_upload 5.0.0 shipping 2026-08-18T00:00:00Z)"
+reprocessing_state="$(wait_for_event_state "$reprocessing_event_id" processed)"
+reprocessing_request_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT r.id::text FROM crash_reprocessing_requests r JOIN crash_reprocessing_request_events x ON x.request_id = r.id WHERE x.event_id::text = '$reprocessing_event_id' AND r.source = 'automatic' ORDER BY r.created_at LIMIT 1;")"
+if [[ -z "$reprocessing_request_id" ]]; then
+  echo "automatic reprocessing request was not recorded" >&2
+  exit 1
+fi
+automatic_reprocessing_progress="$(wait_for_reprocessing_request "$reprocessing_request_id")"
+reprocessing_after="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "WITH current_result AS (SELECT r.result FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id WHERE e.id::text = '$reprocessing_event_id'), original_result AS (SELECT result FROM crash_processing_results WHERE id::text = '$reprocessing_partial_result_id') SELECT e.raw_object_id::text || '|' || e.current_result_id::text || '|' || (SELECT count(*) FROM crash_processing_results r WHERE r.event_id = e.id)::text || '|' || jsonb_array_length((SELECT result FROM current_result)->'history')::text || '|' || (SELECT count(*) FROM jsonb_array_elements((SELECT result FROM current_result)->'history') attempt WHERE attempt = (SELECT result->'current' FROM original_result))::text || '|' || jsonb_path_exists((SELECT result FROM current_result), '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")')::text || '|' || (SELECT count(*) FROM crash_symbol_waiters w WHERE w.event_id = e.id)::text || '|' || e.requested_reprocessing_generation::text || '|' || e.completed_reprocessing_generation::text FROM crash_events e WHERE e.id::text = '$reprocessing_event_id';")"
+IFS='|' read -r reprocessing_final_raw_id reprocessing_final_result_id reprocessing_after_results reprocessing_history_count reprocessing_original_history_count reprocessing_resolved reprocessing_after_waiters reprocessing_requested_generation reprocessing_completed_generation <<<"$reprocessing_after"
+if [[ "$reprocessing_final_raw_id" != "$reprocessing_raw_id" \
+  || "$reprocessing_final_result_id" == "$reprocessing_partial_result_id" \
+  || "$reprocessing_after_results" -lt 2 \
+  || "$reprocessing_history_count" -lt 1 \
+  || "$reprocessing_history_count" -gt 16 \
+  || "$reprocessing_original_history_count" != "1" \
+  || "$reprocessing_resolved" != "true" \
+  || "$reprocessing_after_waiters" != "0" \
+  || "$reprocessing_requested_generation" -lt 1 \
+  || "$reprocessing_requested_generation" != "$reprocessing_completed_generation" \
+  || "$(json_field state <<<"$automatic_reprocessing_progress")" != "completed" \
+  || "$(json_field selected_count <<<"$automatic_reprocessing_progress")" != "1" \
+  || "$(json_field failed_count <<<"$automatic_reprocessing_progress")" != "0" ]]; then
+  echo "completed reprocessing evidence is invalid: $reprocessing_after" >&2
+  echo "$automatic_reprocessing_progress" >&2
+  exit 1
+fi
+
+reprocessing_duplicate="$(run_upload 5.0.0 shipping 2026-08-18T00:00:00Z)"
+sleep 1
+reprocessing_duplicate_generation="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = '$reprocessing_event_id';")"
+if [[ "$(json_field uploaded <<<"$reprocessing_duplicate")" != "0" \
+  || "$(json_field bytes_transferred <<<"$reprocessing_duplicate")" != "0" \
+  || "$reprocessing_duplicate_generation" != "$reprocessing_requested_generation" ]]; then
+  echo "duplicate artifact upload queued another event generation" >&2
+  exit 1
+fi
+
+create_reprocessing_request() {
+  local key="$1"
+  local body="$2"
+  curl --fail --silent --show-error \
+    -X POST \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    -H "Idempotency-Key: $key" \
+    -H "Content-Type: application/json" \
+    --data "$body" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/reprocessing"
+}
+
+reprocessing_issue_id="$(json_field issue_id <<<"$reprocessing_state")"
+declare -a manual_request_ids=()
+manual_event="$(create_reprocessing_request manual-event-299 "{\"scope\":{\"kind\":\"event\",\"event_id\":\"$reprocessing_event_id\"}}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_event")")
+manual_issue="$(create_reprocessing_request manual-issue-299 "{\"scope\":{\"kind\":\"issue\",\"issue_id\":\"$reprocessing_issue_id\"},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_issue")")
+manual_release="$(create_reprocessing_request manual-release-299 "{\"scope\":{\"kind\":\"release\",\"release_id\":\"$reprocessing_release_id\"},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_release")")
+manual_project="$(create_reprocessing_request manual-project-299 "{\"scope\":{\"kind\":\"project\"},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_project")")
+manual_parser="$(create_reprocessing_request manual-parser-299 "{\"scope\":{\"kind\":\"parser_version\",\"parser_version\":1},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_parser")")
+manual_event_replay="$(create_reprocessing_request manual-event-299 "{\"scope\":{\"kind\":\"event\",\"event_id\":\"$reprocessing_event_id\"}}")"
+if [[ "$(json_field request_id <<<"$manual_event_replay")" != "$(json_field request_id <<<"$manual_event")" ]]; then
+  echo "manual request idempotency did not return the original request" >&2
+  exit 1
+fi
+manual_conflict_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  -H "Idempotency-Key: manual-event-299" \
+  -H "Content-Type: application/json" \
+  --data '{"scope":{"kind":"project"},"limit":1}' \
+  "$FAULTLANE_API_URL/api/v1/projects/$reprocessing_project_id/reprocessing")"
+if [[ "$manual_conflict_status" != "409" ]]; then
+  echo "manual idempotency conflict did not return 409" >&2
+  exit 1
+fi
+for request_id in "${manual_request_ids[@]}"; do
+  request_progress="$(wait_for_reprocessing_request "$request_id")"
+  if [[ "$(json_field state <<<"$request_progress")" != "completed" \
+    || "$(json_field selected_count <<<"$request_progress")" != "1" \
+    || "$(json_field failed_count <<<"$request_progress")" != "0" ]]; then
+    echo "manual reprocessing request did not complete: $request_progress" >&2
+    exit 1
+  fi
+done
+
+manual_symbolicator="$(create_reprocessing_request manual-symbolicator-299 "{\"scope\":{\"kind\":\"symbolicator_version\",\"symbolicator_version\":\"0.1.0\"},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_symbolicator")")
+manual_fingerprint="$(create_reprocessing_request manual-fingerprint-299 "{\"scope\":{\"kind\":\"fingerprint_version\",\"fingerprint_version\":1},\"limit\":1}")"
+manual_request_ids+=("$(json_field request_id <<<"$manual_fingerprint")")
+for request_id in "$(json_field request_id <<<"$manual_symbolicator")" "$(json_field request_id <<<"$manual_fingerprint")"; do
+  request_progress="$(wait_for_reprocessing_request "$request_id")"
+  if [[ "$(json_field state <<<"$request_progress")" != "completed" \
+    || "$(json_field selected_count <<<"$request_progress")" != "1" \
+    || "$(json_field failed_count <<<"$request_progress")" != "0" ]]; then
+    echo "version reprocessing request did not complete: $request_progress" >&2
+    exit 1
+  fi
+done
+
+stop_role "$worker_pid"
+worker_pid=""
+reprocessing_kill_request="$(create_reprocessing_request manual-kill-switch-299 "{\"scope\":{\"kind\":\"event\",\"event_id\":\"$reprocessing_event_id\"}}")"
+reprocessing_kill_request_id="$(json_field request_id <<<"$reprocessing_kill_request")"
+reprocessing_kill_generation="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = '$reprocessing_event_id';")"
+reprocessing_proof="$(REPROCESSING_PROGRESS="$automatic_reprocessing_progress" REPROCESSING_STATE="$reprocessing_state" REPROCESSING_UPLOAD="$reprocessing_upload" REPROCESSING_DUPLICATE="$reprocessing_duplicate" REPROCESSING_EVENT_ID="$reprocessing_event_id" REPROCESSING_REQUEST_ID="$reprocessing_request_id" REPROCESSING_HISTORY_COUNT="$reprocessing_history_count" REPROCESSING_RESULTS="$reprocessing_after_results" MANUAL_REQUEST_COUNT="${#manual_request_ids[@]}" node -e '
+  const progress = JSON.parse(process.env.REPROCESSING_PROGRESS);
+  const event = JSON.parse(process.env.REPROCESSING_STATE);
+  const upload = JSON.parse(process.env.REPROCESSING_UPLOAD);
+  const duplicate = JSON.parse(process.env.REPROCESSING_DUPLICATE);
+  process.stdout.write(JSON.stringify({
+    event_id: process.env.REPROCESSING_EVENT_ID,
+    request_id: process.env.REPROCESSING_REQUEST_ID,
+    state: event.state,
+    request_state: progress.state,
+    uploaded_artifacts: upload.uploaded,
+    duplicate_upload_bytes: duplicate.bytes_transferred,
+    immutable_results: Number(process.env.REPROCESSING_RESULTS),
+    history_count: Number(process.env.REPROCESSING_HISTORY_COUNT),
+    manual_selectors: Number(process.env.MANUAL_REQUEST_COUNT),
+  }));
+')"
+project_id="$primary_project_id"
+project_slug="$primary_project_slug"
+ingest_key="$primary_ingest_key"
+upload_token="$primary_upload_token"
 proof_phase "grouping behavior passed, verifying the kill switch and recovery paths"
 
 stop_role "$worker_pid"
@@ -661,6 +953,33 @@ worker_pid=""
 stop_role "$worker_two_pid"
 worker_two_pid=""
 export FAULTLANE_GROUPING_ENABLED=false
+stop_role "$api_pid"
+api_pid=""
+export FAULTLANE_REPROCESSING_ENABLED=false
+start_role api reprocessing-disabled-api
+api_pid="$started_pid"
+for _ in $(seq 1 60); do
+  if curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null
+disabled_reprocessing_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  -H "Idempotency-Key: disabled-reprocessing-299" \
+  -H "Content-Type: application/json" \
+  --data "{\"scope\":{\"kind\":\"event\",\"event_id\":\"$reprocessing_event_id\"}}" \
+  "$FAULTLANE_API_URL/api/v1/projects/$reprocessing_project_id/reprocessing")"
+disabled_reprocessing_progress="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$reprocessing_project_id/reprocessing/$reprocessing_kill_request_id")"
+if [[ "$disabled_reprocessing_status" != "404" \
+  || "$(json_field state <<<"$disabled_reprocessing_progress")" != "pending" ]]; then
+  echo "reprocessing kill switch did not block creates and preserve progress reads" >&2
+  exit 1
+fi
 
 orphan_response="$(curl --fail --silent --show-error \
   -H "Content-Type: application/octet-stream" \
@@ -745,6 +1064,16 @@ for _ in $(seq 1 60); do
 done
 if [[ "$(json_field state <<<"$orphan_state")" != "processed" ]]; then
   echo "reconciled crash did not finish processing" >&2
+  exit 1
+fi
+reprocessing_kill_evidence="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT r.state || '|' || e.requested_reprocessing_generation::text FROM crash_reprocessing_requests r JOIN crash_events e ON e.id::text = '$reprocessing_event_id' WHERE r.id::text = '$reprocessing_kill_request_id';")"
+if [[ "$reprocessing_kill_evidence" != "pending|$reprocessing_kill_generation" ]]; then
+  echo "disabled reprocessing changed pending request state: $reprocessing_kill_evidence" >&2
   exit 1
 fi
 
@@ -901,6 +1230,8 @@ for sensitive in \
   "$FAULTLANE_BOOTSTRAP_SECRET" \
   "$ingest_key" \
   "$upload_token" \
+  "$reprocessing_ingest_key" \
+  "$reprocessing_upload_token" \
   "UECC-Windows-" \
   "faultlane-symbolication.pdb"; do
   if [[ -n "$sensitive" ]] \
@@ -927,9 +1258,9 @@ database_evidence="$(docker compose \
   --env-file .env \
   -f deploy/docker-compose/compose.yml \
   exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
-  "SELECT (SELECT count(*) FROM derived_symbol_caches WHERE state = 'available'), (SELECT count(*) FROM crash_processing_results WHERE event_id IN ('$event_id'::uuid, '$repeat_event_id'::uuid)), (SELECT jsonb_path_exists(result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') FROM crash_processing_results WHERE event_id::text = '$event_id' ORDER BY created_at DESC LIMIT 1), (SELECT state FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT resource_failures FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT processing_state FROM crash_events WHERE id::text = '$resource_event_id'), (SELECT count(*) FROM jobs WHERE job_type = 'generate_symcache'), (SELECT attempt FROM jobs WHERE event_id::text = '$storage_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$database_event_id');")"
+  "SELECT (SELECT count(*) FROM derived_symbol_caches WHERE project_id::text = '$project_id' AND state = 'available'), (SELECT count(*) FROM crash_processing_results WHERE event_id IN ('$event_id'::uuid, '$repeat_event_id'::uuid)), (SELECT jsonb_path_exists(result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') FROM crash_processing_results WHERE event_id::text = '$event_id' ORDER BY created_at DESC LIMIT 1), (SELECT state FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT resource_failures FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT processing_state FROM crash_events WHERE id::text = '$resource_event_id'), (SELECT count(*) FROM jobs WHERE project_id::text = '$project_id' AND job_type = 'generate_symcache'), (SELECT attempt FROM jobs WHERE event_id::text = '$storage_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$database_event_id');")"
 
-FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$database_evidence" EVENT_STATE="$event_state" RESOURCE_STATE="$resource_state" REPEAT_STATE="$repeat_state" ORPHAN_STATE="$orphan_state" STORAGE_STATE="$storage_state" DATABASE_STATE="$database_state" GROUPING_PROOF="$grouping_proof" node -e '
+FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$database_evidence" EVENT_STATE="$event_state" RESOURCE_STATE="$resource_state" REPEAT_STATE="$repeat_state" ORPHAN_STATE="$orphan_state" STORAGE_STATE="$storage_state" DATABASE_STATE="$database_state" GROUPING_PROOF="$grouping_proof" REPROCESSING_PROOF="$reprocessing_proof" node -e '
   const first = JSON.parse(process.env.FIRST_UPLOAD);
   const second = JSON.parse(process.env.SECOND_UPLOAD);
   const event = JSON.parse(process.env.EVENT_STATE);
@@ -939,6 +1270,7 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
   const storage = JSON.parse(process.env.STORAGE_STATE);
   const database = JSON.parse(process.env.DATABASE_STATE);
   const grouping = JSON.parse(process.env.GROUPING_PROOF);
+  const reprocessing = JSON.parse(process.env.REPROCESSING_PROOF);
   if (first.uploaded !== 2 || first.bytes_transferred <= 0 || !first.coverage.ready) {
     throw new Error("first isolated upload failed");
   }
@@ -982,7 +1314,9 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
     database_attempts: Number(evidence[9]),
     database_retry_verified: true,
     ...grouping,
+    reprocessing,
     grouping_kill_switch_verified: true,
+    reprocessing_kill_switch_verified: true,
     logs_and_scratch_verified: true,
   }) + "\n");
 '

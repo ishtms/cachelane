@@ -164,8 +164,7 @@ pub fn process_crash_request<R: Read>(
 ///
 /// # Errors
 ///
-/// Returns an error when crash identity is missing, history exceeds its limit, or serialization
-/// fails.
+/// Returns an error when crash identity is missing or serialization fails.
 pub fn build_processing_result(
     crash_context: &CrashContextData,
     symbolication: &SymbolicationResult,
@@ -188,10 +187,7 @@ pub fn build_processing_result(
     if let Some(previous) = previous
         && previous.current != current
     {
-        if history.len() == MAX_PROCESSING_HISTORY {
-            return Err(ProcessingResultError::PreviousHistoryTooLong);
-        }
-        history.push(previous.current);
+        push_bounded_history(&mut history, previous.current);
     }
 
     serde_json::to_value(ProcessingResult {
@@ -205,6 +201,14 @@ pub fn build_processing_result(
         history: &history,
     })
     .map_err(|_| ProcessingResultError::Serialize)
+}
+
+fn push_bounded_history(history: &mut Vec<Value>, attempt: Value) {
+    if history.len() >= MAX_PROCESSING_HISTORY {
+        let remove = history.len() - MAX_PROCESSING_HISTORY + 1;
+        history.drain(..remove);
+    }
+    history.push(attempt);
 }
 
 /// Validates a prior result and extracts its bounded processing history.
@@ -952,7 +956,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ProcessingResultError, validate_current_processing_result, validate_processing_result,
+        MAX_PROCESSING_HISTORY, ProcessingResultError, push_bounded_history,
+        validate_current_processing_result, validate_processing_result,
     };
 
     fn result() -> Value {
@@ -1055,5 +1060,17 @@ mod tests {
             validate_processing_result(&current, None),
             Err(ProcessingResultError::InvalidPrevious)
         );
+    }
+
+    #[test]
+    fn changed_attempts_keep_the_newest_bounded_history() {
+        let mut history = (0..MAX_PROCESSING_HISTORY)
+            .map(|value| json!(value))
+            .collect();
+        push_bounded_history(&mut history, json!(MAX_PROCESSING_HISTORY));
+
+        assert_eq!(history.len(), MAX_PROCESSING_HISTORY);
+        assert_eq!(history.first(), Some(&json!(1)));
+        assert_eq!(history.last(), Some(&json!(MAX_PROCESSING_HISTORY)));
     }
 }

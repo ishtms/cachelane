@@ -8,6 +8,7 @@ mod crash_ingest;
 mod issues;
 mod processor_runner;
 mod project_setup;
+mod reprocessing;
 mod symbol_upload;
 mod worker;
 
