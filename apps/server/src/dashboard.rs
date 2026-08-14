@@ -37,9 +37,11 @@ struct ErrorBody {
 #[derive(Debug)]
 pub(crate) enum DashboardError {
     InvalidRequest,
+    Forbidden,
     NotFound,
     ResultUnavailable,
     ArtifactUnavailable,
+    Unavailable,
     Internal,
 }
 
@@ -51,6 +53,11 @@ impl IntoResponse for DashboardError {
                 "invalid_request",
                 "request is invalid",
             ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "operation is not allowed",
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource was not found"),
             Self::ResultUnavailable => (
                 StatusCode::CONFLICT,
@@ -61,6 +68,11 @@ impl IntoResponse for DashboardError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "artifact_unavailable",
                 "the retained artifact is unavailable",
+            ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service is unavailable",
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -401,11 +413,18 @@ pub(crate) async fn get_overview(
     headers: HeaderMap,
     Path(project_id): Path<String>,
 ) -> Result<Response, DashboardError> {
-    authorize(&state, &headers, true)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+        true,
+    )
+    .await?;
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| DashboardError::Internal)?;
     configure_read_transaction(&mut transaction).await?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&mut transaction, &actor).await?;
     let overview = load_overview(&mut transaction, &scope).await?;
     transaction
         .commit()
@@ -420,7 +439,14 @@ pub(crate) async fn list_issue_events(
     Path((project_id, issue_id)): Path<(String, String)>,
     query: Result<Query<EventListQuery>, QueryRejection>,
 ) -> Result<Response, DashboardError> {
-    authorize(&state, &headers, true)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+        true,
+    )
+    .await?;
     if !valid_uuid(&issue_id) {
         return Err(DashboardError::NotFound);
     }
@@ -439,7 +465,7 @@ pub(crate) async fn list_issue_events(
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| DashboardError::Internal)?;
     configure_read_transaction(&mut transaction).await?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&mut transaction, &actor).await?;
     require_issue(&mut transaction, &scope, &issue_id).await?;
     let mut items =
         load_event_summaries(&mut transaction, &scope, &issue_id, cursor.as_ref(), limit).await?;
@@ -482,20 +508,27 @@ pub(crate) async fn get_issue_event(
     headers: HeaderMap,
     Path((project_id, issue_id, event_id)): Path<(String, String, String)>,
 ) -> Result<Response, DashboardError> {
-    authorize(&state, &headers, true)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+        true,
+    )
+    .await?;
     if !valid_uuid(&issue_id) || !valid_uuid(&event_id) {
         return Err(DashboardError::NotFound);
     }
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| DashboardError::Internal)?;
     configure_read_transaction(&mut transaction).await?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&mut transaction, &actor).await?;
     let detail = load_event_detail(
         &mut transaction,
         &scope,
         &issue_id,
         &event_id,
-        state.raw_artifact_download_enabled(),
+        state.raw_artifact_download_enabled() && actor.allows(crate::auth::Permission::ReadRaw),
     )
     .await?;
     transaction
@@ -510,12 +543,19 @@ pub(crate) async fn download_log(
     headers: HeaderMap,
     Path((project_id, issue_id, event_id)): Path<(String, String, String)>,
 ) -> Result<Response, DashboardError> {
-    authorize(&state, &headers, true)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+        true,
+    )
+    .await?;
     if !valid_uuid(&issue_id) || !valid_uuid(&event_id) {
         return Err(DashboardError::NotFound);
     }
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
-    let scope = project_scope(pool, &project_id).await?;
+    let scope = project_scope(pool, &actor).await?;
     let row = sqlx::query(
         "SELECT e.crash_guid, r.result FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.id::text = $4",
     )
@@ -546,7 +586,14 @@ pub(crate) async fn download_raw(
     headers: HeaderMap,
     Path((project_id, issue_id, event_id)): Path<(String, String, String)>,
 ) -> Result<Response, DashboardError> {
-    authorize(&state, &headers, true)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadRaw,
+        true,
+    )
+    .await?;
     if !state.raw_artifact_download_enabled() {
         return Err(DashboardError::NotFound);
     }
@@ -554,7 +601,7 @@ pub(crate) async fn download_raw(
         return Err(DashboardError::NotFound);
     }
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
-    let scope = project_scope(pool, &project_id).await?;
+    let scope = project_scope(pool, &actor).await?;
     let row = sqlx::query(
         "SELECT o.object_key, o.byte_size, o.checksum FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored' WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.id::text = $4",
     )
@@ -580,6 +627,16 @@ pub(crate) async fn download_raw(
                 DashboardError::ArtifactUnavailable
             }
         })?;
+    crate::auth::audit(
+        pool,
+        &scope.organization_id,
+        Some(&actor.actor.user_id),
+        "raw_artifact.downloaded",
+        "event",
+        &event_id,
+        "succeeded",
+    )
+    .await;
     let body = Body::from_stream(object.into_stream());
     attachment_response(
         "application/octet-stream",
@@ -589,55 +646,62 @@ pub(crate) async fn download_raw(
     )
 }
 
-fn authorize(
+async fn authorize(
     state: &ServerState,
     headers: &HeaderMap,
+    project_id: &str,
+    permission: crate::auth::Permission,
     require_dashboard: bool,
-) -> Result<(), DashboardError> {
-    if !state.authorize_control(headers) || (require_dashboard && !state.dashboard_enabled()) {
+) -> Result<crate::auth::ProjectActor, DashboardError> {
+    if require_dashboard && !state.dashboard_enabled() {
         return Err(DashboardError::NotFound);
     }
-    Ok(())
+    crate::auth::authorize_project(state, headers, project_id, permission)
+        .await
+        .map_err(|error| match error {
+            crate::auth::AuthorizationError::Forbidden => DashboardError::Forbidden,
+            crate::auth::AuthorizationError::Unavailable => DashboardError::Unavailable,
+            _ => DashboardError::NotFound,
+        })
 }
 
-async fn project_scope(pool: &PgPool, project_id: &str) -> Result<ProjectScope, DashboardError> {
-    if !valid_uuid(project_id) {
-        return Err(DashboardError::NotFound);
-    }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id, p.slug AS project_slug FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1",
+async fn project_scope(
+    pool: &PgPool,
+    actor: &crate::auth::ProjectActor,
+) -> Result<ProjectScope, DashboardError> {
+    let project_slug = sqlx::query_scalar::<_, String>(
+        "SELECT slug FROM projects WHERE organization_id::text = $1 AND id::text = $2",
     )
-    .bind(project_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| DashboardError::Internal)?
     .ok_or(DashboardError::NotFound)?;
     Ok(ProjectScope {
-        organization_id: row.get("organization_id"),
-        project_id: row.get("project_id"),
-        project_slug: row.get("project_slug"),
+        organization_id: actor.organization_id.clone(),
+        project_id: actor.project_id.clone(),
+        project_slug,
     })
 }
 
 async fn transaction_scope(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: &str,
+    actor: &crate::auth::ProjectActor,
 ) -> Result<ProjectScope, DashboardError> {
-    if !valid_uuid(project_id) {
-        return Err(DashboardError::NotFound);
-    }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id, p.slug AS project_slug FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1",
+    let project_slug = sqlx::query_scalar::<_, String>(
+        "SELECT slug FROM projects WHERE organization_id::text = $1 AND id::text = $2",
     )
-    .bind(project_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| DashboardError::Internal)?
     .ok_or(DashboardError::NotFound)?;
     Ok(ProjectScope {
-        organization_id: row.get("organization_id"),
-        project_id: row.get("project_id"),
-        project_slug: row.get("project_slug"),
+        organization_id: actor.organization_id.clone(),
+        project_id: actor.project_id.clone(),
+        project_slug,
     })
 }
 

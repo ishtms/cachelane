@@ -162,7 +162,9 @@ struct ProjectScope {
 #[derive(Debug)]
 pub(crate) enum IssueError {
     InvalidRequest,
+    Forbidden,
     NotFound,
+    Unavailable,
     Internal,
 }
 
@@ -174,7 +176,17 @@ impl IntoResponse for IssueError {
                 "invalid_request",
                 "request is invalid",
             ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "operation is not allowed",
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource was not found"),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service is unavailable",
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -191,7 +203,13 @@ pub(crate) async fn list_issues(
     Path(project_id): Path<String>,
     query: Result<Query<IssueListQuery>, QueryRejection>,
 ) -> Result<Response, IssueError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+    )
+    .await?;
     let Query(query) = query.map_err(|_| IssueError::InvalidRequest)?;
     let query = validate_list_query(query)?;
     if dashboard_filters_requested(&query) && !state.dashboard_enabled() {
@@ -207,7 +225,7 @@ pub(crate) async fn list_issues(
         .execute(&mut *transaction)
         .await
         .map_err(|_| IssueError::Internal)?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&actor);
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
     let filter_hash = issue_filter_hash(&query)?;
     let cursor = query
@@ -277,7 +295,13 @@ pub(crate) async fn get_issue(
     headers: HeaderMap,
     Path((project_id, issue_id)): Path<(String, String)>,
 ) -> Result<Response, IssueError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+    )
+    .await?;
     if !valid_uuid(&issue_id) {
         return Err(IssueError::NotFound);
     }
@@ -287,7 +311,7 @@ pub(crate) async fn get_issue(
         .execute(&mut *transaction)
         .await
         .map_err(|_| IssueError::Internal)?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&actor);
     let detail = load_issue_detail(&mut transaction, &scope, &issue_id).await?;
     transaction
         .commit()
@@ -302,14 +326,20 @@ pub(crate) async fn resolve_issue(
     Path((project_id, issue_id)): Path<(String, String)>,
     payload: Result<Json<ResolveIssueRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, IssueError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageIssue,
+    )
+    .await?;
     let Json(request) = payload.map_err(|_| IssueError::InvalidRequest)?;
     if !valid_uuid(&issue_id) || !valid_uuid(&request.release_id) {
         return Err(IssueError::NotFound);
     }
     let pool = state.control_pool().ok_or(IssueError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| IssueError::Internal)?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&actor);
     lock_issue(&mut transaction, &scope, &issue_id).await?;
     let resolution_timestamp = sqlx::query_scalar::<_, time::OffsetDateTime>(
         "SELECT build_timestamp FROM releases WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND build_timestamp IS NOT NULL",
@@ -346,6 +376,16 @@ pub(crate) async fn resolve_issue(
         .commit()
         .await
         .map_err(|_| IssueError::Internal)?;
+    crate::auth::audit(
+        pool,
+        &scope.organization_id,
+        Some(&actor.actor.user_id),
+        "issue.resolved",
+        "issue",
+        &issue_id,
+        "succeeded",
+    )
+    .await;
     Ok(no_store(StatusCode::OK, &response))
 }
 
@@ -354,13 +394,19 @@ pub(crate) async fn reopen_issue(
     headers: HeaderMap,
     Path((project_id, issue_id)): Path<(String, String)>,
 ) -> Result<Response, IssueError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageIssue,
+    )
+    .await?;
     if !valid_uuid(&issue_id) {
         return Err(IssueError::NotFound);
     }
     let pool = state.control_pool().ok_or(IssueError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| IssueError::Internal)?;
-    let scope = transaction_scope(&mut transaction, &project_id).await?;
+    let scope = transaction_scope(&actor);
     lock_issue(&mut transaction, &scope, &issue_id).await?;
     let regression_state = retained_regression_state(&mut transaction, &scope, &issue_id).await?;
     let row = sqlx::query(
@@ -378,6 +424,16 @@ pub(crate) async fn reopen_issue(
         .commit()
         .await
         .map_err(|_| IssueError::Internal)?;
+    crate::auth::audit(
+        pool,
+        &scope.organization_id,
+        Some(&actor.actor.user_id),
+        "issue.reopened",
+        "issue",
+        &issue_id,
+        "succeeded",
+    )
+    .await;
     Ok(no_store(StatusCode::OK, &response))
 }
 
@@ -563,33 +619,26 @@ fn lower_hex(bytes: &[u8]) -> String {
     value
 }
 
-fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<(), IssueError> {
-    if state.authorize_control(headers) {
-        Ok(())
-    } else {
-        Err(IssueError::NotFound)
-    }
+async fn authorize(
+    state: &ServerState,
+    headers: &HeaderMap,
+    project_id: &str,
+    permission: crate::auth::Permission,
+) -> Result<crate::auth::ProjectActor, IssueError> {
+    crate::auth::authorize_project(state, headers, project_id, permission)
+        .await
+        .map_err(|error| match error {
+            crate::auth::AuthorizationError::Forbidden => IssueError::Forbidden,
+            crate::auth::AuthorizationError::Unavailable => IssueError::Unavailable,
+            _ => IssueError::NotFound,
+        })
 }
 
-async fn transaction_scope(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: &str,
-) -> Result<ProjectScope, IssueError> {
-    if !valid_uuid(project_id) {
-        return Err(IssueError::NotFound);
+fn transaction_scope(actor: &crate::auth::ProjectActor) -> ProjectScope {
+    ProjectScope {
+        organization_id: actor.organization_id.clone(),
+        project_id: actor.project_id.clone(),
     }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|_| IssueError::Internal)?
-    .ok_or(IssueError::NotFound)?;
-    Ok(ProjectScope {
-        organization_id: row.get("organization_id"),
-        project_id: row.get("project_id"),
-    })
 }
 
 async fn lock_issue(

@@ -1,5 +1,73 @@
 import "server-only";
 
+import { cookies } from "next/headers";
+
+export const SESSION_COOKIE = "faultlane_session";
+
+export type Role = "owner" | "admin" | "developer" | "viewer";
+
+export type AuthProviders = {
+  github: boolean;
+  email: boolean;
+};
+
+export type Membership = {
+  organization_id: string;
+  organization_name: string;
+  organization_slug: string;
+  role: Role;
+};
+
+export type SessionView = {
+  id: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  current: boolean;
+};
+
+export type SessionResponse = {
+  session: SessionView;
+  user: { id: string; email: string };
+  memberships: Membership[];
+};
+
+export type SessionCreated = SessionResponse & { token: string };
+
+export type Member = {
+  user_id: string;
+  email: string;
+  role: Role;
+  joined_at: string;
+};
+
+export type Invitation = {
+  id: string;
+  email: string;
+  role: Role;
+  created_at: string;
+  expires_at: string;
+};
+
+export type MemberList = {
+  members: Member[];
+  invitations: Invitation[];
+};
+
+export type AuditList = {
+  items: Array<{
+    id: string;
+    actor_user_id: string | null;
+    action: string;
+    target_type: string;
+    target_id: string;
+    result: "succeeded" | "denied" | "failed";
+    occurred_at: string;
+  }>;
+};
+
+export type SessionList = { sessions: SessionView[] };
+
 export type IngestKey = {
   id: string;
   display_suffix: string;
@@ -362,7 +430,9 @@ export class FaultlaneApiError extends Error {
 
 export { FaultlaneApiError as SetupApiError };
 
-function authorization(): string {
+async function authorization(): Promise<string> {
+  const session = (await cookies()).get(SESSION_COOKIE)?.value;
+  if (session) return `Session ${session}`;
   const secret = process.env.FAULTLANE_BOOTSTRAP_SECRET;
   if (!secret) {
     throw new FaultlaneApiError("bootstrap_unavailable");
@@ -385,7 +455,7 @@ export async function faultlaneFetch(
     throw new FaultlaneApiError("invalid_api_path");
   }
   const headers = new Headers(init.headers);
-  headers.set("authorization", authorization());
+  headers.set("authorization", await authorization());
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
@@ -401,6 +471,44 @@ export async function faultlaneFetch(
     }
     throw new FaultlaneApiError("service_unavailable");
   }
+}
+
+export async function faultlanePublicApi<T>(
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const apiUrl = process.env.FAULTLANE_API_URL ?? "http://127.0.0.1:8080";
+  const baseUrl = new URL(apiUrl);
+  const targetUrl = new URL(path, baseUrl);
+  if (
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    targetUrl.origin !== baseUrl.origin
+  ) {
+    throw new FaultlaneApiError("invalid_api_path");
+  }
+  const headers = new Headers(init.headers);
+  if (init.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  let response: Response;
+  try {
+    response = await fetch(targetUrl, {
+      ...init,
+      cache: "no-store",
+      headers,
+    });
+  } catch {
+    throw new FaultlaneApiError("service_unavailable");
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
+    throw new FaultlaneApiError(body.code ?? "request_failed", response.status);
+  }
+  if (response.status === 204) return undefined as T;
+  const text = await response.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export async function faultlaneApi<T>(

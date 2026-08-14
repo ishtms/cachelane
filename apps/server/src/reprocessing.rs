@@ -91,9 +91,11 @@ struct ValidatedRequest {
 #[derive(Debug)]
 pub(crate) enum ReprocessingError {
     InvalidRequest,
+    Forbidden,
     NotFound,
     Conflict,
     TooManyRequests,
+    Unavailable,
     Internal,
 }
 
@@ -105,6 +107,11 @@ impl IntoResponse for ReprocessingError {
                 "invalid_request",
                 "request is invalid",
             ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "operation is not allowed",
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource was not found"),
             Self::Conflict => (
                 StatusCode::CONFLICT,
@@ -115,6 +122,11 @@ impl IntoResponse for ReprocessingError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "reprocessing_limit_reached",
                 "too many reprocessing requests are active",
+            ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service is unavailable",
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -132,7 +144,13 @@ pub(crate) async fn create_request(
     Path(project_id): Path<String>,
     body: Result<Json<CreateRequestBody>, JsonRejection>,
 ) -> Result<Response, ReprocessingError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageIssue,
+    )
+    .await?;
     if !state.reprocessing_enabled() {
         return Err(ReprocessingError::NotFound);
     }
@@ -144,7 +162,7 @@ pub(crate) async fn create_request(
         .begin()
         .await
         .map_err(|_| ReprocessingError::Internal)?;
-    let scope = project_scope(&mut transaction, &project_id).await?;
+    let scope = project_scope(&mut transaction, &actor).await?;
 
     if let Some(row) = sqlx::query(
         "SELECT id::text AS request_id, scope_fingerprint FROM crash_reprocessing_requests WHERE organization_id::text = $1 AND project_id::text = $2 AND source = 'manual' AND idempotency_digest = $3",
@@ -216,6 +234,16 @@ pub(crate) async fn create_request(
         .commit()
         .await
         .map_err(|_| ReprocessingError::Internal)?;
+    crate::auth::audit(
+        pool,
+        &scope.organization,
+        Some(&actor.actor.user_id),
+        "reprocessing.requested",
+        "reprocessing_request",
+        &request_id,
+        "succeeded",
+    )
+    .await;
     Ok(no_store(StatusCode::ACCEPTED, &view))
 }
 
@@ -224,7 +252,13 @@ pub(crate) async fn get_request(
     headers: HeaderMap,
     Path((project_id, request_id)): Path<(String, String)>,
 ) -> Result<Response, ReprocessingError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+    )
+    .await?;
     if !valid_uuid(&request_id) {
         return Err(ReprocessingError::NotFound);
     }
@@ -237,7 +271,7 @@ pub(crate) async fn get_request(
         .execute(&mut *transaction)
         .await
         .map_err(|_| ReprocessingError::Internal)?;
-    let scope = project_scope_read(&mut transaction, &project_id).await?;
+    let scope = project_scope_read(&actor);
     let view = load_request(&mut transaction, &scope, &request_id).await?;
     transaction
         .commit()
@@ -412,46 +446,30 @@ fn idempotency_digest(headers: &HeaderMap) -> Result<[u8; 32], ReprocessingError
 
 async fn project_scope(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: &str,
+    actor: &crate::auth::ProjectActor,
 ) -> Result<ProjectScope, ReprocessingError> {
-    if !valid_uuid(project_id) {
-        return Err(ReprocessingError::NotFound);
-    }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id, u.id::text AS user_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1 FOR UPDATE OF p",
+    let found = sqlx::query_scalar::<_, String>(
+        "SELECT id::text FROM projects WHERE organization_id::text = $1 AND id::text = $2 FOR UPDATE",
     )
-    .bind(project_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| ReprocessingError::Internal)?
     .ok_or(ReprocessingError::NotFound)?;
     Ok(ProjectScope {
-        organization: row.get("organization_id"),
-        project: row.get("project_id"),
-        requester: row.get("user_id"),
+        organization: actor.organization_id.clone(),
+        project: found,
+        requester: actor.actor.user_id.clone(),
     })
 }
 
-async fn project_scope_read(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: &str,
-) -> Result<ProjectScope, ReprocessingError> {
-    if !valid_uuid(project_id) {
-        return Err(ReprocessingError::NotFound);
+fn project_scope_read(actor: &crate::auth::ProjectActor) -> ProjectScope {
+    ProjectScope {
+        organization: actor.organization_id.clone(),
+        project: actor.project_id.clone(),
+        requester: actor.actor.user_id.clone(),
     }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id, u.id::text AS user_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|_| ReprocessingError::Internal)?
-    .ok_or(ReprocessingError::NotFound)?;
-    Ok(ProjectScope {
-        organization: row.get("organization_id"),
-        project: row.get("project_id"),
-        requester: row.get("user_id"),
-    })
 }
 
 async fn load_request(
@@ -512,12 +530,19 @@ async fn load_request(
     })
 }
 
-fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<(), ReprocessingError> {
-    if state.authorize_control(headers) {
-        Ok(())
-    } else {
-        Err(ReprocessingError::NotFound)
-    }
+async fn authorize(
+    state: &ServerState,
+    headers: &HeaderMap,
+    project_id: &str,
+    permission: crate::auth::Permission,
+) -> Result<crate::auth::ProjectActor, ReprocessingError> {
+    crate::auth::authorize_project(state, headers, project_id, permission)
+        .await
+        .map_err(|error| match error {
+            crate::auth::AuthorizationError::Forbidden => ReprocessingError::Forbidden,
+            crate::auth::AuthorizationError::Unavailable => ReprocessingError::Unavailable,
+            _ => ReprocessingError::NotFound,
+        })
 }
 
 fn require_uuid(value: &str) -> Result<(), ReprocessingError> {

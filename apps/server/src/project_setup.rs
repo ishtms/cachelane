@@ -37,6 +37,7 @@ pub(crate) struct ServerState {
     raw_artifact_download_enabled: bool,
     reprocessing_enabled: bool,
     symbol_uploads: crate::symbol_upload::SymbolUploads,
+    auth: crate::auth::Auth,
 }
 
 impl ServerState {
@@ -82,6 +83,7 @@ impl ServerState {
 
         let symbol_uploads =
             crate::symbol_upload::SymbolUploads::postgres(pool.clone(), role, host)?;
+        let auth = crate::auth::Auth::for_role(pool.clone(), host, role)?;
 
         Ok(Self {
             store: ProjectStore::Postgres(pool.clone()),
@@ -95,6 +97,7 @@ impl ServerState {
             reprocessing_enabled: env::var("FAULTLANE_REPROCESSING_ENABLED")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             symbol_uploads,
+            auth,
         })
     }
 
@@ -112,6 +115,7 @@ impl ServerState {
             raw_artifact_download_enabled: false,
             reprocessing_enabled: false,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::disabled(),
         }
     }
 
@@ -122,7 +126,7 @@ impl ServerState {
         secret: &str,
     ) -> Self {
         Self {
-            store: ProjectStore::Postgres(pool),
+            store: ProjectStore::Postgres(pool.clone()),
             bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
@@ -131,6 +135,7 @@ impl ServerState {
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
         }
     }
 
@@ -141,7 +146,7 @@ impl ServerState {
         secret: &str,
     ) -> Self {
         Self {
-            store: ProjectStore::Postgres(pool),
+            store: ProjectStore::Postgres(pool.clone()),
             bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
@@ -150,6 +155,7 @@ impl ServerState {
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads,
+            auth: crate::auth::Auth::test(pool),
         }
     }
 
@@ -160,11 +166,28 @@ impl ServerState {
             bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
-            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hosted_auth_test(pool: PgPool, secret: &str, provider_base_url: &str) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: true,
+            reprocessing_enabled: true,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test_providers(pool, provider_base_url),
         }
     }
 
@@ -180,12 +203,14 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test_with_objects(
-                pool, objects,
+                pool.clone(),
+                objects,
             ),
             dashboard_enabled: true,
             raw_artifact_download_enabled: true,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
         }
     }
 
@@ -201,12 +226,14 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test_with_objects(
-                pool, objects,
+                pool.clone(),
+                objects,
             ),
             dashboard_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
         }
     }
 
@@ -217,11 +244,12 @@ impl ServerState {
             bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
-            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: false,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
         }
     }
 
@@ -237,8 +265,12 @@ impl ServerState {
             .push(project_id.to_owned());
     }
 
-    pub(crate) fn authorize_control(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn authorize_bootstrap(&self, headers: &HeaderMap) -> bool {
         self.bootstrap.authorize(headers).is_ok()
+    }
+
+    pub(crate) fn auth(&self) -> &crate::auth::Auth {
+        &self.auth
     }
 
     pub(crate) fn crash_ingest(&self) -> &crate::crash_ingest::CrashIngest {
@@ -300,6 +332,7 @@ pub(crate) enum StartupError {
     MigrationFailed,
     IngestConfiguration,
     SymbolUploadConfiguration,
+    AuthenticationConfiguration,
 }
 
 impl fmt::Display for StartupError {
@@ -311,6 +344,9 @@ impl fmt::Display for StartupError {
             Self::IngestConfiguration => formatter.write_str("ingest configuration is invalid"),
             Self::SymbolUploadConfiguration => {
                 formatter.write_str("symbol upload configuration is invalid")
+            }
+            Self::AuthenticationConfiguration => {
+                formatter.write_str("authentication configuration is invalid")
             }
         }
     }
@@ -340,6 +376,7 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
 
     match role {
         "api" => health
+            .merge(crate::auth::router())
             .route("/api/v1/setup", post(create_setup))
             .route("/api/v1/projects/{project_id}/setup", get(get_setup))
             .route(
@@ -722,6 +759,18 @@ async fn create_setup(
         .store
         .bootstrap(BOOTSTRAP_SUBJECT, &request, &key, &policy)
         .await?;
+    if let Some(pool) = state.control_pool() {
+        crate::auth::audit(
+            pool,
+            &created.setup.organization.id,
+            Some(&created.setup.owner_id),
+            "project.created",
+            "project",
+            &created.setup.project.id,
+            "succeeded",
+        )
+        .await;
+    }
     let response = created_response(&state.ingest_base_url, created, key);
 
     Ok(no_store(StatusCode::CREATED, &response))
@@ -732,10 +781,17 @@ async fn get_setup(
     headers: HeaderMap,
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
-    state.bootstrap.authorize(&headers)?;
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let setup = state
         .store
-        .get_setup(BOOTSTRAP_SUBJECT, &project_id)
+        .get_setup(&actor.actor.user_id, &project_id)
         .await?;
 
     Ok(no_store(StatusCode::OK, &ExistingSetupResponse { setup }))
@@ -747,7 +803,14 @@ async fn rotate_ingest_key(
     AxumPath(project_id): AxumPath<String>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    state.bootstrap.authorize(&headers)?;
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageProject,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let policy = if body.is_empty() {
         ValidatedKeyPolicy::default()
     } else {
@@ -758,8 +821,20 @@ async fn rotate_ingest_key(
     let key = GeneratedKey::new()?;
     let created = state
         .store
-        .rotate_key(BOOTSTRAP_SUBJECT, &project_id, &key, &policy)
+        .rotate_key(&actor.actor.user_id, &project_id, &key, &policy)
         .await?;
+    if let Some(pool) = state.control_pool() {
+        crate::auth::audit(
+            pool,
+            &actor.organization_id,
+            Some(&actor.actor.user_id),
+            "ingest_key.created",
+            "project",
+            &project_id,
+            "succeeded",
+        )
+        .await;
+    }
     let response = created_response(&state.ingest_base_url, created, key);
 
     Ok(no_store(StatusCode::CREATED, &response))
@@ -771,13 +846,32 @@ async fn update_ingest_key_policy(
     AxumPath((project_id, key_id)): AxumPath<(String, String)>,
     payload: Result<Json<KeyPolicyRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    state.bootstrap.authorize(&headers)?;
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageProject,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let Json(request) = payload.map_err(|_| ApiError::InvalidRequest)?;
     let policy = ValidatedKeyPolicy::try_from(request)?;
     let setup = state
         .store
-        .update_key_policy(BOOTSTRAP_SUBJECT, &project_id, &key_id, &policy)
+        .update_key_policy(&actor.actor.user_id, &project_id, &key_id, &policy)
         .await?;
+    if let Some(pool) = state.control_pool() {
+        crate::auth::audit(
+            pool,
+            &actor.organization_id,
+            Some(&actor.actor.user_id),
+            "ingest_key.policy_changed",
+            "ingest_key",
+            &key_id,
+            "succeeded",
+        )
+        .await;
+    }
 
     Ok(no_store(StatusCode::OK, &ExistingSetupResponse { setup }))
 }
@@ -787,11 +881,30 @@ async fn revoke_ingest_key(
     headers: HeaderMap,
     AxumPath((project_id, key_id)): AxumPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    state.bootstrap.authorize(&headers)?;
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageProject,
+    )
+    .await
+    .map_err(ApiError::from)?;
     state
         .store
-        .revoke_key(BOOTSTRAP_SUBJECT, &project_id, &key_id)
+        .revoke_key(&actor.actor.user_id, &project_id, &key_id)
         .await?;
+    if let Some(pool) = state.control_pool() {
+        crate::auth::audit(
+            pool,
+            &actor.organization_id,
+            Some(&actor.actor.user_id),
+            "ingest_key.revoked",
+            "ingest_key",
+            &key_id,
+            "succeeded",
+        )
+        .await;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -843,9 +956,11 @@ fn no_store(status: StatusCode, value: &impl Serialize) -> Response {
 enum ApiError {
     InvalidRequest,
     Unauthorized,
+    Forbidden,
     NotFound,
     Conflict,
     Internal,
+    Unavailable,
 }
 
 impl IntoResponse for ApiError {
@@ -861,6 +976,11 @@ impl IntoResponse for ApiError {
                 "unauthorized",
                 "authorization is required",
             ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "operation is not allowed",
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "resource was not found"),
             Self::Conflict => (
                 StatusCode::CONFLICT,
@@ -872,9 +992,25 @@ impl IntoResponse for ApiError {
                 "internal_error",
                 "request could not be completed",
             ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service is unavailable",
+            ),
         };
 
         no_store(status, &ErrorResponse { code, message })
+    }
+}
+
+impl From<crate::auth::AuthorizationError> for ApiError {
+    fn from(error: crate::auth::AuthorizationError) -> Self {
+        match error {
+            crate::auth::AuthorizationError::Unauthorized => Self::Unauthorized,
+            crate::auth::AuthorizationError::Forbidden => Self::Forbidden,
+            crate::auth::AuthorizationError::NotFound => Self::NotFound,
+            crate::auth::AuthorizationError::Unavailable => Self::Unavailable,
+        }
     }
 }
 
@@ -1188,7 +1324,7 @@ async fn postgres_get_setup(
     project_id: &str,
 ) -> Result<ProjectSetupView, StoreError> {
     let row = sqlx::query(
-        "SELECT u.id::text AS owner_id, o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, p.id::text AS project_id, p.name AS project_name, p.slug AS project_slug FROM users u JOIN organization_memberships m ON m.user_id = u.id AND m.role = 'owner' JOIN organizations o ON o.id = m.organization_id JOIN projects p ON p.organization_id = o.id WHERE u.bootstrap_subject = $1 AND p.id::text = $2",
+        "SELECT (SELECT owner.user_id::text FROM organization_memberships owner WHERE owner.organization_id = o.id AND owner.role = 'owner' ORDER BY owner.created_at, owner.user_id LIMIT 1) AS owner_id, o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, p.id::text AS project_id, p.name AS project_name, p.slug AS project_slug FROM users u JOIN organization_memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id JOIN projects p ON p.organization_id = o.id WHERE u.id::text = $1 AND p.id::text = $2",
     )
     .bind(subject)
     .bind(project_id)
@@ -1220,7 +1356,7 @@ async fn postgres_keys(
     project_id: &str,
 ) -> Result<Vec<IngestKeyView>, StoreError> {
     let rows = sqlx::query(
-        "SELECT k.id::text AS id, k.display_suffix, k.environment, k.allowed_cidrs, to_char(k.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN k.revoked_at IS NULL THEN NULL ELSE to_char(k.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS revoked_at FROM project_ingest_keys k JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = $1 AND p.id::text = $2 ORDER BY k.created_at, k.id",
+        "SELECT k.id::text AS id, k.display_suffix, k.environment, k.allowed_cidrs, to_char(k.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN k.revoked_at IS NULL THEN NULL ELSE to_char(k.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS revoked_at FROM project_ingest_keys k JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id::text = $1 AND p.id::text = $2 ORDER BY k.created_at, k.id",
     )
     .bind(subject)
     .bind(project_id)
@@ -1249,7 +1385,7 @@ async fn postgres_rotate_key(
     policy: &ValidatedKeyPolicy,
 ) -> Result<StoredSetup, StoreError> {
     let scope = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = $1 AND p.id::text = $2",
+        "SELECT p.organization_id::text AS organization_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id::text = $1 AND p.id::text = $2",
     )
     .bind(subject)
     .bind(project_id)
@@ -1277,7 +1413,7 @@ async fn postgres_update_key_policy(
     policy: &ValidatedKeyPolicy,
 ) -> Result<ProjectSetupView, StoreError> {
     let result = sqlx::query(
-        "UPDATE project_ingest_keys k SET environment = $4, allowed_cidrs = $5 FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND m.role = 'owner' AND u.id = m.user_id AND u.bootstrap_subject = $1 AND p.id::text = $2 AND k.id::text = $3",
+        "UPDATE project_ingest_keys k SET environment = $4, allowed_cidrs = $5 FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id::text = $1 AND p.id::text = $2 AND k.id::text = $3",
     )
     .bind(subject)
     .bind(project_id)
@@ -1300,7 +1436,7 @@ async fn postgres_revoke_key(
     key_id: &str,
 ) -> Result<(), StoreError> {
     let result = sqlx::query(
-        "UPDATE project_ingest_keys k SET revoked_at = COALESCE(k.revoked_at, now()) FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND m.role = 'owner' AND u.id = m.user_id AND u.bootstrap_subject = $1 AND p.id::text = $2 AND k.id::text = $3",
+        "UPDATE project_ingest_keys k SET revoked_at = COALESCE(k.revoked_at, now()) FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id::text = $1 AND p.id::text = $2 AND k.id::text = $3",
     )
     .bind(subject)
     .bind(project_id)

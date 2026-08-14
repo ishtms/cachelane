@@ -139,7 +139,10 @@ function DashboardNav({ phase }: { phase: string }) {
         </span>
         FaultLane
       </Link>
-      <span className="phase">{phase}</span>
+      <div className="nav-actions">
+        <Link href="/account">Account</Link>
+        <span className="phase">{phase}</span>
+      </div>
     </nav>
   );
 }
