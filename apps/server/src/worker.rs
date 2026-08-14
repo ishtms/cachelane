@@ -1746,7 +1746,16 @@ fn verify_private_windows_acl(path: &Path, sid: &str, icacls: &Path) -> Result<(
         if windows_acl_is_private(&descriptor, sid) {
             Ok(())
         } else {
-            Err(std::io::Error::other("worker scratch ACL is not private"))
+            #[cfg(test)]
+            let message = format!(
+                "worker scratch ACL is not private: {}",
+                descriptor
+                    .replace(sid, "CURRENT_USER")
+                    .replace(['\r', '\n'], "")
+            );
+            #[cfg(not(test))]
+            let message = "worker scratch ACL is not private";
+            Err(std::io::Error::other(message))
         }
     });
     let _ = fs::remove_file(dump);
