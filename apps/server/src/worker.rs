@@ -1090,14 +1090,42 @@ impl Worker {
         &self,
         job: &Job,
         event_id: &str,
-        result: Value,
+        mut result: Value,
         state: &str,
         reason: &str,
         release: &ReleaseResolution,
     ) -> Result<(), JobError> {
         let (schema_version, processing_version) = processing_versions(&result)?;
+        let waiters = if state == "awaiting_symbols" {
+            symbol_waiters(&result, release)?
+        } else {
+            Vec::new()
+        };
+        let result_id = random_uuid().map_err(|_| JobError::Transient("random_unavailable"))?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+        let rules = crate::data_rules::lock_for_publication(
+            &mut transaction,
+            &job.organization_id,
+            &job.project_id,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::data_rules::DataRulesError::Unavailable => {
+                JobError::Transient("database_unavailable")
+            }
+            crate::data_rules::DataRulesError::NotFound => JobError::LostLease,
+            _ => JobError::Deterministic("data_rules_invalid"),
+        })?;
+        lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
+        let existing = lock_event(&mut transaction, job, event_id).await?;
+        let existing_grouped = existing.state == "grouped";
+        let context_facets = crate::data_rules::redact_and_index(&mut result, &rules);
         let grouping = grouping_publication(self.grouping_enabled, &result)?;
-        let search_text = event_search_text(&result);
+        let search_text = event_search_text(&result, &context_facets);
         let user_comment = projected_text(&result, "/crash_context/user_comment").map(|value| {
             value
                 .chars()
@@ -1109,25 +1137,11 @@ impl Worker {
         let architecture = projected_text(&result, "/crash_context/architecture");
         let engine_version = projected_text(&result, "/crash_context/engine_version");
         let symbolication_state = projected_symbolication_state(state, &result);
-        let waiters = if state == "awaiting_symbols" {
-            symbol_waiters(&result, release)?
-        } else {
-            Vec::new()
-        };
         let bytes = serde_json::to_vec(&result)
             .map_err(|_| JobError::Deterministic("processor_output_invalid"))?;
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-        let result_id = random_uuid().map_err(|_| JobError::Transient("random_unavailable"))?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| JobError::Transient("database_unavailable"))?;
-        lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
-        let existing = lock_event(&mut transaction, job, event_id).await?;
-        let existing_grouped = existing.state == "grouped";
         let stored_id: String = sqlx::query_scalar(
-            "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8) ON CONFLICT (event_id, processing_version, checksum) DO UPDATE SET checksum = EXCLUDED.checksum RETURNING id::text",
+            "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, data_rules_version, result, checksum) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9) ON CONFLICT (event_id, processing_version, data_rules_version, checksum) DO UPDATE SET checksum = EXCLUDED.checksum RETURNING id::text",
         )
         .bind(result_id)
         .bind(&job.organization_id)
@@ -1135,18 +1149,20 @@ impl Worker {
         .bind(event_id)
         .bind(schema_version)
         .bind(processing_version)
+        .bind(rules.version)
         .bind(&result)
         .bind(checksum.as_slice())
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
         sqlx::query(
-            "INSERT INTO crash_event_search (organization_id, project_id, event_id, result_id, search_text, user_comment, crash_type, platform, architecture, engine_version, symbolication_state) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (organization_id, project_id, event_id) DO UPDATE SET result_id = EXCLUDED.result_id, search_text = EXCLUDED.search_text, user_comment = EXCLUDED.user_comment, crash_type = EXCLUDED.crash_type, platform = EXCLUDED.platform, architecture = EXCLUDED.architecture, engine_version = EXCLUDED.engine_version, symbolication_state = EXCLUDED.symbolication_state, updated_at = now()",
+            "INSERT INTO crash_event_search (organization_id, project_id, event_id, result_id, data_rules_version, search_text, user_comment, crash_type, platform, architecture, engine_version, symbolication_state) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (organization_id, project_id, event_id) DO UPDATE SET result_id = EXCLUDED.result_id, data_rules_version = EXCLUDED.data_rules_version, search_text = EXCLUDED.search_text, user_comment = EXCLUDED.user_comment, crash_type = EXCLUDED.crash_type, platform = EXCLUDED.platform, architecture = EXCLUDED.architecture, engine_version = EXCLUDED.engine_version, symbolication_state = EXCLUDED.symbolication_state, updated_at = now()",
         )
         .bind(&job.organization_id)
         .bind(&job.project_id)
         .bind(event_id)
         .bind(&stored_id)
+        .bind(rules.version)
         .bind(search_text)
         .bind(user_comment)
         .bind(crash_type)
@@ -1157,6 +1173,31 @@ impl Worker {
         .execute(&mut *transaction)
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
+        sqlx::query(
+            "DELETE FROM crash_event_context_facets WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+        )
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(event_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+        for facet in context_facets {
+            sqlx::query(
+                "INSERT INTO crash_event_context_facets (organization_id, project_id, event_id, result_id, data_rules_version, key, value, value_truncated) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8)",
+            )
+            .bind(&job.organization_id)
+            .bind(&job.project_id)
+            .bind(event_id)
+            .bind(&stored_id)
+            .bind(rules.version)
+            .bind(facet.key)
+            .bind(facet.value)
+            .bind(facet.value_truncated)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+        }
         record_release_mapping(&mut transaction, job, event_id, release).await?;
         replace_symbol_waiters(
             &mut transaction,
@@ -1528,17 +1569,40 @@ async fn automatic_reprocessing_candidates(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &ReprocessingRequest,
 ) -> Result<Vec<ReprocessingCandidate>, JobError> {
-    let rows = sqlx::query(
-        "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
-    )
-    .bind(request.scope_value.as_deref().unwrap_or_default())
-    .bind(&request.organization_id)
-    .bind(&request.project_id)
-    .bind(request.selection_before)
-    .bind(&request.selection_cursor_event_id)
-    .bind(i64::try_from(AUTOMATIC_REPROCESSING_BATCH + 1).unwrap_or(i64::MAX))
-    .fetch_all(&mut **transaction)
-    .await
+    let batch = i64::try_from(AUTOMATIC_REPROCESSING_BATCH + 1).unwrap_or(i64::MAX);
+    let rows = match request.scope_kind.as_str() {
+        "artifact" => sqlx::query(
+            "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
+        )
+        .bind(request.scope_value.as_deref().unwrap_or_default())
+        .bind(&request.organization_id)
+        .bind(&request.project_id)
+        .bind(request.selection_before)
+        .bind(&request.selection_cursor_event_id)
+        .bind(batch)
+        .fetch_all(&mut **transaction)
+        .await,
+        "data_rules_version" => {
+            let version = request
+                .scope_value
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| *value > 0)
+                .ok_or(JobError::Deterministic("reprocessing_request_invalid"))?;
+            sqlx::query(
+                "SELECT e.id::text AS event_id FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.received_at <= $3 AND r.data_rules_version < $4 AND ($5::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id::text = $5 AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) ORDER BY e.received_at, e.id LIMIT $6",
+            )
+            .bind(&request.organization_id)
+            .bind(&request.project_id)
+            .bind(request.selection_before)
+            .bind(version)
+            .bind(&request.selection_cursor_event_id)
+            .bind(batch)
+            .fetch_all(&mut **transaction)
+            .await
+        }
+        _ => return Err(JobError::Deterministic("reprocessing_request_invalid")),
+    }
     .map_err(|_| JobError::Transient("database_unavailable"))?;
     Ok(rows
         .iter()
@@ -2086,7 +2150,7 @@ fn processing_versions(result: &Value) -> Result<(i32, i32), JobError> {
     Ok((schema, processing))
 }
 
-fn event_search_text(result: &Value) -> String {
+fn event_search_text(result: &Value, context_facets: &[crate::data_rules::ContextFacet]) -> String {
     const MAX_SEARCH_DOCUMENT_CHARS: usize = 65_536;
 
     fn append(document: &mut String, remaining: &mut usize, value: Option<&str>) {
@@ -2158,6 +2222,9 @@ fn event_search_text(result: &Value) -> String {
                 }
             }
         }
+    }
+    for facet in context_facets {
+        append(&mut document, &mut remaining, Some(&facet.value));
     }
     document
 }
@@ -3371,7 +3438,7 @@ mod tests {
         });
 
         assert_eq!(
-            event_search_text(&result),
+            event_search_text(&result, &[]),
             "access violation\u{1f}player report\u{1f}Game.exe\u{1f}Arena::Tick()\u{1f}Arena::Inner()"
         );
         assert_eq!(
@@ -3387,7 +3454,7 @@ mod tests {
         let oversized = json!({
             "crash_context": {"error_message": "雪".repeat(70_000)}
         });
-        let projected = event_search_text(&oversized);
+        let projected = event_search_text(&oversized, &[]);
         assert_eq!(projected.chars().count(), 65_536);
         assert!(projected.chars().all(|character| character == '雪'));
     }
@@ -4098,6 +4165,157 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("event publication must succeed: {error:?}"));
         (job_id, event_id)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn rule_changes_redact_current_results_and_reindex_only_approved_context() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(6)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let scope = insert_test_scope(&pool, "data-rules", "data-rules").await;
+        let worker = publication_worker(pool.clone(), "data-rules-worker", false);
+        let release = release_resolution("1.0.0", Vec::new());
+        let mut original = processing_result("UECC-Windows-Data-Rules", "1.0.0", "Rules::Crash()");
+        original["crash_context"]["error_message"] = json!("failed with test-secret in Arena");
+        original["crash_context"]["user_comment"] = json!("test-secret");
+        original["crash_context"]["system_metadata"] =
+            json!([{"name": "Account", "value": "test-secret"}]);
+        original["crash_context"]["game_data"] = json!([
+            {"name": "MapName", "value": "Arena-test-secret"},
+            {"name": "Private", "value": "test-secret"}
+        ]);
+        original["log"] = json!({
+            "name": "Project.log",
+            "tail": {
+                "text": "token test-secret",
+                "truncated": false,
+                "invalid_utf8": false
+            }
+        });
+        let (job_id, event_id) = publish_new_event(
+            &worker,
+            &scope.organization,
+            &scope.project,
+            "data-rules-event",
+            original.clone(),
+            &release,
+            "2020-08-15T00:00:00Z",
+        )
+        .await;
+        let initial: (i64, String, i64) = sqlx::query_as(
+            "SELECT r.data_rules_version, s.search_text, (SELECT count(*) FROM crash_event_context_facets f WHERE f.event_id = e.id) FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("initial projection must load: {error}"));
+        assert_eq!(initial.0, 0);
+        assert!(initial.1.contains("test-secret"));
+        assert_eq!(initial.2, 0);
+
+        sqlx::query(
+            "INSERT INTO project_data_rules (organization_id, project_id, version, redaction_patterns, indexed_game_data_keys, updated_by_user_id) VALUES ($1::uuid, $2::uuid, 1, ARRAY['test-secret'], ARRAY['MapName'], $3::uuid)",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&scope.user)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("data rules must insert: {error}"));
+        sqlx::query(
+            "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest) VALUES ($1::uuid, $2::uuid, 'automatic', 'data_rules_version', '1', $3, $3)",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(vec![7_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("rule reprocessing request must insert: {error}"));
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("rule reprocessing must schedule"))
+        );
+        let job = lease_exact_job(&pool, &job_id, worker.instance_id.as_ref()).await;
+        worker
+            .publish_crash_result(
+                &job,
+                &event_id,
+                original.clone(),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("redacted result must publish: {error:?}"));
+
+        let current = sqlx::query(
+            "SELECT r.result, r.data_rules_version, s.search_text, o.checksum, q.state AS request_state FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id JOIN crash_event_objects o ON o.id = e.raw_object_id JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("redacted projection must load: {error}"));
+        let result: Value = current.get("result");
+        let encoded = result.to_string();
+        assert!(!encoded.contains("test-secret"));
+        assert_eq!(current.get::<i64, _>("data_rules_version"), 1);
+        assert!(
+            !current
+                .get::<String, _>("search_text")
+                .contains("test-secret")
+        );
+        assert_eq!(current.get::<Vec<u8>, _>("checksum"), vec![0_u8; 32]);
+        assert_eq!(current.get::<String, _>("request_state"), "completed");
+        let facets = sqlx::query(
+            "SELECT key, value, value_truncated FROM crash_event_context_facets WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY key, value",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&event_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("context facets must load: {error}"));
+        assert_eq!(facets.len(), 1);
+        assert_eq!(facets[0].get::<String, _>("key"), "MapName");
+        assert_eq!(facets[0].get::<String, _>("value"), "Arena-[REDACTED]");
+        assert!(!facets[0].get::<bool, _>("value_truncated"));
+
+        let duplicate = lease_exact_job(&pool, &job_id, worker.instance_id.as_ref()).await;
+        worker
+            .publish_crash_result(
+                &duplicate,
+                &event_id,
+                original,
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("duplicate reprocessing must publish: {error:?}"));
+        let rule_version_results: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1 AND data_rules_version = 1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("result count must load: {error}"));
+        assert_eq!(rule_version_results, 1);
     }
 
     #[tokio::test]

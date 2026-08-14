@@ -110,6 +110,14 @@ export type ExistingSetup = {
   setup: ProjectSetup;
 };
 
+export type ProjectDataRules = {
+  version: number;
+  redaction_patterns: string[];
+  indexed_game_data_keys: string[];
+  can_edit: boolean;
+  reprocessing_request_id: string | null;
+};
+
 export type Distribution = {
   key: string;
   label: string;
@@ -281,6 +289,12 @@ export type EventFacets = {
   processing_states: Distribution[];
   processing_states_truncated: boolean;
   processing_states_other_count: number;
+  custom_context: Array<{
+    key: string;
+    values: Distribution[];
+    values_truncated: boolean;
+    values_other_count: number;
+  }>;
 };
 
 export type EventList = {
@@ -387,6 +401,7 @@ export type EventDetail = {
       result_id: string;
       schema_version: number;
       processing_version: number;
+      data_rules_version: number;
       checksum: string;
       created_at: string;
       current: boolean;

@@ -571,6 +571,72 @@ paths:
           $ref: "#/components/responses/IssueNotFound"
         "500":
           $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/data-rules:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectDataRules
+      summary: Get the active redaction and custom context indexing rules
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Current project data rules
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDataRules"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      operationId: updateProjectDataRules
+      summary: Replace project data rules and queue existing derived data for reprocessing
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectDataRules"
+      responses:
+        "200":
+          description: Rules were already current
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDataRules"
+        "202":
+          description: Rules were updated and reprocessing was queued
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDataRules"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/projects/{project_id}/issues:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -631,6 +697,21 @@ paths:
           in: query
           schema:
             $ref: "#/components/schemas/SymbolicationState"
+        - name: context_key
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: ^[A-Za-z0-9_.-]+$
+          description: Owner-approved GameData key. Must be paired with context_value.
+        - name: context_value
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+          description: Exact redacted GameData facet value. Must be paired with context_key.
         - name: first_seen_from
           in: query
           schema:
@@ -2034,6 +2115,63 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/IngestKey"
+    UpdateProjectDataRules:
+      type: object
+      additionalProperties: false
+      required:
+        - redaction_patterns
+        - indexed_game_data_keys
+      properties:
+        redaction_patterns:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+        indexed_game_data_keys:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: ^[A-Za-z0-9_.-]+$
+    ProjectDataRules:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - redaction_patterns
+        - indexed_game_data_keys
+        - can_edit
+        - reprocessing_request_id
+      properties:
+        version:
+          type: integer
+          minimum: 0
+        redaction_patterns:
+          type: array
+          maxItems: 32
+          description: Empty for callers who cannot manage project data rules.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+        indexed_game_data_keys:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        can_edit:
+          type: boolean
+        reprocessing_request_id:
+          type:
+            - string
+            - "null"
+          format: uuid
     SecretIngestKey:
       type: object
       additionalProperties: false
@@ -2916,6 +3054,7 @@ components:
         - processing_states
         - processing_states_truncated
         - processing_states_other_count
+        - custom_context
       properties:
         releases:
           type: array
@@ -2975,6 +3114,34 @@ components:
         processing_states_truncated:
           type: boolean
         processing_states_other_count:
+          type: integer
+          minimum: 0
+        custom_context:
+          type: array
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/ContextFacetGroup"
+    ContextFacetGroup:
+      type: object
+      additionalProperties: false
+      required:
+        - key
+        - values
+        - values_truncated
+        - values_other_count
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 128
+        values:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        values_truncated:
+          type: boolean
+        values_other_count:
           type: integer
           minimum: 0
     IssueEventList:
@@ -3376,6 +3543,7 @@ components:
         - result_id
         - schema_version
         - processing_version
+        - data_rules_version
         - checksum
         - created_at
         - current
@@ -3389,6 +3557,9 @@ components:
         processing_version:
           type: integer
           minimum: 1
+        data_rules_version:
+          type: integer
+          minimum: 0
         checksum:
           type: string
           pattern: ^[a-f0-9]{64}$

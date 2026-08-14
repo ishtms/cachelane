@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod crash_ingest;
 mod dashboard;
+mod data_rules;
 mod issues;
 mod processor_runner;
 mod project_setup;

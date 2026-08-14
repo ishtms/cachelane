@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use axum::{
     Json,
     body::Body,
@@ -247,6 +249,15 @@ struct EventFacets {
     processing_states: Vec<Distribution>,
     processing_states_truncated: bool,
     processing_states_other_count: i64,
+    custom_context: Vec<ContextFacetGroup>,
+}
+
+#[derive(Serialize)]
+struct ContextFacetGroup {
+    key: String,
+    values: Vec<Distribution>,
+    values_truncated: bool,
+    values_other_count: i64,
 }
 
 #[derive(Serialize)]
@@ -382,6 +393,7 @@ struct ResultHistory {
     result_id: String,
     schema_version: i32,
     processing_version: i32,
+    data_rules_version: i64,
     checksum: String,
     created_at: String,
     current: bool,
@@ -1144,6 +1156,16 @@ async fn load_event_facets(
     .map_err(|_| DashboardError::Internal)?;
     let (processing_states, processing_states_truncated, processing_states_other_count) =
         distribution_rows(&processing_states);
+    let context_rows = sqlx::query(
+        "WITH counts AS (SELECT f.key, f.value, bool_or(f.value_truncated) AS value_truncated, count(*) AS count FROM crash_events e JOIN crash_event_context_facets f ON f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY f.key, f.value), ranked AS (SELECT key, value, value_truncated, count, row_number() OVER (PARTITION BY key ORDER BY count DESC, value) AS rank, sum(count) OVER (PARTITION BY key)::bigint AS total_count FROM counts) SELECT key, value, value_truncated, count, total_count FROM ranked WHERE rank <= 21 ORDER BY key, rank",
+    )
+    .bind(&scope.organization_id)
+    .bind(&scope.project_id)
+    .bind(issue_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+    let custom_context = context_facet_groups(&context_rows);
     Ok(EventFacets {
         releases,
         releases_truncated,
@@ -1163,7 +1185,44 @@ async fn load_event_facets(
         processing_states,
         processing_states_truncated,
         processing_states_other_count,
+        custom_context,
     })
+}
+
+fn context_facet_groups(rows: &[sqlx::postgres::PgRow]) -> Vec<ContextFacetGroup> {
+    let mut grouped = BTreeMap::<String, Vec<&sqlx::postgres::PgRow>>::new();
+    for row in rows {
+        grouped.entry(row.get("key")).or_default().push(row);
+    }
+    grouped
+        .into_iter()
+        .map(|(key, rows)| {
+            let values_truncated = rows.len() > MAX_DISTRIBUTIONS;
+            let total_count = rows
+                .first()
+                .map_or(0, |row| row.get::<i64, _>("total_count"));
+            let values = rows
+                .iter()
+                .take(MAX_DISTRIBUTIONS)
+                .map(|row| {
+                    let value: String = row.get("value");
+                    Distribution {
+                        key: value.clone(),
+                        label: value,
+                        count: row.get("count"),
+                        truncated: row.get("value_truncated"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let visible_count = values.iter().map(|value| value.count).sum::<i64>();
+            ContextFacetGroup {
+                key,
+                values,
+                values_truncated,
+                values_other_count: total_count.saturating_sub(visible_count),
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1623,7 +1682,7 @@ async fn load_processing_history(
     current_result_id: Option<&str>,
 ) -> Result<ProcessingHistory, DashboardError> {
     let result_rows = sqlx::query(
-        "SELECT id::text AS result_id, schema_version, processing_version, checksum, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM crash_processing_results WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY created_at DESC, id DESC LIMIT 51",
+        "SELECT id::text AS result_id, schema_version, processing_version, data_rules_version, checksum, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM crash_processing_results WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY created_at DESC, id DESC LIMIT 51",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1642,6 +1701,7 @@ async fn load_processing_history(
                 result_id,
                 schema_version: row.get("schema_version"),
                 processing_version: row.get("processing_version"),
+                data_rules_version: row.get("data_rules_version"),
                 checksum: lower_hex(&row.get::<Vec<u8>, _>("checksum")),
                 created_at: row.get("created_at"),
             }
