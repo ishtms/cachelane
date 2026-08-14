@@ -139,6 +139,18 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await expect(
     page.getByText("No events in this window.").first(),
   ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Project data rules" }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Literal redaction patterns, one per line")
+    .fill("browser-proof-secret");
+  await page.getByLabel("Indexed GameData keys, one per line").fill("MapName");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Save data rules" }).click();
+  await expect(page.locator(".action-status")).toContainText(
+    "Existing events are queued for reprocessing.",
+  );
 
   await page.goto(`/projects/${outsideProjectId}`);
   await expect(

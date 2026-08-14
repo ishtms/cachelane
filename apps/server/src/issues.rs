@@ -31,6 +31,8 @@ pub(crate) struct IssueListQuery {
     architecture: Option<String>,
     engine_version: Option<String>,
     symbolication_state: Option<String>,
+    context_key: Option<String>,
+    context_value: Option<String>,
     first_seen_from: Option<String>,
     first_seen_to: Option<String>,
     last_seen_from: Option<String>,
@@ -48,6 +50,8 @@ struct IssueFilterIdentity<'query> {
     architecture: Option<&'query str>,
     engine_version: Option<&'query str>,
     symbolication_state: Option<&'query str>,
+    context_key: Option<&'query str>,
+    context_value: Option<&'query str>,
     first_seen_from: Option<&'query str>,
     first_seen_to: Option<&'query str>,
     last_seen_from: Option<&'query str>,
@@ -235,7 +239,7 @@ pub(crate) async fn list_issues(
         .transpose()?;
     let search = query.query.as_deref().map(search_pattern);
     let rows = sqlx::query(
-        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND ($3::timestamptz IS NULL OR (i.last_seen_at, i.id) < ($3::timestamptz, $4::uuid)) AND ($5::text IS NULL OR i.status = $5) AND ($6::text IS NULL OR i.regression_state = $6) AND ($8::timestamptz IS NULL OR i.first_seen_at >= $8::timestamptz) AND ($9::timestamptz IS NULL OR i.first_seen_at < $9::timestamptz) AND ($10::timestamptz IS NULL OR i.last_seen_at >= $10::timestamptz) AND ($11::timestamptz IS NULL OR i.last_seen_at < $11::timestamptz) AND (($7::uuid IS NULL AND $12::text IS NULL AND $13::text IS NULL AND $14::text IS NULL AND $15::text IS NULL AND $16::text IS NULL) OR EXISTS (SELECT 1 FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND ($7::uuid IS NULL OR e.release_id = $7::uuid) AND ($12::text IS NULL OR s.crash_type = $12) AND ($13::text IS NULL OR s.platform = $13) AND ($14::text IS NULL OR s.architecture = $14) AND ($15::text IS NULL OR s.engine_version = $15) AND ($16::text IS NULL OR CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END = $16))) AND ($17::text IS NULL OR i.title ILIKE $17 ESCAPE E'\\\\' OR EXISTS (SELECT 1 FROM crash_events e JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND s.search_text ILIKE $17 ESCAPE E'\\\\')) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $18",
+        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND ($3::timestamptz IS NULL OR (i.last_seen_at, i.id) < ($3::timestamptz, $4::uuid)) AND ($5::text IS NULL OR i.status = $5) AND ($6::text IS NULL OR i.regression_state = $6) AND ($8::timestamptz IS NULL OR i.first_seen_at >= $8::timestamptz) AND ($9::timestamptz IS NULL OR i.first_seen_at < $9::timestamptz) AND ($10::timestamptz IS NULL OR i.last_seen_at >= $10::timestamptz) AND ($11::timestamptz IS NULL OR i.last_seen_at < $11::timestamptz) AND (($7::uuid IS NULL AND $12::text IS NULL AND $13::text IS NULL AND $14::text IS NULL AND $15::text IS NULL AND $16::text IS NULL AND $17::text IS NULL) OR EXISTS (SELECT 1 FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND ($7::uuid IS NULL OR e.release_id = $7::uuid) AND ($12::text IS NULL OR s.crash_type = $12) AND ($13::text IS NULL OR s.platform = $13) AND ($14::text IS NULL OR s.architecture = $14) AND ($15::text IS NULL OR s.engine_version = $15) AND ($16::text IS NULL OR CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END = $16) AND ($17::text IS NULL OR EXISTS (SELECT 1 FROM crash_event_context_facets f WHERE f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id AND f.key = $17 AND f.value = $18)))) AND ($19::text IS NULL OR i.title ILIKE $19 ESCAPE E'\\\\' OR EXISTS (SELECT 1 FROM crash_events e JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND s.search_text ILIKE $19 ESCAPE E'\\\\')) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $20",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -253,6 +257,8 @@ pub(crate) async fn list_issues(
     .bind(query.architecture.as_deref())
     .bind(query.engine_version.as_deref())
     .bind(query.symbolication_state.as_deref())
+    .bind(query.context_key.as_deref())
+    .bind(query.context_value.as_deref())
     .bind(search.as_deref())
     .bind(i64::from(limit) + 1)
     .fetch_all(&mut *transaction)
@@ -476,6 +482,14 @@ fn validate_list_query(query: IssueListQuery) -> Result<IssueListQuery, IssueErr
                 "readable" | "partial" | "missing" | "failed" | "processing"
             )
         })
+        || query.context_key.is_some() != query.context_value.is_some()
+        || query
+            .context_key
+            .as_deref()
+            .is_some_and(|value| !valid_context_key(value))
+        || query.context_value.as_deref().is_some_and(|value| {
+            value.is_empty() || value.chars().count() > 512 || value.chars().any(char::is_control)
+        })
         || [
             query.first_seen_from.as_deref(),
             query.first_seen_to.as_deref(),
@@ -510,6 +524,7 @@ fn dashboard_filters_requested(query: &IssueListQuery) -> bool {
         || query.architecture.is_some()
         || query.engine_version.is_some()
         || query.symbolication_state.is_some()
+        || query.context_key.is_some()
         || query.first_seen_from.is_some()
         || query.first_seen_to.is_some()
         || query.last_seen_from.is_some()
@@ -527,6 +542,14 @@ fn valid_filter_token(value: &str, maximum: usize) -> bool {
 
 fn valid_filter_text(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn valid_context_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn valid_time_range(from: Option<&str>, to: Option<&str>) -> bool {
@@ -552,6 +575,8 @@ fn issue_filter_hash(query: &IssueListQuery) -> Result<String, IssueError> {
         architecture: query.architecture.as_deref(),
         engine_version: query.engine_version.as_deref(),
         symbolication_state: query.symbolication_state.as_deref(),
+        context_key: query.context_key.as_deref(),
+        context_value: query.context_value.as_deref(),
         first_seen_from: query.first_seen_from.as_deref(),
         first_seen_to: query.first_seen_to.as_deref(),
         last_seen_from: query.last_seen_from.as_deref(),

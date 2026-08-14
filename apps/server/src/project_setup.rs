@@ -414,6 +414,12 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
                 get(crate::dashboard::get_overview),
             )
             .route(
+                "/api/v1/projects/{project_id}/data-rules",
+                get(crate::data_rules::get_data_rules)
+                    .put(crate::data_rules::update_data_rules)
+                    .layer(DefaultBodyLimit::max(16 * 1024)),
+            )
+            .route(
                 "/api/v1/projects/{project_id}/issues/{issue_id}/events",
                 get(crate::dashboard::list_issue_events),
             )

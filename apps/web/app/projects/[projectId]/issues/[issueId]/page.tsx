@@ -349,6 +349,14 @@ export default async function IssuePage({
             rows={events.facets.processing_states}
             otherCount={events.facets.processing_states_other_count}
           />
+          {events.facets.custom_context.map((facet) => (
+            <FacetList
+              key={facet.key}
+              title={facet.key}
+              rows={facet.values}
+              otherCount={facet.values_other_count}
+            />
+          ))}
         </aside>
       </section>
 
@@ -730,7 +738,8 @@ export default async function IssuePage({
                     </span>
                     <strong>
                       Schema {result.schema_version}, processor{" "}
-                      {result.processing_version}
+                      {result.processing_version}, data rules{" "}
+                      {result.data_rules_version}
                     </strong>
                     <small>{formatDate(result.created_at)}</small>
                     <code>{result.checksum}</code>

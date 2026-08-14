@@ -6,9 +6,11 @@ import {
   FaultlaneApiError,
   type ExistingSetup,
   type IssueList,
+  type ProjectDataRules,
   type ProjectOverview,
   faultlaneApi,
 } from "../../../lib/faultlane";
+import { DataRulesForm } from "./data-rules-form";
 
 export const metadata: Metadata = {
   title: "Project overview | FaultLane",
@@ -26,6 +28,8 @@ const filterNames = [
   "architecture",
   "engine_version",
   "symbolication_state",
+  "context_key",
+  "context_value",
   "first_seen_from",
   "first_seen_to",
   "last_seen_from",
@@ -165,8 +169,9 @@ export default async function ProjectPage({
   let overview: ProjectOverview;
   let issues: IssueList;
   let setup: ExistingSetup;
+  let dataRules: ProjectDataRules;
   try {
-    [overview, issues, setup] = await Promise.all([
+    [overview, issues, setup, dataRules] = await Promise.all([
       faultlaneApi<ProjectOverview>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/overview`,
       ),
@@ -175,6 +180,9 @@ export default async function ProjectPage({
       ),
       faultlaneApi<ExistingSetup>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/setup`,
+      ),
+      faultlaneApi<ProjectDataRules>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/data-rules`,
       ),
     ]);
   } catch (error) {
@@ -323,6 +331,8 @@ export default async function ProjectPage({
                 ["platform", "Platform"],
                 ["architecture", "Architecture"],
                 ["engine_version", "Engine version"],
+                ["context_key", "GameData key"],
+                ["context_value", "GameData value"],
                 ["first_seen_from", "First seen from (RFC 3339)"],
                 ["first_seen_to", "First seen to (RFC 3339)"],
                 ["last_seen_from", "Last seen from (RFC 3339)"],
@@ -499,6 +509,22 @@ export default async function ProjectPage({
           truncated={overview.crash_types_truncated}
           otherCount={overview.crash_types_other_count}
         />
+      </section>
+
+      <section className="dashboard-panel data-rules-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="setup-kicker">Privacy and search</p>
+            <h2>Project data rules</h2>
+          </div>
+          <span>Version {dataRules.version}</span>
+        </div>
+        <p className="fine-print">
+          Matching text is replaced in derived crash context and logs. Only
+          listed GameData keys are indexed for search and facets. Retained raw
+          artifacts are unchanged and keep separate access controls.
+        </p>
+        <DataRulesForm projectId={projectId} rules={dataRules} />
       </section>
 
       <section className="dashboard-panel usage-panel">
