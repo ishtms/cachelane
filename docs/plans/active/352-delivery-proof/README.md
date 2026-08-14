@@ -2,7 +2,7 @@
 
 Issue: [#352](https://github.com/ishtms/faultlane/issues/352)
 
-Status: Approved on August 15, 2026. Track the seven authoritative documents using option 1 below.
+Status: Approved on August 15, 2026. Track the seven authoritative documents under `docs/`.
 
 ## Outcome
 
@@ -19,11 +19,11 @@ The current implementation has useful checks, but their enforcement is inconsist
 - The tracked Playwright setup and dashboard tests run only from the Windows-oriented isolated proof or by direct command. Pull request CI does not execute a browser flow.
 - `scripts/doctor` checks command availability, Docker, Compose, and ports, but not the installed Playwright package or configured Chrome executable.
 - `docs/plans/active/README.md` says merged plans move to completed. Plans 298, 299, 300, 311, and 346 remain active after their changes merged.
-- `AGENTS.md` declares `docs/product/overview.md`, `PRD.md`, and `ARCHITECTURE.md` authoritative. Those files are ignored and not tracked, and their local copies disagree with the tracked repository and GitHub roadmap.
+- The local `AGENTS.md` declares `docs/product/overview.md`, `PRD.md`, and `ARCHITECTURE.md` authoritative. Those files are ignored and not tracked, and their local copies disagree with the tracked repository and GitHub roadmap.
 
-The current source policy cannot be repaired silently. Repository instructions prohibit changing `.gitignore`, force-adding ignored Markdown, and staging `AGENTS.md`. One narrow exception is required before the authority repair can be implemented.
+The approved repair relocates the root product and architecture documents under `docs/`. Local ignore exceptions allow only the seven authority documents to be added normally. `.gitignore`, `AGENTS.md`, `.agents/`, and `.codex/` remain local, ignored, and uncommitted. `.gitignore` remains self-ignored, and no ignored file is force-added.
 
-The ignored authority set is exactly `docs/product/overview.md`, `PRD.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/security/threat-model.md`, `docs/operations/deployment.md`, and `docs/operations/rollback.md`. `docs/security/processor-boundary.md` and `docs/operations/isolated-worker.md` are already tracked and must not be duplicated or re-added.
+The authority set is exactly `docs/product/overview.md`, `docs/product/requirements.md`, `docs/architecture/overview.md`, `docs/architecture/index.md`, `docs/security/threat-model.md`, `docs/operations/deployment.md`, and `docs/operations/rollback.md`. `docs/security/processor-boundary.md` and `docs/operations/isolated-worker.md` are already tracked and must not be duplicated or re-added.
 
 ## Acceptance criteria
 
@@ -69,7 +69,7 @@ Do not add a bypass actor or weaken a current protection. If either new job is u
 
 Move each merged tracked plan with Git rename semantics and append its merged PR and final outcome. Do not rewrite historical reasoning.
 
-The product and architecture source repair depends on the explicit decision below. No workaround using a new filename or another duplicate document is acceptable because `AGENTS.md` would still point reviewers at stale ignored files.
+Relocate the root `PRD.md` content to `docs/product/requirements.md` and the root `ARCHITECTURE.md` content to `docs/architecture/overview.md`. Update the local `AGENTS.md` references to those paths without staging it. Do not leave duplicate product or architecture authority at the repository root.
 
 ## Security analysis
 
@@ -138,9 +138,16 @@ Rollback in this order:
 
 ## Approved source-of-truth decision
 
-Option 1 was approved on August 15, 2026:
+Option 1 was approved on August 15, 2026. Track these documents:
 
-1. Allow exact `.gitignore` exceptions for `docs/product/overview.md`, `PRD.md`, `ARCHITECTURE.md`, `docs/architecture/index.md`, `docs/security/threat-model.md`, `docs/operations/deployment.md`, and `docs/operations/rollback.md`. Update their stale product name and milestone state before adding them normally as tracked files. No force-add remains necessary.
-2. Allow exact `.gitignore` and staging exceptions for `AGENTS.md`, then update it so tracked GitHub issues, milestones, decisions, and plans become authoritative instead of the ignored local product and architecture Markdown. Leave the seven ignored documents local and non-authoritative.
+- `docs/product/overview.md`
+- `docs/product/requirements.md`
+- `docs/architecture/overview.md`
+- `docs/architecture/index.md`
+- `docs/security/threat-model.md`
+- `docs/operations/deployment.md`
+- `docs/operations/rollback.md`
 
-Option 1 keeps architecture and product rationale reviewable beside the code while preserving GitHub as the execution roadmap. The approval is a narrow exception to modify `.gitignore` only for these seven paths. `AGENTS.md` remains unstaged and unchanged.
+Update their stale product name and milestone state before adding them normally. Use exact exceptions in the local, self-ignored `.gitignore`; do not commit `.gitignore` or force-add ignored files. Keep `AGENTS.md`, `.agents/`, and `.codex/` local, ignored, and uncommitted. Update the local `AGENTS.md` authority paths without staging it.
+
+This keeps product and architecture rationale reviewable beside the code without placing those documents at the repository root. GitHub remains the execution roadmap.
