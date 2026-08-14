@@ -1769,19 +1769,19 @@ fn decode_windows_acl(bytes: &[u8]) -> Result<String, std::io::Error> {
 
 #[cfg(windows)]
 fn windows_acl_is_private(descriptor: &str, sid: &str) -> bool {
-    let Some(dacl) = descriptor
+    let Some((dacl, first_ace)) = descriptor
         .lines()
         .map(str::trim)
-        .find(|line| line.starts_with("D:"))
+        .filter(|line| line.starts_with("D:"))
+        .find_map(|line| {
+            let first_ace = line.find('(')?;
+            line[2..first_ace]
+                .contains('P')
+                .then_some((line, first_ace))
+        })
     else {
         return false;
     };
-    let Some(first_ace) = dacl.find('(') else {
-        return false;
-    };
-    if !dacl[2..first_ace].contains('P') {
-        return false;
-    }
     let mut actual: Vec<&str> = dacl[first_ace..]
         .split('(')
         .skip(1)
@@ -1929,6 +1929,15 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, other);
         assert_eq!(first.len(), 64);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_parser_ignores_drive_paths() {
+        let sid = "S-1-5-21-1000";
+        let descriptor =
+            format!("D:\\a\\faultlane\\scratch\r\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})\r\n");
+        assert!(super::windows_acl_is_private(&descriptor, sid));
     }
 
     #[cfg(windows)]
