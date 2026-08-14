@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod crash_ingest;
+mod dashboard;
 mod issues;
 mod processor_runner;
 mod project_setup;

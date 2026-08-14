@@ -32,6 +32,7 @@ const MAX_SELECTED_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PREVIOUS_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEARCH_COMMENT_CHARS: usize = 8_192;
 const MAX_STORED_RELEASE_CANDIDATES: i64 = 101;
 const MAX_SYMBOL_WAITERS: usize = 4_096;
 const AUTOMATIC_REPROCESSING_BATCH: usize = 100;
@@ -1096,6 +1097,18 @@ impl Worker {
     ) -> Result<(), JobError> {
         let (schema_version, processing_version) = processing_versions(&result)?;
         let grouping = grouping_publication(self.grouping_enabled, &result)?;
+        let search_text = event_search_text(&result);
+        let user_comment = projected_text(&result, "/crash_context/user_comment").map(|value| {
+            value
+                .chars()
+                .take(MAX_SEARCH_COMMENT_CHARS)
+                .collect::<String>()
+        });
+        let crash_type = projected_text(&result, "/crash_context/crash_type");
+        let platform = projected_text(&result, "/crash_context/platform/normalized");
+        let architecture = projected_text(&result, "/crash_context/architecture");
+        let engine_version = projected_text(&result, "/crash_context/engine_version");
+        let symbolication_state = projected_symbolication_state(state, &result);
         let waiters = if state == "awaiting_symbols" {
             symbol_waiters(&result, release)?
         } else {
@@ -1122,9 +1135,26 @@ impl Worker {
         .bind(event_id)
         .bind(schema_version)
         .bind(processing_version)
-        .bind(result)
+        .bind(&result)
         .bind(checksum.as_slice())
         .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+        sqlx::query(
+            "INSERT INTO crash_event_search (organization_id, project_id, event_id, result_id, search_text, user_comment, crash_type, platform, architecture, engine_version, symbolication_state) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (organization_id, project_id, event_id) DO UPDATE SET result_id = EXCLUDED.result_id, search_text = EXCLUDED.search_text, user_comment = EXCLUDED.user_comment, crash_type = EXCLUDED.crash_type, platform = EXCLUDED.platform, architecture = EXCLUDED.architecture, engine_version = EXCLUDED.engine_version, symbolication_state = EXCLUDED.symbolication_state, updated_at = now()",
+        )
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(event_id)
+        .bind(&stored_id)
+        .bind(search_text)
+        .bind(user_comment)
+        .bind(crash_type)
+        .bind(platform)
+        .bind(architecture)
+        .bind(engine_version)
+        .bind(symbolication_state)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
         record_release_mapping(&mut transaction, job, event_id, release).await?;
@@ -2054,6 +2084,127 @@ fn processing_versions(result: &Value) -> Result<(i32, i32), JobError> {
         .and_then(|value| i32::try_from(value).ok())
         .ok_or(JobError::Deterministic("processor_output_invalid"))?;
     Ok((schema, processing))
+}
+
+fn event_search_text(result: &Value) -> String {
+    const MAX_SEARCH_DOCUMENT_CHARS: usize = 65_536;
+
+    fn append(document: &mut String, remaining: &mut usize, value: Option<&str>) {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if *remaining == 0 {
+            return;
+        }
+        if !document.is_empty() {
+            document.push('\u{1f}');
+            *remaining -= 1;
+        }
+        for character in value.chars().take(*remaining) {
+            document.push(character);
+            *remaining -= 1;
+        }
+    }
+
+    let mut document = String::new();
+    let mut remaining = MAX_SEARCH_DOCUMENT_CHARS;
+    append(
+        &mut document,
+        &mut remaining,
+        result
+            .pointer("/crash_context/error_message")
+            .and_then(Value::as_str),
+    );
+    append(
+        &mut document,
+        &mut remaining,
+        result
+            .pointer("/crash_context/user_comment")
+            .and_then(Value::as_str),
+    );
+    if let Some(modules) = result
+        .pointer("/current/symbolication/modules")
+        .and_then(Value::as_array)
+    {
+        for module in modules {
+            append(
+                &mut document,
+                &mut remaining,
+                module.get("module").and_then(Value::as_str),
+            );
+        }
+    }
+    if let Some(threads) = result
+        .pointer("/current/symbolication/threads")
+        .and_then(Value::as_array)
+    {
+        for thread in threads {
+            if let Some(frames) = thread.get("frames").and_then(Value::as_array) {
+                for frame in frames {
+                    append(
+                        &mut document,
+                        &mut remaining,
+                        frame.get("function").and_then(Value::as_str),
+                    );
+                    if let Some(inlines) = frame.get("inlines").and_then(Value::as_array) {
+                        for inline in inlines {
+                            append(
+                                &mut document,
+                                &mut remaining,
+                                inline.get("function").and_then(Value::as_str),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    document
+}
+
+fn projected_text<'a>(result: &'a Value, pointer: &str) -> Option<&'a str> {
+    result
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn projected_symbolication_state(state: &str, result: &Value) -> &'static str {
+    if matches!(state, "failed" | "quarantined") {
+        return "failed";
+    }
+    let resolved = result
+        .pointer("/current/symbolication/threads")
+        .and_then(Value::as_array)
+        .is_some_and(|threads| {
+            threads.iter().any(|thread| {
+                thread
+                    .get("frames")
+                    .and_then(Value::as_array)
+                    .is_some_and(|frames| {
+                        frames.iter().any(|frame| {
+                            frame.get("symbol_status").and_then(Value::as_str) == Some("resolved")
+                        })
+                    })
+            })
+        });
+    let missing = result
+        .pointer("/current/symbolication/modules")
+        .and_then(Value::as_array)
+        .is_some_and(|modules| {
+            modules.iter().any(|module| {
+                matches!(
+                    module.get("status").and_then(Value::as_str),
+                    Some("missing_pe" | "missing_pdb" | "mismatched" | "missing_identity")
+                )
+            })
+        });
+    match (resolved, missing, state) {
+        (true, true, _) => "partial",
+        (true, false, _) => "readable",
+        (_, true, _) | (_, _, "awaiting_symbols") => "missing",
+        _ => "processing",
+    }
 }
 
 fn grouping_publication(enabled: bool, result: &Value) -> Result<GroupingPublication, JobError> {
@@ -3177,10 +3328,11 @@ mod tests {
 
     use super::{
         Job, JobError, ModuleIdentity, ReleaseEvidence, ReleaseLookup, ReleaseResolution,
-        SelectedArtifact, Worker, attempt_identity, claim_job, container_name, has_resolved_frame,
-        lock_lease, owned_attempt, prepare_worker_scratch, processor_scope, random_uuid,
-        release_chronology, release_lookup, selected_artifact_size_valid, set_private_permissions,
-        strict_json, valid_internal_uuid,
+        SelectedArtifact, Worker, attempt_identity, claim_job, container_name, event_search_text,
+        has_resolved_frame, lock_lease, owned_attempt, prepare_worker_scratch, processor_scope,
+        projected_symbolication_state, projected_text, random_uuid, release_chronology,
+        release_lookup, selected_artifact_size_valid, set_private_permissions, strict_json,
+        valid_internal_uuid,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, migrate};
     use crate::{
@@ -3198,6 +3350,78 @@ mod tests {
         }
         #[cfg(not(windows))]
         env::temp_dir()
+    }
+
+    #[test]
+    fn event_search_projects_only_approved_current_fields() {
+        let result = json!({
+            "crash_context": {
+                "error_message": "access violation",
+                "user_comment": "player report",
+                "unknown_fields": {"Secret": "do-not-index"}
+            },
+            "log": {"tail": {"text": "do-not-index"}},
+            "current": {"symbolication": {
+                "modules": [{"module": "Game.exe"}],
+                "threads": [{"frames": [{
+                    "function": "Arena::Tick()",
+                    "inlines": [{"function": "Arena::Inner()"}]
+                }]}]
+            }}
+        });
+
+        assert_eq!(
+            event_search_text(&result),
+            "access violation\u{1f}player report\u{1f}Game.exe\u{1f}Arena::Tick()\u{1f}Arena::Inner()"
+        );
+        assert_eq!(
+            projected_text(&result, "/crash_context/error_message"),
+            Some("access violation")
+        );
+        assert_eq!(projected_text(&result, "/crash_context/unknown"), None);
+        assert_eq!(
+            projected_symbolication_state("processed", &result),
+            "processing"
+        );
+
+        let oversized = json!({
+            "crash_context": {"error_message": "雪".repeat(70_000)}
+        });
+        let projected = event_search_text(&oversized);
+        assert_eq!(projected.chars().count(), 65_536);
+        assert!(projected.chars().all(|character| character == '雪'));
+    }
+
+    #[test]
+    fn event_search_projects_symbolication_state() {
+        let partial = json!({
+            "current": {"symbolication": {
+                "modules": [{"status": "missing_pdb"}],
+                "threads": [{"frames": [{"symbol_status": "resolved"}]}]
+            }}
+        });
+        let readable = json!({
+            "current": {"symbolication": {
+                "modules": [{"status": "matched"}],
+                "threads": [{"frames": [{"symbol_status": "resolved"}]}]
+            }}
+        });
+        assert_eq!(
+            projected_symbolication_state("processed", &partial),
+            "partial"
+        );
+        assert_eq!(
+            projected_symbolication_state("processed", &readable),
+            "readable"
+        );
+        assert_eq!(
+            projected_symbolication_state("awaiting_symbols", &json!({})),
+            "missing"
+        );
+        assert_eq!(
+            projected_symbolication_state("quarantined", &readable),
+            "failed"
+        );
     }
 
     #[test]
@@ -4058,6 +4282,19 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("processing result count must load: {error}"));
         assert_eq!(first_results, 1);
+        let search = sqlx::query(
+            "SELECT search.search_text, search.result_id = event.current_result_id AS current FROM crash_event_search search JOIN crash_events event ON event.id = search.event_id AND event.organization_id = search.organization_id AND event.project_id = search.project_id WHERE event.id::text = $1",
+        )
+        .bind(&first_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("event search projection must load: {error}"));
+        assert!(search.get::<bool, _>("current"));
+        assert!(
+            search
+                .get::<String, _>("search_text")
+                .contains("Arena::Tick()")
+        );
 
         let ambiguous = sqlx::query_scalar::<_, String>(
             "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '9.0.0', 'windows', 'x86_64', 'Shipping', '2026-09-01T00:00:00Z'), ($1::uuid, $2::uuid, '9.0.0', 'windows', 'x86_64', 'shipping', '2026-09-02T00:00:00Z') RETURNING id::text",
