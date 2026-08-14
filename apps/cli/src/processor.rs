@@ -17,6 +17,7 @@ const INPUT_ROOT: &str = "/input";
 const SCRATCH_ROOT: &str = "/scratch";
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_PREVIOUS_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Subcommand)]
 pub(crate) enum ProcessorCommand {
@@ -69,6 +70,7 @@ pub(crate) fn run(command: ProcessorCommand) -> Result<(), ProcessorError> {
             &input.join("raw.bundle"),
             &input.join("symbols"),
             &input.join("symcaches.json"),
+            &input.join("previous.json"),
         ),
     }
 }
@@ -100,9 +102,15 @@ fn generate(input: &Path, output: &Path) -> Result<(), ProcessorError> {
     write_json(&metadata)
 }
 
-fn process(request: &Path, symbols: &Path, manifest: &Path) -> Result<(), ProcessorError> {
+fn process(
+    request: &Path,
+    symbols: &Path,
+    manifest: &Path,
+    previous: &Path,
+) -> Result<(), ProcessorError> {
     let request = File::open(request).map_err(|_| ProcessorError::InvalidInput)?;
     let manifest = read_manifest(manifest)?;
+    let previous = read_optional(previous, MAX_PREVIOUS_BYTES)?;
     let caches = manifest
         .entries
         .into_iter()
@@ -114,9 +122,25 @@ fn process(request: &Path, symbols: &Path, manifest: &Path) -> Result<(), Proces
         })
         .collect::<Option<Vec<_>>>()
         .ok_or(ProcessorError::InvalidInput)?;
-    let result = process_crash_request(request, symbols, &caches, None)
+    let result = process_crash_request(request, symbols, &caches, previous.as_deref())
         .map_err(|_| ProcessorError::Crash)?;
     write_json(&result)
+}
+
+fn read_optional(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, ProcessorError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ProcessorError::InvalidInput),
+    };
+    let mut bytes = Vec::new();
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProcessorError::InvalidInput)?;
+    if u64::try_from(bytes.len()).map_or(true, |size| size > maximum) {
+        return Err(ProcessorError::InvalidInput);
+    }
+    Ok(Some(bytes))
 }
 
 #[derive(Deserialize)]
@@ -164,9 +188,13 @@ fn write_json(value: &impl serde::Serialize) -> Result<(), ProcessorError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs::{self, File},
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use super::valid_cache_name;
+    use super::{MAX_PREVIOUS_BYTES, ProcessorError, read_optional, valid_cache_name};
 
     #[test]
     fn cache_manifest_accepts_only_fixed_leaf_names() {
@@ -175,5 +203,44 @@ mod tests {
         assert!(!valid_cache_name(Path::new("../secret.symcache")));
         assert!(!valid_cache_name(Path::new("C:\\secret.symcache")));
         assert!(!valid_cache_name(Path::new("nested/cache.symcache")));
+    }
+
+    #[test]
+    fn optional_previous_result_is_fixed_and_bounded() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|error| panic!("test clock must be valid: {error}"))
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "faultlane-processor-previous-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)
+            .unwrap_or_else(|error| panic!("test directory must be created: {error}"));
+        let missing = root.join("missing.json");
+        assert!(
+            read_optional(&missing, MAX_PREVIOUS_BYTES)
+                .unwrap_or_else(|error| panic!("missing previous result must be optional: {error}"))
+                .is_none()
+        );
+        let previous = root.join("previous.json");
+        fs::write(&previous, br#"{"schema_version":1}"#)
+            .unwrap_or_else(|error| panic!("previous result must be written: {error}"));
+        assert_eq!(
+            read_optional(&previous, MAX_PREVIOUS_BYTES)
+                .unwrap_or_else(|error| panic!("previous result must be read: {error}"))
+                .as_deref(),
+            Some(br#"{"schema_version":1}"#.as_slice())
+        );
+        let oversized = root.join("oversized.json");
+        File::create(&oversized)
+            .and_then(|file| file.set_len(MAX_PREVIOUS_BYTES + 1))
+            .unwrap_or_else(|error| panic!("oversized result must be created: {error}"));
+        assert!(matches!(
+            read_optional(&oversized, MAX_PREVIOUS_BYTES),
+            Err(ProcessorError::InvalidInput)
+        ));
+        fs::remove_dir_all(&root)
+            .unwrap_or_else(|error| panic!("test directory must be removed: {error}"));
     }
 }

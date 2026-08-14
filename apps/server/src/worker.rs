@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fmt, fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -23,13 +24,18 @@ use crate::{
 };
 
 const LEASE_SECONDS: i64 = 300;
+const REPROCESSING_REQUEST_LEASE_SECONDS: i64 = 60;
 const HEARTBEAT_SECONDS: u64 = 30;
 const POLL_MILLISECONDS: u64 = 250;
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SELECTED_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_RAW_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PREVIOUS_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STORED_RELEASE_CANDIDATES: i64 = 101;
+const MAX_SYMBOL_WAITERS: usize = 4_096;
+const AUTOMATIC_REPROCESSING_BATCH: usize = 100;
+const JOBS_BETWEEN_REPROCESSING_REQUESTS: u32 = 20;
 const SCRATCH_MARKER: &[u8] = b"faultlane-worker-scratch-v1\n";
 
 pub(crate) async fn run() -> Result<(), WorkerStartupError> {
@@ -54,6 +60,8 @@ pub(crate) async fn run() -> Result<(), WorkerStartupError> {
         scratch: Arc::new(scratch),
         instance_id: Arc::from(worker_id),
         grouping_enabled: env::var("FAULTLANE_GROUPING_ENABLED")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+        reprocessing_enabled: env::var("FAULTLANE_REPROCESSING_ENABLED")
             .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
     };
     worker.reconcile_containers().await?;
@@ -93,6 +101,7 @@ struct Worker {
     scratch: Arc<PathBuf>,
     instance_id: Arc<str>,
     grouping_enabled: bool,
+    reprocessing_enabled: bool,
 }
 
 impl Worker {
@@ -101,11 +110,21 @@ impl Worker {
         let mut reconciliation = tokio::time::interval(Duration::from_secs(30));
         reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         reconciliation.tick().await;
+        let mut jobs_since_reprocessing = 0_u32;
         loop {
+            if self.reprocessing_enabled
+                && jobs_since_reprocessing >= JOBS_BETWEEN_REPROCESSING_REQUESTS
+            {
+                if self.schedule_reprocessing_request().await.is_err() {
+                    warn!("reprocessing request scheduling failed");
+                }
+                jobs_since_reprocessing = 0;
+            }
             tokio::select! {
                 result = self.claim() => {
                     match result {
                         Ok(Some(job)) => {
+                            jobs_since_reprocessing = jobs_since_reprocessing.saturating_add(1);
                             let running = job.clone();
                             tokio::select! {
                                 () = self.run_job(running) => {}
@@ -118,7 +137,17 @@ impl Worker {
                                 }
                             }
                         }
-                        Ok(None) => tokio::time::sleep(Duration::from_millis(POLL_MILLISECONDS)).await,
+                        Ok(None) => {
+                            let scheduled = self.reprocessing_enabled
+                                && self.schedule_reprocessing_request().await.unwrap_or_else(|()| {
+                                    warn!("reprocessing request scheduling failed");
+                                    false
+                                });
+                            jobs_since_reprocessing = 0;
+                            if !scheduled {
+                                tokio::time::sleep(Duration::from_millis(POLL_MILLISECONDS)).await;
+                            }
+                        }
                         Err(()) => {
                             warn!("worker claim failed");
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -209,6 +238,94 @@ impl Worker {
 
     async fn claim(&self) -> Result<Option<Job>, ()> {
         claim_job(&self.pool, self.instance_id.as_ref()).await
+    }
+
+    async fn schedule_reprocessing_request(&self) -> Result<bool, ()> {
+        let reconciled = reconcile_reprocessing_event_jobs(&self.pool).await?;
+        let Some(request) =
+            claim_reprocessing_request(&self.pool, self.instance_id.as_ref()).await?
+        else {
+            return Ok(reconciled);
+        };
+        if request.exhausted {
+            finish_reprocessing_schedule_failure(
+                &self.pool,
+                &request,
+                self.instance_id.as_ref(),
+                "reprocessing_schedule_failed",
+            )
+            .await
+            .map_err(|_| ())?;
+            return Ok(true);
+        }
+        if self.expand_reprocessing_request(&request).await.is_err() {
+            finish_reprocessing_schedule_failure(
+                &self.pool,
+                &request,
+                self.instance_id.as_ref(),
+                "reprocessing_schedule_failed",
+            )
+            .await
+            .map_err(|_| ())?;
+        }
+        Ok(true)
+    }
+
+    async fn expand_reprocessing_request(&self, request: &ReprocessingRequest) -> Result<(), ()> {
+        let mut transaction = self.pool.begin().await.map_err(|_| ())?;
+        lock_reprocessing_request(&mut transaction, request, self.instance_id.as_ref())
+            .await
+            .map_err(|_| ())?;
+        let mut candidates = if request.source == "automatic" {
+            automatic_reprocessing_candidates(&mut transaction, request)
+                .await
+                .map_err(|_| ())?
+        } else {
+            manual_reprocessing_candidates(&mut transaction, request)
+                .await
+                .map_err(|_| ())?
+        };
+        let limit = if request.source == "automatic" {
+            AUTOMATIC_REPROCESSING_BATCH
+        } else {
+            usize::try_from(request.request_limit.ok_or(())?).map_err(|_| ())?
+        };
+        let truncated = candidates.len() > limit;
+        candidates.truncate(limit);
+        let event_ids = candidates
+            .iter()
+            .map(|candidate| candidate.event_id.clone())
+            .collect::<Vec<_>>();
+        schedule_reprocessing_events(&mut transaction, request, &event_ids)
+            .await
+            .map_err(|_| ())?;
+        let cursor = candidates
+            .last()
+            .map(|candidate| candidate.event_id.as_str());
+        if request.source == "automatic" && truncated {
+            release_reprocessing_request_page(
+                &mut transaction,
+                request,
+                self.instance_id.as_ref(),
+                cursor,
+            )
+            .await
+            .map_err(|_| ())?;
+        } else {
+            complete_reprocessing_selection(
+                &mut transaction,
+                request,
+                self.instance_id.as_ref(),
+                truncated,
+                truncated.then_some(cursor).flatten(),
+            )
+            .await
+            .map_err(|_| ())?;
+        }
+        refresh_reprocessing_request(&mut transaction, &request.id)
+            .await
+            .map_err(|_| ())?;
+        transaction.commit().await.map_err(|_| ())
     }
 
     async fn run_job(&self, job: Job) {
@@ -450,7 +567,7 @@ impl Worker {
             .as_deref()
             .ok_or(JobError::Deterministic("missing_event"))?;
         let row = sqlx::query(
-            "SELECT e.crash_guid, o.object_key, o.checksum, o.byte_size FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
+            "SELECT e.crash_guid, o.object_key, o.checksum, o.byte_size, r.result AS previous_result FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -482,6 +599,15 @@ impl Worker {
             .map_err(|_| JobError::Transient("scratch_unavailable"))?;
         fs::write(attempt.input().join("symcaches.json"), br#"{"entries":[]}"#)
             .map_err(|_| JobError::Transient("scratch_unavailable"))?;
+        if let Some(previous) = row.get::<Option<Value>, _>("previous_result") {
+            let bytes = serde_json::to_vec(&previous)
+                .map_err(|_| JobError::Deterministic("previous_result_invalid"))?;
+            if bytes.len() > MAX_PREVIOUS_RESULT_BYTES {
+                return Err(JobError::Deterministic("previous_result_too_large"));
+            }
+            fs::write(attempt.input().join("previous.json"), bytes)
+                .map_err(|_| JobError::Transient("scratch_unavailable"))?;
+        }
         let inspection = self
             .run_processor(job, ProcessorOperation::ProcessCrash, &attempt, None)
             .await?;
@@ -816,6 +942,14 @@ impl Worker {
         if session.rows_affected() != 1 {
             return Err(JobError::LostLease);
         }
+        crate::reprocessing::enqueue_artifact_request(
+            &mut transaction,
+            &job.organization_id,
+            &job.project_id,
+            &artifact.manifest_artifact_id,
+        )
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
         complete_job(&mut transaction, job, self.instance_id.as_ref(), None).await?;
         transaction
             .commit()
@@ -950,6 +1084,7 @@ impl Worker {
             .map_err(|_| JobError::Transient("database_unavailable"))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn publish_crash_result(
         &self,
         job: &Job,
@@ -961,6 +1096,11 @@ impl Worker {
     ) -> Result<(), JobError> {
         let (schema_version, processing_version) = processing_versions(&result)?;
         let grouping = grouping_publication(self.grouping_enabled, &result)?;
+        let waiters = if state == "awaiting_symbols" {
+            symbol_waiters(&result, release)?
+        } else {
+            Vec::new()
+        };
         let bytes = serde_json::to_vec(&result)
             .map_err(|_| JobError::Deterministic("processor_output_invalid"))?;
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
@@ -988,6 +1128,24 @@ impl Worker {
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
         record_release_mapping(&mut transaction, job, event_id, release).await?;
+        replace_symbol_waiters(
+            &mut transaction,
+            job,
+            event_id,
+            &stored_id,
+            release,
+            &waiters,
+        )
+        .await?;
+        crate::reprocessing::enqueue_waiter_catchup_requests(
+            &mut transaction,
+            &job.organization_id,
+            &job.project_id,
+            event_id,
+            &stored_id,
+        )
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
         let issue_id = apply_grouping(&mut transaction, job, event_id, existing, &grouping).await?;
         if let Some(issue_id) = issue_id.as_deref()
             && (self.grouping_enabled || existing_grouped)
@@ -995,21 +1153,27 @@ impl Worker {
             recompute_issue(&mut transaction, job, issue_id, self.grouping_enabled).await?;
         }
         let updated = sqlx::query(
-            "UPDATE crash_events SET current_result_id = $4::uuid, processing_state = $5, state_reason = CASE WHEN $5 = 'processed' THEN NULL ELSE $6 END, retryable = false, retry_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+            "UPDATE crash_events SET current_result_id = $4::uuid, processing_state = $5, state_reason = CASE WHEN $5 = 'processed' THEN NULL ELSE $6 END, retryable = false, retry_at = NULL, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $7), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING requested_reprocessing_generation",
         )
         .bind(event_id)
         .bind(&job.organization_id)
         .bind(&job.project_id)
-        .bind(stored_id)
+        .bind(&stored_id)
         .bind(state)
         .bind(reason)
-        .execute(&mut *transaction)
+        .bind(job.target_generation)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(|_| JobError::Transient("database_unavailable"))?;
-        if updated.rows_affected() != 1 {
-            return Err(JobError::LostLease);
+        .map_err(|_| JobError::Transient("database_unavailable"))?
+        .ok_or(JobError::LostLease)?;
+        let requested_generation: i64 = updated.get("requested_reprocessing_generation");
+        complete_reprocessing_request_events(&mut transaction, job, event_id, &stored_id).await?;
+        if requested_generation > job.target_generation {
+            requeue_job_for_new_generation(&mut transaction, job, self.instance_id.as_ref())
+                .await?;
+        } else {
+            complete_job(&mut transaction, job, self.instance_id.as_ref(), None).await?;
         }
-        complete_job(&mut transaction, job, self.instance_id.as_ref(), None).await?;
         transaction
             .commit()
             .await
@@ -1058,6 +1222,11 @@ impl Worker {
         resource: bool,
         dependency: bool,
     ) -> Result<(), JobError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
         let updated = sqlx::query(
             "UPDATE jobs SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = $7, resource_failures = resource_failures + CASE WHEN $8 THEN 1 ELSE 0 END, attempt = attempt - CASE WHEN $9 THEN 1 ELSE 0 END, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
         )
@@ -1070,14 +1239,33 @@ impl Worker {
         .bind(code)
         .bind(resource)
         .bind(dependency)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
-        if updated.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(JobError::LostLease)
+        if updated.rows_affected() != 1 {
+            return Err(JobError::LostLease);
         }
+        if job.target_generation > 0
+            && let Some(event_id) = job.event_id.as_deref()
+        {
+            let request_ids = sqlx::query_scalar::<_, String>(
+                "UPDATE crash_reprocessing_request_events SET state = 'queued' WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state = 'running' RETURNING request_id::text",
+            )
+            .bind(&job.organization_id)
+            .bind(&job.project_id)
+            .bind(event_id)
+            .bind(job.target_generation)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+            for request_id in BTreeSet::from_iter(request_ids) {
+                refresh_reprocessing_request(&mut transaction, &request_id).await?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))
     }
 
     async fn quarantine(&self, job: &Job, code: &'static str) -> Result<(), JobError> {
@@ -1092,6 +1280,7 @@ impl Worker {
         self.finish_failure(job, code, false, false).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn finish_failure(
         &self,
         job: &Job,
@@ -1105,22 +1294,40 @@ impl Worker {
             .await
             .map_err(|_| JobError::Transient("database_unavailable"))?;
         lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
+        let mut requeue_newer_generation = false;
         match job.kind.as_str() {
             "process_crash" => {
                 let updated = sqlx::query(
-                    "UPDATE crash_events SET processing_state = $4, state_reason = $5, retryable = false, retry_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+                    "UPDATE crash_events SET processing_state = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN processing_state ELSE $4 END, state_reason = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN state_reason ELSE $5 END, retryable = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retryable ELSE false END, retry_at = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retry_at ELSE NULL END, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $6), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING requested_reprocessing_generation",
                 )
                 .bind(job.event_id.as_deref().unwrap_or_default())
                 .bind(&job.organization_id)
                 .bind(&job.project_id)
                 .bind(if quarantine { "quarantined" } else { "failed" })
                 .bind(code)
-                .execute(&mut *transaction)
+                .bind(job.target_generation)
+                .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|_| JobError::Transient("database_unavailable"))?;
-                if updated.rows_affected() != 1 {
-                    return Err(JobError::LostLease);
+                .map_err(|_| JobError::Transient("database_unavailable"))?
+                .ok_or(JobError::LostLease)?;
+                let requested_generation: i64 = updated.get("requested_reprocessing_generation");
+                if job.target_generation > 0 {
+                    let request_ids = sqlx::query_scalar::<_, String>(
+                        "UPDATE crash_reprocessing_request_events SET state = 'failed', result_id = NULL, failure_code = $5, completed_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
+                    )
+                    .bind(&job.organization_id)
+                    .bind(&job.project_id)
+                    .bind(job.event_id.as_deref().unwrap_or_default())
+                    .bind(job.target_generation)
+                    .bind(code)
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(|_| JobError::Transient("database_unavailable"))?;
+                    for request_id in BTreeSet::from_iter(request_ids) {
+                        refresh_reprocessing_request(&mut transaction, &request_id).await?;
+                    }
                 }
+                requeue_newer_generation = requested_generation > job.target_generation;
             }
             "index_artifact" => {
                 let session = sqlx::query(
@@ -1168,16 +1375,21 @@ impl Worker {
             }
             _ => return Err(JobError::Deterministic("unknown_job_type")),
         }
-        let terminal = if quarantine { "failed" } else { "dead" };
-        terminal_job(
-            &mut transaction,
-            job,
-            self.instance_id.as_ref(),
-            terminal,
-            code,
-            resource_failure,
-        )
-        .await?;
+        if requeue_newer_generation {
+            requeue_job_for_new_generation(&mut transaction, job, self.instance_id.as_ref())
+                .await?;
+        } else {
+            let terminal = if quarantine { "failed" } else { "dead" };
+            terminal_job(
+                &mut transaction,
+                job,
+                self.instance_id.as_ref(),
+                terminal,
+                code,
+                resource_failure,
+            )
+            .await?;
+        }
         transaction
             .commit()
             .await
@@ -1185,18 +1397,327 @@ impl Worker {
     }
 }
 
-async fn claim_job(pool: &PgPool, worker_id: &str) -> Result<Option<Job>, ()> {
+#[derive(Clone)]
+struct ReprocessingRequest {
+    id: String,
+    organization_id: String,
+    project_id: String,
+    source: String,
+    scope_kind: String,
+    scope_value: Option<String>,
+    request_limit: Option<i32>,
+    input_cursor_event_id: Option<String>,
+    selection_before: time::OffsetDateTime,
+    selection_cursor_event_id: Option<String>,
+    attempt: i32,
+    max_attempt: i32,
+    lease_token: String,
+    exhausted: bool,
+}
+
+struct ReprocessingCandidate {
+    event_id: String,
+}
+
+async fn reconcile_reprocessing_event_jobs(pool: &PgPool) -> Result<bool, ()> {
+    let mut transaction = pool.begin().await.map_err(|_| ())?;
+    let rows = sqlx::query(
+        "WITH candidates AS MATERIALIZED (SELECT x.id, x.request_id, x.event_id FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests r ON r.id = x.request_id AND r.organization_id = x.organization_id AND r.project_id = x.project_id JOIN crash_events e ON e.id = x.event_id AND e.organization_id = x.organization_id AND e.project_id = x.project_id JOIN jobs j ON j.event_id = e.id AND j.organization_id = e.organization_id AND j.project_id = e.project_id AND j.job_type = 'process_crash' WHERE x.state IN ('queued', 'running') AND r.state IN ('running', 'partial', 'failed') AND e.completed_reprocessing_generation < x.generation AND j.state IN ('completed', 'failed', 'dead') ORDER BY x.created_at FOR UPDATE OF x, e, j SKIP LOCKED LIMIT 100), reset_events AS (UPDATE crash_reprocessing_request_events x SET state = 'queued' FROM candidates c WHERE x.id = c.id RETURNING x.request_id, x.event_id), reset_jobs AS (UPDATE jobs j SET state = 'pending', priority = 200, attempt = 0, resource_failures = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = NULL, completed_at = NULL, updated_at = now() FROM (SELECT DISTINCT event_id FROM reset_events) e WHERE j.event_id = e.event_id AND j.job_type = 'process_crash' AND j.state IN ('completed', 'failed', 'dead') RETURNING j.event_id) SELECT DISTINCT request_id::text AS request_id, (SELECT count(*) FROM reset_jobs) AS reset_count FROM reset_events",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|_| ())?;
+    let request_ids = rows
+        .iter()
+        .map(|row| row.get::<String, _>("request_id"))
+        .collect::<BTreeSet<_>>();
+    for request_id in request_ids {
+        refresh_reprocessing_request(&mut transaction, &request_id)
+            .await
+            .map_err(|_| ())?;
+    }
+    let reconciled = rows
+        .first()
+        .is_some_and(|row| row.get::<i64, _>("reset_count") > 0);
+    transaction.commit().await.map_err(|_| ())?;
+    Ok(reconciled)
+}
+
+async fn claim_reprocessing_request(
+    pool: &PgPool,
+    worker_id: &str,
+) -> Result<Option<ReprocessingRequest>, ()> {
     let lease_token = random_uuid().map_err(|_| ())?;
     let row = sqlx::query(
-        "WITH candidate AS (SELECT j.id FROM jobs j JOIN projects p ON p.id = j.project_id AND p.organization_id = j.organization_id WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.project_id = j.project_id AND active.id <> j.id AND active.state = 'leased' AND active.lease_expires_at > now()) ORDER BY j.priority, j.available_at, j.created_at FOR UPDATE OF p, j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token",
+        "WITH candidate AS (SELECT r.id, r.state = 'scheduling' AND r.attempt >= r.max_attempt AS exhausted FROM crash_reprocessing_requests r JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id WHERE (r.state = 'pending' AND r.available_at <= now() AND r.attempt < r.max_attempt) OR (r.state = 'scheduling' AND r.lease_expires_at <= now()) ORDER BY CASE WHEN r.source = 'automatic' THEN 0 ELSE 1 END, r.available_at, r.created_at FOR UPDATE OF p, r SKIP LOCKED LIMIT 1) UPDATE crash_reprocessing_requests r SET state = 'scheduling', attempt = r.attempt + CASE WHEN candidate.exhausted THEN 0 ELSE 1 END, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), updated_at = now(), completed_at = NULL FROM candidate WHERE r.id = candidate.id RETURNING r.id::text AS id, r.organization_id::text AS organization_id, r.project_id::text AS project_id, r.source, r.scope_kind, r.scope_value, r.request_limit, r.input_cursor_event_id::text AS input_cursor_event_id, r.selection_before, r.selection_cursor_event_id::text AS selection_cursor_event_id, r.attempt, r.max_attempt, r.lease_token::text AS lease_token, candidate.exhausted",
+    )
+    .bind(worker_id)
+    .bind(&lease_token)
+    .bind(REPROCESSING_REQUEST_LEASE_SECONDS)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ())?;
+    Ok(row.map(|row| ReprocessingRequest {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        project_id: row.get("project_id"),
+        source: row.get("source"),
+        scope_kind: row.get("scope_kind"),
+        scope_value: row.get("scope_value"),
+        request_limit: row.get("request_limit"),
+        input_cursor_event_id: row.get("input_cursor_event_id"),
+        selection_before: row.get("selection_before"),
+        selection_cursor_event_id: row.get("selection_cursor_event_id"),
+        attempt: row.get("attempt"),
+        max_attempt: row.get("max_attempt"),
+        lease_token: row.get("lease_token"),
+        exhausted: row.get("exhausted"),
+    }))
+}
+
+async fn lock_reprocessing_request(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+    worker_id: &str,
+) -> Result<(), JobError> {
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT id::text FROM crash_reprocessing_requests WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5 AND lease_expires_at > now() FOR UPDATE",
+    )
+    .bind(&request.id)
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(worker_id)
+    .bind(&request.lease_token)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    found.map_or(Err(JobError::LostLease), |_| Ok(()))
+}
+
+async fn automatic_reprocessing_candidates(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+) -> Result<Vec<ReprocessingCandidate>, JobError> {
+    let rows = sqlx::query(
+        "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
+    )
+    .bind(request.scope_value.as_deref().unwrap_or_default())
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(request.selection_before)
+    .bind(&request.selection_cursor_event_id)
+    .bind(i64::try_from(AUTOMATIC_REPROCESSING_BATCH + 1).unwrap_or(i64::MAX))
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    Ok(rows
+        .iter()
+        .map(|row| ReprocessingCandidate {
+            event_id: row.get("event_id"),
+        })
+        .collect())
+}
+
+async fn manual_reprocessing_candidates(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+) -> Result<Vec<ReprocessingCandidate>, JobError> {
+    let limit = request
+        .request_limit
+        .ok_or(JobError::Deterministic("reprocessing_request_invalid"))?;
+    let rows = sqlx::query(
+        "SELECT e.id::text AS event_id FROM crash_events e LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.received_at <= $3 AND ($4::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id::text = $4 AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) AND (($5 = 'event' AND e.id::text = $6) OR ($5 = 'issue' AND e.issue_id::text = $6) OR ($5 = 'release' AND e.release_id::text = $6) OR ($5 = 'project') OR ($5 = 'parser_version' AND r.result #>> '{current,parser_version}' = $6) OR ($5 = 'symbolicator_version' AND r.result #>> '{current,symbolication,symbolicator_version}' = $6) OR ($5 = 'fingerprint_version' AND e.fingerprint_version::text = $6)) ORDER BY e.received_at, e.id LIMIT $7",
+    )
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(request.selection_before)
+    .bind(&request.input_cursor_event_id)
+    .bind(&request.scope_kind)
+    .bind(request.scope_value.as_deref())
+    .bind(i64::from(limit) + 1)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    Ok(rows
+        .iter()
+        .map(|row| ReprocessingCandidate {
+            event_id: row.get("event_id"),
+        })
+        .collect())
+}
+
+async fn schedule_reprocessing_events(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+    event_ids: &[String],
+) -> Result<(), JobError> {
+    let locked_jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT j.id FROM jobs j JOIN unnest($3::text[]) selected(event_id) ON selected.event_id::uuid = j.event_id WHERE j.organization_id::text = $1 AND j.project_id::text = $2 AND j.job_type = 'process_crash' ORDER BY j.id FOR UPDATE OF j) locked",
+    )
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(event_ids)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if locked_jobs
+        != i64::try_from(event_ids.len())
+            .map_err(|_| JobError::Deterministic("reprocessing_request_invalid"))?
+    {
+        return Err(JobError::Deterministic("event_job_missing"));
+    }
+    let row = sqlx::query(
+        "WITH selected AS (SELECT unnest($4::text[])::uuid AS event_id), eligible AS MATERIALIZED (SELECT e.id, e.current_result_id, CASE WHEN j.state = 'leased' THEN CASE WHEN e.requested_reprocessing_generation <= COALESCE((SELECT max(x.generation) FROM crash_reprocessing_request_events x WHERE x.organization_id = e.organization_id AND x.project_id = e.project_id AND x.event_id = e.id AND x.state = 'running'), 0) THEN e.requested_reprocessing_generation + 1 ELSE e.requested_reprocessing_generation END WHEN e.requested_reprocessing_generation > e.completed_reprocessing_generation THEN e.requested_reprocessing_generation ELSE e.requested_reprocessing_generation + 1 END AS generation FROM crash_events e JOIN selected s ON s.event_id = e.id JOIN jobs j ON j.event_id = e.id AND j.organization_id = e.organization_id AND j.project_id = e.project_id AND j.job_type = 'process_crash' WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND NOT EXISTS (SELECT 1 FROM crash_reprocessing_request_events x WHERE x.request_id::text = $3 AND x.event_id = e.id) FOR UPDATE OF e), advanced AS (UPDATE crash_events e SET requested_reprocessing_generation = c.generation, updated_at = now() FROM eligible c WHERE e.id = c.id AND e.organization_id::text = $1 AND e.project_id::text = $2 RETURNING e.id, e.current_result_id, e.requested_reprocessing_generation), inserted AS (INSERT INTO crash_reprocessing_request_events (organization_id, project_id, request_id, event_id, generation, previous_result_id) SELECT $1::uuid, $2::uuid, $3::uuid, a.id, a.requested_reprocessing_generation, a.current_result_id FROM advanced a ON CONFLICT (request_id, event_id) DO NOTHING RETURNING event_id), reactivated AS (UPDATE jobs j SET state = CASE WHEN j.state = 'leased' THEN j.state ELSE 'pending' END, priority = CASE WHEN j.state IN ('completed', 'failed', 'dead') THEN 200 ELSE j.priority END, attempt = CASE WHEN j.state = 'leased' THEN j.attempt ELSE 0 END, resource_failures = CASE WHEN j.state = 'leased' THEN j.resource_failures ELSE 0 END, available_at = CASE WHEN j.state = 'leased' THEN j.available_at ELSE now() END, lease_owner = CASE WHEN j.state = 'leased' THEN j.lease_owner ELSE NULL END, lease_token = CASE WHEN j.state = 'leased' THEN j.lease_token ELSE NULL END, lease_expires_at = CASE WHEN j.state = 'leased' THEN j.lease_expires_at ELSE NULL END, heartbeat_at = CASE WHEN j.state = 'leased' THEN j.heartbeat_at ELSE NULL END, failure_code = CASE WHEN j.state = 'leased' THEN j.failure_code ELSE NULL END, completed_at = CASE WHEN j.state = 'leased' THEN j.completed_at ELSE NULL END, updated_at = now() FROM inserted i WHERE j.event_id = i.event_id AND j.organization_id::text = $1 AND j.project_id::text = $2 AND j.job_type = 'process_crash' RETURNING j.event_id) SELECT (SELECT count(*) FROM inserted) AS inserted_count, (SELECT count(*) FROM reactivated) AS reactivated_count",
+    )
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(&request.id)
+    .bind(event_ids)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    let inserted: i64 = row.get("inserted_count");
+    let reactivated: i64 = row.get("reactivated_count");
+    if inserted == reactivated {
+        Ok(())
+    } else {
+        Err(JobError::Deterministic("event_job_missing"))
+    }
+}
+
+async fn release_reprocessing_request_page(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+    worker_id: &str,
+    cursor: Option<&str>,
+) -> Result<(), JobError> {
+    let updated = sqlx::query(
+        "UPDATE crash_reprocessing_requests SET state = 'pending', selection_cursor_event_id = $6::uuid, attempt = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5",
+    )
+    .bind(&request.id)
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(worker_id)
+    .bind(&request.lease_token)
+    .bind(cursor)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::LostLease)
+    }
+}
+
+async fn complete_reprocessing_selection(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &ReprocessingRequest,
+    worker_id: &str,
+    truncated: bool,
+    next_cursor: Option<&str>,
+) -> Result<(), JobError> {
+    let updated = sqlx::query(
+        "UPDATE crash_reprocessing_requests SET state = 'running', selection_complete = true, selection_truncated = $6, next_cursor_event_id = $7::uuid, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5",
+    )
+    .bind(&request.id)
+    .bind(&request.organization_id)
+    .bind(&request.project_id)
+    .bind(worker_id)
+    .bind(&request.lease_token)
+    .bind(truncated)
+    .bind(next_cursor)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::LostLease)
+    }
+}
+
+async fn refresh_reprocessing_request(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: &str,
+) -> Result<(), JobError> {
+    let updated = sqlx::query(
+        "WITH counts AS (SELECT count(*) AS selected_count, count(*) FILTER (WHERE state = 'queued') AS queued_count, count(*) FILTER (WHERE state = 'running') AS running_count, count(*) FILTER (WHERE state = 'completed') AS completed_count, count(*) FILTER (WHERE state = 'failed') AS failed_count FROM crash_reprocessing_request_events WHERE request_id::text = $1), desired AS (SELECT r.id, c.*, CASE WHEN NOT r.selection_complete THEN r.state WHEN r.failure_code IS NOT NULL AND c.completed_count > 0 THEN 'partial' WHEN r.failure_code IS NOT NULL THEN 'failed' WHEN c.selected_count = 0 THEN 'completed' WHEN c.queued_count + c.running_count > 0 THEN 'running' WHEN c.completed_count > 0 AND c.failed_count > 0 THEN 'partial' WHEN c.failed_count > 0 THEN 'failed' ELSE 'completed' END AS next_state FROM crash_reprocessing_requests r CROSS JOIN counts c WHERE r.id::text = $1) UPDATE crash_reprocessing_requests r SET state = d.next_state, selected_count = d.selected_count, queued_count = d.queued_count, running_count = d.running_count, completed_count = d.completed_count, failed_count = d.failed_count, completed_at = CASE WHEN d.next_state IN ('completed', 'partial', 'failed') THEN COALESCE(r.completed_at, now()) ELSE NULL END, updated_at = now() FROM desired d WHERE r.id = d.id",
+    )
+    .bind(request_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::Deterministic("reprocessing_request_missing"))
+    }
+}
+
+async fn finish_reprocessing_schedule_failure(
+    pool: &PgPool,
+    request: &ReprocessingRequest,
+    worker_id: &str,
+    code: &'static str,
+) -> Result<(), JobError> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+    lock_reprocessing_request(&mut transaction, request, worker_id).await?;
+    if request.attempt < request.max_attempt {
+        let exponent = u32::try_from(request.attempt.saturating_sub(1))
+            .unwrap_or(6)
+            .min(6);
+        let seconds = i64::from(1_u32 << exponent).min(60);
+        sqlx::query(
+            "UPDATE crash_reprocessing_requests SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $7, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lease_owner = $4 AND lease_token::text = $5",
+        )
+        .bind(&request.id)
+        .bind(&request.organization_id)
+        .bind(&request.project_id)
+        .bind(worker_id)
+        .bind(&request.lease_token)
+        .bind(seconds)
+        .bind(code)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+    } else {
+        sqlx::query(
+            "UPDATE crash_reprocessing_requests SET state = 'failed', selection_complete = true, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $6, completed_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lease_owner = $4 AND lease_token::text = $5",
+        )
+        .bind(&request.id)
+        .bind(&request.organization_id)
+        .bind(&request.project_id)
+        .bind(worker_id)
+        .bind(&request.lease_token)
+        .bind(code)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+        refresh_reprocessing_request(&mut transaction, &request.id).await?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))
+}
+
+async fn claim_job(pool: &PgPool, worker_id: &str) -> Result<Option<Job>, ()> {
+    let lease_token = random_uuid().map_err(|_| ())?;
+    let mut transaction = pool.begin().await.map_err(|_| ())?;
+    let row = sqlx::query(
+        "WITH candidate AS (SELECT j.id FROM jobs j JOIN projects p ON p.id = j.project_id AND p.organization_id = j.organization_id WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.project_id = j.project_id AND active.id <> j.id AND active.state = 'leased' AND active.lease_expires_at > now()) ORDER BY j.priority, j.available_at, j.created_at FOR UPDATE OF p, j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token, COALESCE((SELECT e.requested_reprocessing_generation FROM crash_events e WHERE e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id), 0) AS target_generation",
     )
     .bind(worker_id)
     .bind(&lease_token)
     .bind(LEASE_SECONDS)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| ())?;
-    Ok(row.map(|row| Job {
+    let job = row.map(|row| Job {
         id: row.get("id"),
         organization_id: row.get("organization_id"),
         project_id: row.get("project_id"),
@@ -1208,7 +1729,15 @@ async fn claim_job(pool: &PgPool, worker_id: &str) -> Result<Option<Job>, ()> {
         max_attempt: row.get("max_attempt"),
         resource_failures: row.get("resource_failures"),
         lease_token: row.get("lease_token"),
-    }))
+        target_generation: row.get("target_generation"),
+    });
+    if let Some(job) = job.as_ref() {
+        mark_reprocessing_events_running(&mut transaction, job)
+            .await
+            .map_err(|_| ())?;
+    }
+    transaction.commit().await.map_err(|_| ())?;
+    Ok(job)
 }
 
 #[derive(Clone)]
@@ -1224,6 +1753,33 @@ struct Job {
     max_attempt: i32,
     resource_failures: i32,
     lease_token: String,
+    target_generation: i64,
+}
+
+async fn mark_reprocessing_events_running(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+) -> Result<(), JobError> {
+    if job.target_generation == 0 {
+        return Ok(());
+    }
+    let Some(event_id) = job.event_id.as_deref() else {
+        return Ok(());
+    };
+    let request_ids = sqlx::query_scalar::<_, String>(
+        "UPDATE crash_reprocessing_request_events SET state = 'running', started_at = COALESCE(started_at, now()) WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state = 'queued' RETURNING request_id::text",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(event_id)
+    .bind(job.target_generation)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    for request_id in BTreeSet::from_iter(request_ids) {
+        refresh_reprocessing_request(transaction, &request_id).await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1413,6 +1969,15 @@ struct ModuleIdentity {
     module: String,
     debug_id: Option<String>,
     code_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SymbolWaiter {
+    required_artifact: &'static str,
+    module_name: String,
+    architecture: String,
+    debug_id: String,
+    code_id: String,
 }
 
 struct SelectedArtifact {
@@ -1923,6 +2488,55 @@ async fn complete_job(
     }
 }
 
+async fn complete_reprocessing_request_events(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+    result_id: &str,
+) -> Result<(), JobError> {
+    if job.target_generation == 0 {
+        return Ok(());
+    }
+    let request_ids = sqlx::query_scalar::<_, String>(
+        "UPDATE crash_reprocessing_request_events SET state = 'completed', result_id = $5::uuid, failure_code = NULL, completed_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(event_id)
+    .bind(job.target_generation)
+    .bind(result_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    for request_id in BTreeSet::from_iter(request_ids) {
+        refresh_reprocessing_request(transaction, &request_id).await?;
+    }
+    Ok(())
+}
+
+async fn requeue_job_for_new_generation(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    worker_id: &str,
+) -> Result<(), JobError> {
+    let updated = sqlx::query(
+        "UPDATE jobs SET state = 'pending', priority = 200, attempt = 0, resource_failures = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
+    )
+    .bind(&job.id)
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(worker_id)
+    .bind(&job.lease_token)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(JobError::LostLease)
+    }
+}
+
 async fn terminal_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job: &Job,
@@ -1976,6 +2590,118 @@ fn processing_modules(result: &Value) -> Result<Vec<ModuleIdentity>, JobError> {
             })
         })
         .collect()
+}
+
+fn symbol_waiters(
+    result: &Value,
+    release: &ReleaseResolution,
+) -> Result<Vec<SymbolWaiter>, JobError> {
+    if release.matched_id().is_none() {
+        return Ok(Vec::new());
+    }
+    let symbolication = result
+        .pointer("/current/symbolication")
+        .and_then(Value::as_object)
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    let architecture = symbolication
+        .get("architecture")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    let modules = symbolication
+        .get("modules")
+        .and_then(Value::as_array)
+        .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+    let mut waiters = BTreeSet::new();
+    for module in modules {
+        let Some(module_name) = module
+            .get("module")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+        else {
+            continue;
+        };
+        let Some(debug_id) = module
+            .get("debug_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+        else {
+            continue;
+        };
+        let code_id = module
+            .get("code_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128);
+        let status = module
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or(JobError::Deterministic("processor_output_invalid"))?;
+        if matches!(status, "missing_pdb" | "mismatched") {
+            waiters.insert(SymbolWaiter {
+                required_artifact: "pdb",
+                module_name: module_name.to_ascii_lowercase(),
+                architecture: architecture.to_ascii_lowercase(),
+                debug_id: debug_id.to_ascii_uppercase(),
+                code_id: String::new(),
+            });
+        }
+        if matches!(status, "missing_pe" | "mismatched")
+            && let Some(code_id) = code_id
+        {
+            waiters.insert(SymbolWaiter {
+                required_artifact: "pe",
+                module_name: module_name.to_ascii_lowercase(),
+                architecture: architecture.to_ascii_lowercase(),
+                debug_id: debug_id.to_ascii_uppercase(),
+                code_id: code_id.to_ascii_uppercase(),
+            });
+        }
+        if waiters.len() > MAX_SYMBOL_WAITERS {
+            return Err(JobError::Deterministic("processor_output_invalid"));
+        }
+    }
+    Ok(waiters.into_iter().collect())
+}
+
+async fn replace_symbol_waiters(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+    event_id: &str,
+    result_id: &str,
+    release: &ReleaseResolution,
+    waiters: &[SymbolWaiter],
+) -> Result<(), JobError> {
+    sqlx::query(
+        "DELETE FROM crash_symbol_waiters WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+    )
+    .bind(&job.organization_id)
+    .bind(&job.project_id)
+    .bind(event_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobError::Transient("database_unavailable"))?;
+    let Some(release_id) = release.matched_id() else {
+        return Ok(());
+    };
+    for waiter in waiters {
+        sqlx::query(
+            "INSERT INTO crash_symbol_waiters (organization_id, project_id, event_id, result_id, release_id, required_artifact, module_name, architecture, debug_id, code_id) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
+        )
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .bind(event_id)
+        .bind(result_id)
+        .bind(release_id)
+        .bind(waiter.required_artifact)
+        .bind(&waiter.module_name)
+        .bind(&waiter.architecture)
+        .bind(&waiter.debug_id)
+        .bind(&waiter.code_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?;
+    }
+    Ok(())
 }
 
 fn release_lookup(result: &Value) -> Result<Option<ReleaseLookup>, JobError> {
@@ -2669,6 +3395,7 @@ mod tests {
             scratch: Arc::new(root.clone()),
             instance_id: Arc::from("reconciliation-test"),
             grouping_enabled: false,
+            reprocessing_enabled: false,
         };
         worker
             .reconcile_attempt_directories()
@@ -2715,6 +3442,55 @@ mod tests {
             ..artifact
         };
         assert!(!selected_artifact_size_valid(&[oversized]));
+    }
+
+    #[test]
+    fn symbol_waiters_require_exact_bounded_identities_and_one_release() {
+        let mut result = processing_result("UECC-Windows-Waiters", "1.0.0", "CrashFixture()");
+        result["current"]["symbolication"]["modules"][0]["status"] = json!("mismatched");
+        result["current"]["symbolication"]["modules"][0]["module"] = json!("GAME.EXE");
+        result["current"]["symbolication"]["modules"][0]["debug_id"] = json!("debug-a");
+        result["current"]["symbolication"]["modules"][0]["code_id"] = json!("code-a");
+        let matched = release_resolution(
+            "1.0.0",
+            vec!["11111111-1111-4111-8111-111111111111".to_owned()],
+        );
+        let waiters = super::symbol_waiters(&result, &matched)
+            .unwrap_or_else(|error| panic!("waiters must parse: {error:?}"));
+        assert_eq!(waiters.len(), 2);
+        assert_eq!(waiters[0].architecture, "x86_64");
+        assert_eq!(waiters[0].debug_id, "DEBUG-A");
+        assert_eq!(waiters[0].module_name, "game.exe");
+        assert!(
+            waiters
+                .iter()
+                .any(|waiter| { waiter.required_artifact == "pe" && waiter.code_id == "CODE-A" })
+        );
+        assert!(
+            waiters
+                .iter()
+                .any(|waiter| { waiter.required_artifact == "pdb" && waiter.code_id.is_empty() })
+        );
+
+        let ambiguous = release_resolution(
+            "1.0.0",
+            vec![
+                "11111111-1111-4111-8111-111111111111".to_owned(),
+                "22222222-2222-4222-8222-222222222222".to_owned(),
+            ],
+        );
+        assert!(
+            super::symbol_waiters(&result, &ambiguous)
+                .unwrap_or_else(|error| panic!("ambiguous result must parse: {error:?}"))
+                .is_empty()
+        );
+        result["current"]["symbolication"]["modules"][0]["status"] = json!("missing_pe");
+        result["current"]["symbolication"]["modules"][0]["code_id"] = Value::Null;
+        assert!(
+            super::symbol_waiters(&result, &matched)
+                .unwrap_or_else(|error| panic!("incomplete identity must parse: {error:?}"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2846,7 +3622,7 @@ mod tests {
         let lease_token =
             random_uuid().unwrap_or_else(|error| panic!("lease token must generate: {error}"));
         let row = sqlx::query(
-            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token",
+            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token, COALESCE((SELECT requested_reprocessing_generation FROM crash_events WHERE id = jobs.event_id), 0) AS target_generation",
         )
         .bind(job_id)
         .bind(owner)
@@ -2866,6 +3642,7 @@ mod tests {
             max_attempt: row.get("max_attempt"),
             resource_failures: row.get("resource_failures"),
             lease_token: row.get("lease_token"),
+            target_generation: row.get("target_generation"),
         }
     }
 
@@ -2877,7 +3654,104 @@ mod tests {
             scratch: Arc::new(env::temp_dir()),
             instance_id: Arc::from(owner.to_owned()),
             grouping_enabled,
+            reprocessing_enabled: true,
         }
+    }
+
+    struct TestScope {
+        user: String,
+        organization: String,
+        project: String,
+    }
+
+    async fn insert_test_scope(pool: &PgPool, subject: &str, slug: &str) -> TestScope {
+        let user_id: String = sqlx::query_scalar(
+            "INSERT INTO users (bootstrap_subject, email) VALUES ($1, $2) RETURNING id::text",
+        )
+        .bind(subject)
+        .bind(format!("{slug}@example.com"))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("test user must insert: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id::text",
+        )
+        .bind(slug)
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("test organization must insert: {error}"));
+        sqlx::query(
+            "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1::uuid, $2::uuid, 'owner')",
+        )
+        .bind(&organization_id)
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|error| panic!("test membership must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, $2, $2) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("test project must insert: {error}"));
+        TestScope {
+            user: user_id,
+            organization: organization_id,
+            project: project_id,
+        }
+    }
+
+    async fn insert_manual_reprocessing_request(
+        pool: &PgPool,
+        organization_id: &str,
+        project_id: &str,
+        user_id: &str,
+        scope_kind: &str,
+        scope_value: Option<&str>,
+        nonce: &str,
+    ) -> String {
+        let digest = Sha256::digest(format!("manual-request-{nonce}")).to_vec();
+        sqlx::query_scalar(
+            "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, requested_by_user_id, request_limit) VALUES ($1::uuid, $2::uuid, 'manual', $3, $4, $5, $5, $6::uuid, 1) RETURNING id::text",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .bind(scope_kind)
+        .bind(scope_value)
+        .bind(digest)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("manual request must insert: {error}"))
+    }
+
+    async fn insert_manual_reprocessing_page(
+        pool: &PgPool,
+        scope: &TestScope,
+        scope_kind: &str,
+        scope_value: Option<&str>,
+        nonce: &str,
+        limit: i32,
+        cursor: Option<&str>,
+    ) -> String {
+        let digest = Sha256::digest(format!("manual-page-{nonce}")).to_vec();
+        sqlx::query_scalar(
+            "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, requested_by_user_id, request_limit, input_cursor_event_id) VALUES ($1::uuid, $2::uuid, 'manual', $3, $4, $5, $5, $6::uuid, $7, $8::uuid) RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(scope_kind)
+        .bind(scope_value)
+        .bind(digest)
+        .bind(&scope.user)
+        .bind(limit)
+        .bind(cursor)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("manual page must insert: {error}"))
     }
 
     fn processing_result(crash_guid: &str, version: &str, function: &str) -> Value {
@@ -3844,6 +4718,7 @@ mod tests {
             scratch: Arc::new(env::temp_dir()),
             instance_id: Arc::from("worker-resource"),
             grouping_enabled: false,
+            reprocessing_enabled: true,
         };
         let first = claim_job(&pool, "worker-resource")
             .await
@@ -4009,5 +4884,1056 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("failed event must load: {error}"));
         assert_eq!(failed_state, "failed");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn exact_symbol_waiters_reprocess_one_event_without_losing_history_when_configured() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let user_id: String = sqlx::query_scalar(
+            "INSERT INTO users (bootstrap_subject, email) VALUES ('local-bootstrap', 'reprocessing@example.com') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("user must insert: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ('Reprocessing test', 'reprocessing-test') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("organization must insert: {error}"));
+        sqlx::query(
+            "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1::uuid, $2::uuid, 'owner')",
+        )
+        .bind(&organization_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("membership must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Game', 'game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project must insert: {error}"));
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '1.0.0', 'windows', 'x86_64', 'Shipping', '2026-01-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release must insert: {error}"));
+        let token_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'waiter') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&user_id)
+        .bind(Sha256::digest(b"reprocessing-token").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("upload token must insert: {error}"));
+        let job_id = insert_event_job(&pool, &organization_id, &project_id, "reprocessing").await;
+        let event_id: String =
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("event ID must load: {error}"));
+        let raw_object_id: String =
+            sqlx::query_scalar("SELECT raw_object_id::text FROM crash_events WHERE id::text = $1")
+                .bind(&event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("raw object ID must load: {error}"));
+        let worker = publication_worker(pool.clone(), "reprocessing-worker", false);
+        let release = release_resolution("1.0.0", vec![release_id.clone()]);
+        let mut partial =
+            processing_result("UECC-Windows-Reprocessing-1", "1.0.0", "0x0000000140001000");
+        partial["current"]["symbolication"]["modules"][0]["status"] = json!("missing_pdb");
+        partial["current"]["symbolication"]["modules"][0]["pdb"] = Value::Null;
+        partial["current"]["symbolication"]["threads"][0]["frames"][0]["symbol_status"] =
+            json!("missing_pdb");
+        partial["current"]["symbolication"]["threads"][0]["frames"][0]["function"] = Value::Null;
+        partial["current"]["symbolication"]["threads"][0]["frames"][0]["source_file"] = Value::Null;
+        partial["current"]["symbolication"]["threads"][0]["frames"][0]["source_line"] = Value::Null;
+        let initial = lease_exact_job(&pool, &job_id, worker.instance_id.as_ref()).await;
+        worker
+            .publish_crash_result(
+                &initial,
+                &event_id,
+                partial.clone(),
+                "awaiting_symbols",
+                "matching_symbols_missing",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("partial result must publish: {error:?}"));
+        let waiter_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id::text = $1 AND release_id::text = $2 AND required_artifact = 'pdb' AND debug_id = 'DEBUG-A'",
+        )
+        .bind(&event_id)
+        .bind(&release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("waiter count must load: {error}"));
+        assert_eq!(waiter_count, 1);
+
+        let manifest_id: String = sqlx::query_scalar(
+            "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 10, 'pdb', 'Game.pdb', 'x86_64', 'DEBUG-A', 'Game.pdb', '0.1.0', 'available', now()) RETURNING id::text",
+        )
+        .bind(&release_id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&user_id)
+        .bind(&token_id)
+        .bind(Sha256::digest(b"matching-pdb").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("manifest must insert: {error}"));
+        let mut transaction = pool
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("request transaction must begin: {error}"));
+        crate::reprocessing::enqueue_artifact_request(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &manifest_id,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("automatic request must enqueue: {error}"));
+        crate::reprocessing::enqueue_artifact_request(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &manifest_id,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("duplicate request must be idempotent: {error}"));
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("request transaction must commit: {error}"));
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("request must schedule"))
+        );
+        let scheduled = sqlx::query(
+            "SELECT e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state, j.priority, r.state AS request_state, r.selected_count, r.queued_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("scheduled state must load: {error}"));
+        assert_eq!(
+            scheduled.get::<i64, _>("requested_reprocessing_generation"),
+            1
+        );
+        assert_eq!(
+            scheduled.get::<i64, _>("completed_reprocessing_generation"),
+            0
+        );
+        assert_eq!(scheduled.get::<String, _>("job_state"), "pending");
+        assert_eq!(scheduled.get::<i16, _>("priority"), 200);
+        assert_eq!(scheduled.get::<String, _>("request_state"), "running");
+        assert_eq!(scheduled.get::<i64, _>("selected_count"), 1);
+        assert_eq!(scheduled.get::<i64, _>("queued_count"), 1);
+
+        let reprocessing_job = claim_job(&pool, worker.instance_id.as_ref())
+            .await
+            .unwrap_or_else(|()| panic!("event job claim must succeed"))
+            .unwrap_or_else(|| panic!("event job must be claimable"));
+        assert_eq!(reprocessing_job.target_generation, 1);
+        let running_count: i64 =
+            sqlx::query_scalar("SELECT running_count FROM crash_reprocessing_requests LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("running progress must load: {error}"));
+        assert_eq!(running_count, 1);
+        let mut resolved =
+            processing_result("UECC-Windows-Reprocessing-1", "1.0.0", "CrashFixture()");
+        resolved["history"] = json!([partial["current"].clone()]);
+        worker
+            .publish_crash_result(
+                &reprocessing_job,
+                &event_id,
+                resolved,
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("resolved result must publish: {error:?}"));
+        let completed = sqlx::query(
+            "SELECT e.processing_state, e.raw_object_id::text AS raw_object_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, jsonb_array_length(r.result->'history') AS history_count, j.state AS job_state, q.state AS request_state, q.completed_count, q.failed_count FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("completed state must load: {error}"));
+        assert_eq!(completed.get::<String, _>("processing_state"), "processed");
+        assert_eq!(completed.get::<String, _>("raw_object_id"), raw_object_id);
+        assert_eq!(
+            completed.get::<i64, _>("requested_reprocessing_generation"),
+            1
+        );
+        assert_eq!(
+            completed.get::<i64, _>("completed_reprocessing_generation"),
+            1
+        );
+        assert_eq!(completed.get::<i32, _>("history_count"), 1);
+        assert_eq!(completed.get::<String, _>("job_state"), "completed");
+        assert_eq!(completed.get::<String, _>("request_state"), "completed");
+        assert_eq!(completed.get::<i64, _>("completed_count"), 1);
+        assert_eq!(completed.get::<i64, _>("failed_count"), 0);
+        let retained_results: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("result history must load: {error}"));
+        assert_eq!(retained_results, 2);
+        let remaining_waiters: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("remaining waiters must load: {error}"));
+        assert_eq!(remaining_waiters, 0);
+
+        let mismatch_manifest: String = sqlx::query_scalar(
+            "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 11, 'pdb', 'Other.pdb', 'x86_64', 'DEBUG-B', 'Other.pdb', '0.1.0', 'available', now()) RETURNING id::text",
+        )
+        .bind(&release_id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&user_id)
+        .bind(&token_id)
+        .bind(Sha256::digest(b"mismatch-pdb").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("mismatch manifest must insert: {error}"));
+        let mut transaction = pool
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("mismatch transaction must begin: {error}"));
+        crate::reprocessing::enqueue_artifact_request(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &mismatch_manifest,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("mismatch request must enqueue: {error}"));
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("mismatch transaction must commit: {error}"));
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("mismatch request must schedule"))
+        );
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("generation must load: {error}"));
+        assert_eq!(generation, 1);
+        let request_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM crash_reprocessing_requests")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("request count must load: {error}"));
+        assert_eq!(request_count, 2);
+        let zero_match_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE state = 'completed' AND selected_count = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("zero match count must load: {error}"));
+        assert_eq!(zero_match_count, 1);
+
+        let catchup_job_id =
+            insert_event_job(&pool, &organization_id, &project_id, "reprocessing-catchup").await;
+        let catchup_event_id: String =
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+                .bind(&catchup_job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("catch-up event ID must load: {error}"));
+        let catchup_job =
+            lease_exact_job(&pool, &catchup_job_id, worker.instance_id.as_ref()).await;
+        let mut late_partial = processing_result(
+            "UECC-Windows-Reprocessing-Catchup",
+            "1.0.0",
+            "0x0000000140001000",
+        );
+        late_partial["current"]["symbolication"]["modules"][0]["status"] = json!("missing_pdb");
+        late_partial["current"]["symbolication"]["modules"][0]["pdb"] = Value::Null;
+        late_partial["current"]["symbolication"]["threads"][0]["frames"][0]["symbol_status"] =
+            json!("missing_pdb");
+        late_partial["current"]["symbolication"]["threads"][0]["frames"][0]["function"] =
+            Value::Null;
+        late_partial["current"]["symbolication"]["threads"][0]["frames"][0]["source_file"] =
+            Value::Null;
+        late_partial["current"]["symbolication"]["threads"][0]["frames"][0]["source_line"] =
+            Value::Null;
+        worker
+            .publish_crash_result(
+                &catchup_job,
+                &catchup_event_id,
+                late_partial,
+                "awaiting_symbols",
+                "matching_symbols_missing",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("late partial result must publish: {error:?}"));
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("catch-up request must schedule"))
+        );
+        let catchup = sqlx::query(
+            "SELECT e.requested_reprocessing_generation, r.state, r.selected_count FROM crash_events e JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id::text = $1 AND r.scope_value = $2",
+        )
+        .bind(&catchup_event_id)
+        .bind(&manifest_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("catch-up state must load: {error}"));
+        assert_eq!(
+            catchup.get::<i64, _>("requested_reprocessing_generation"),
+            1
+        );
+        assert_eq!(catchup.get::<String, _>("state"), "running");
+        assert_eq!(catchup.get::<i64, _>("selected_count"), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn concurrent_reprocessing_coalesces_and_failure_keeps_the_current_result_when_configured()
+     {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let user_id: String = sqlx::query_scalar(
+            "INSERT INTO users (bootstrap_subject, email) VALUES ('local-bootstrap', 'coalescing@example.com') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("user must insert: {error}"));
+        let organization_id: String = sqlx::query_scalar(
+            "INSERT INTO organizations (name, slug) VALUES ('Coalescing test', 'coalescing-test') RETURNING id::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("organization must insert: {error}"));
+        sqlx::query(
+            "INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ($1::uuid, $2::uuid, 'owner')",
+        )
+        .bind(&organization_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("membership must insert: {error}"));
+        let project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Game', 'game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project must insert: {error}"));
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '2.0.0', 'windows', 'x86_64', 'Shipping', '2026-02-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release must insert: {error}"));
+        let job_id = insert_event_job(&pool, &organization_id, &project_id, "coalescing").await;
+        let event_id: String =
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("event ID must load: {error}"));
+        let worker = publication_worker(pool.clone(), "coalescing-worker", false);
+        let release = release_resolution("2.0.0", vec![release_id]);
+        let initial_job = lease_exact_job(&pool, &job_id, worker.instance_id.as_ref()).await;
+        worker
+            .publish_crash_result(
+                &initial_job,
+                &event_id,
+                processing_result("UECC-Windows-Coalescing-1", "2.0.0", "Initial()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("initial result must publish: {error:?}"));
+        let initial = sqlx::query(
+            "SELECT current_result_id::text AS result_id, raw_object_id::text AS raw_object_id FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("initial event state must load: {error}"));
+        let initial_result: String = initial.get("result_id");
+        let raw_object_id: String = initial.get("raw_object_id");
+
+        let first_request = insert_manual_reprocessing_request(
+            &pool,
+            &organization_id,
+            &project_id,
+            &user_id,
+            "event",
+            Some(&event_id),
+            "first",
+        )
+        .await;
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("first request must schedule"))
+        );
+        let first_job = claim_job(&pool, worker.instance_id.as_ref())
+            .await
+            .unwrap_or_else(|()| panic!("first generation must claim"))
+            .unwrap_or_else(|| panic!("first generation must exist"));
+        assert_eq!(first_job.target_generation, 1);
+
+        let second_request = insert_manual_reprocessing_request(
+            &pool,
+            &organization_id,
+            &project_id,
+            &user_id,
+            "event",
+            Some(&event_id),
+            "second",
+        )
+        .await;
+        let third_request = insert_manual_reprocessing_request(
+            &pool,
+            &organization_id,
+            &project_id,
+            &user_id,
+            "event",
+            Some(&event_id),
+            "third",
+        )
+        .await;
+        for _ in 0..2 {
+            assert!(
+                worker
+                    .schedule_reprocessing_request()
+                    .await
+                    .unwrap_or_else(|()| panic!("concurrent request must schedule"))
+            );
+        }
+        let generations = sqlx::query(
+            "SELECT request_id::text AS request_id, generation FROM crash_reprocessing_request_events WHERE event_id::text = $1 ORDER BY generation, request_id",
+        )
+        .bind(&event_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("request generations must load: {error}"));
+        assert_eq!(generations.len(), 3);
+        assert_eq!(generations[0].get::<i64, _>("generation"), 1);
+        assert_eq!(generations[1].get::<i64, _>("generation"), 2);
+        assert_eq!(generations[2].get::<i64, _>("generation"), 2);
+
+        worker
+            .publish_crash_result(
+                &first_job,
+                &event_id,
+                processing_result("UECC-Windows-Coalescing-1", "2.0.0", "Updated()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("first generation must publish: {error:?}"));
+        let after_first = sqlx::query(
+            "SELECT e.current_result_id::text AS result_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("first generation state must load: {error}"));
+        let updated_result: String = after_first.get("result_id");
+        assert_ne!(updated_result, initial_result);
+        assert_eq!(
+            after_first.get::<i64, _>("requested_reprocessing_generation"),
+            2
+        );
+        assert_eq!(
+            after_first.get::<i64, _>("completed_reprocessing_generation"),
+            1
+        );
+        assert_eq!(after_first.get::<String, _>("job_state"), "pending");
+        let stale = worker
+            .publish_crash_result(
+                &first_job,
+                &event_id,
+                processing_result("UECC-Windows-Coalescing-1", "2.0.0", "Stale()"),
+                "processed",
+                "processing_complete",
+                &release,
+            )
+            .await;
+        assert!(matches!(stale, Err(JobError::LostLease)));
+
+        let second_job = claim_job(&pool, worker.instance_id.as_ref())
+            .await
+            .unwrap_or_else(|()| panic!("second generation must claim"))
+            .unwrap_or_else(|| panic!("second generation must exist"));
+        assert_eq!(second_job.target_generation, 2);
+        worker
+            .finish_result(
+                &second_job,
+                Err(JobError::Deterministic("processor_output_invalid")),
+            )
+            .await;
+        let failed = sqlx::query(
+            "SELECT e.current_result_id::text AS result_id, e.raw_object_id::text AS raw_object_id, e.processing_state, e.state_reason, e.completed_reprocessing_generation, j.state AS job_state, j.failure_code, (SELECT count(*) FROM crash_processing_results r WHERE r.event_id = e.id) AS result_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("failed generation state must load: {error}"));
+        assert_eq!(failed.get::<String, _>("result_id"), updated_result);
+        assert_eq!(failed.get::<String, _>("raw_object_id"), raw_object_id);
+        assert_eq!(failed.get::<String, _>("processing_state"), "processed");
+        assert_eq!(failed.get::<Option<String>, _>("state_reason"), None);
+        assert_eq!(failed.get::<i64, _>("completed_reprocessing_generation"), 2);
+        assert_eq!(failed.get::<String, _>("job_state"), "failed");
+        assert_eq!(
+            failed.get::<Option<String>, _>("failure_code").as_deref(),
+            Some("processor_output_invalid")
+        );
+        assert_eq!(failed.get::<i64, _>("result_count"), 2);
+        let states = sqlx::query(
+            "SELECT id::text AS request_id, state, completed_count, failed_count FROM crash_reprocessing_requests WHERE id::text = ANY($1::text[]) ORDER BY id",
+        )
+        .bind(vec![&first_request, &second_request, &third_request])
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("request states must load: {error}"));
+        assert_eq!(states.len(), 3);
+        for state in states {
+            let request_id: String = state.get("request_id");
+            if request_id == first_request {
+                assert_eq!(state.get::<String, _>("state"), "completed");
+                assert_eq!(state.get::<i64, _>("completed_count"), 1);
+            } else {
+                assert_eq!(state.get::<String, _>("state"), "failed");
+                assert_eq!(state.get::<i64, _>("failed_count"), 1);
+            }
+        }
+
+        let recovered_request = insert_manual_reprocessing_request(
+            &pool,
+            &organization_id,
+            &project_id,
+            &user_id,
+            "event",
+            Some(&event_id),
+            "recovered",
+        )
+        .await;
+        let expired = super::claim_reprocessing_request(&pool, "expired-scheduler")
+            .await
+            .unwrap_or_else(|()| panic!("request lease must be claimed"))
+            .unwrap_or_else(|| panic!("request lease must exist"));
+        assert_eq!(expired.id, recovered_request);
+        sqlx::query(
+            "UPDATE crash_reprocessing_requests SET lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+        )
+        .bind(&recovered_request)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("request lease must expire: {error}"));
+        let current = super::claim_reprocessing_request(&pool, "current-scheduler")
+            .await
+            .unwrap_or_else(|()| panic!("expired request must be reclaimed"))
+            .unwrap_or_else(|| panic!("reclaimed request must exist"));
+        assert_ne!(expired.lease_token, current.lease_token);
+        let current_worker = publication_worker(pool.clone(), "current-scheduler", false);
+        assert!(
+            current_worker
+                .expand_reprocessing_request(&expired)
+                .await
+                .is_err()
+        );
+        current_worker
+            .expand_reprocessing_request(&current)
+            .await
+            .unwrap_or_else(|()| panic!("current request lease must schedule"));
+        let recovered_generation: i64 = sqlx::query_scalar(
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("recovered generation must load: {error}"));
+        assert_eq!(recovered_generation, 3);
+        sqlx::query(
+            "UPDATE jobs SET state = 'completed', completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL WHERE id::text = $1",
+        )
+        .bind(&job_id)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("old worker completion must be simulated: {error}"));
+        assert!(
+            super::reconcile_reprocessing_event_jobs(&pool)
+                .await
+                .unwrap_or_else(|()| panic!("request event reconciliation must succeed"))
+        );
+        let reconciled = sqlx::query(
+            "SELECT j.state AS job_state, x.state AS event_state, r.state AS request_state FROM jobs j JOIN crash_reprocessing_request_events x ON x.event_id = j.event_id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE j.id::text = $1 AND r.id::text = $2",
+        )
+        .bind(&job_id)
+        .bind(&recovered_request)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("reconciled state must load: {error}"));
+        assert_eq!(reconciled.get::<String, _>("job_state"), "pending");
+        assert_eq!(reconciled.get::<String, _>("event_state"), "queued");
+        assert_eq!(reconciled.get::<String, _>("request_state"), "running");
+
+        let exhausted_request = insert_manual_reprocessing_request(
+            &pool,
+            &organization_id,
+            &project_id,
+            &user_id,
+            "event",
+            Some(&event_id),
+            "exhausted",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE crash_reprocessing_requests SET state = 'scheduling', attempt = max_attempt, lease_owner = 'abandoned-scheduler', lease_token = gen_random_uuid(), lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+        )
+        .bind(&exhausted_request)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("exhausted request must expire: {error}"));
+        let terminal_worker = publication_worker(pool.clone(), "terminal-scheduler", false);
+        assert!(
+            terminal_worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("exhausted request must terminalize"))
+        );
+        let exhausted = sqlx::query(
+            "SELECT state, selection_complete, attempt, max_attempt, lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL AS lease_released, failure_code, completed_at IS NOT NULL AS completed, (SELECT count(*) FROM crash_reprocessing_request_events x WHERE x.request_id = r.id) AS event_count FROM crash_reprocessing_requests r WHERE id::text = $1",
+        )
+        .bind(&exhausted_request)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("exhausted request state must load: {error}"));
+        assert_eq!(exhausted.get::<String, _>("state"), "failed");
+        assert!(exhausted.get::<bool, _>("selection_complete"));
+        assert_eq!(
+            exhausted.get::<i32, _>("attempt"),
+            exhausted.get::<i32, _>("max_attempt")
+        );
+        assert!(exhausted.get::<bool, _>("lease_released"));
+        assert_eq!(
+            exhausted
+                .get::<Option<String>, _>("failure_code")
+                .as_deref(),
+            Some("reprocessing_schedule_failed")
+        );
+        assert!(exhausted.get::<bool, _>("completed"));
+        assert_eq!(exhausted.get::<i64, _>("event_count"), 0);
+        let generation_after_exhaustion: i64 = sqlx::query_scalar(
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("event generation must load: {error}"));
+        assert_eq!(generation_after_exhaustion, recovered_generation);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn manual_reprocessing_selectors_use_a_stable_tenant_scoped_cursor_when_configured() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let scope = insert_test_scope(&pool, "local-bootstrap", "selector-main").await;
+        let outside = insert_test_scope(&pool, "outside-bootstrap", "selector-outside").await;
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '3.0.0', 'windows', 'x86_64', 'Shipping', '2026-03-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release must insert: {error}"));
+        let outside_release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '3.0.0', 'windows', 'x86_64', 'Shipping', '2026-03-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&outside.organization)
+        .bind(&outside.project)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("outside release must insert: {error}"));
+        let worker = publication_worker(pool.clone(), "selector-worker", true);
+        let release = release_resolution("3.0.0", vec![release_id.clone()]);
+        let (_, first_event) = publish_new_event(
+            &worker,
+            &scope.organization,
+            &scope.project,
+            "selector-first",
+            processing_result("UECC-Windows-Selector-1", "3.0.0", "SelectorFirst()"),
+            &release,
+            "2026-03-02T00:00:00Z",
+        )
+        .await;
+        let (_, second_event) = publish_new_event(
+            &worker,
+            &scope.organization,
+            &scope.project,
+            "selector-second",
+            processing_result("UECC-Windows-Selector-2", "3.0.0", "SelectorSecond()"),
+            &release,
+            "2026-03-03T00:00:00Z",
+        )
+        .await;
+        let outside_release = release_resolution("3.0.0", vec![outside_release_id.clone()]);
+        let (_, outside_event) = publish_new_event(
+            &worker,
+            &outside.organization,
+            &outside.project,
+            "selector-outside",
+            processing_result("UECC-Windows-Selector-Outside", "3.0.0", "SelectorFirst()"),
+            &outside_release,
+            "2026-03-02T00:00:00Z",
+        )
+        .await;
+        let identity = sqlx::query(
+            "SELECT issue_id::text AS issue_id, fingerprint_version FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&first_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("selector identity must load: {error}"));
+        let issue_id: String = identity.get("issue_id");
+        let fingerprint_version: i32 = identity.get("fingerprint_version");
+        let specs = vec![
+            ("event", Some(first_event.clone()), "selector-event"),
+            ("issue", Some(issue_id), "selector-issue"),
+            ("release", Some(release_id), "selector-release"),
+            ("project", None, "selector-project"),
+            ("parser_version", Some("1".to_owned()), "selector-parser"),
+            (
+                "symbolicator_version",
+                Some("0.1.0".to_owned()),
+                "selector-symbolicator",
+            ),
+            (
+                "fingerprint_version",
+                Some(fingerprint_version.to_string()),
+                "selector-fingerprint",
+            ),
+        ];
+        let mut request_ids = Vec::new();
+        let mut project_request = None;
+        for (scope_kind, scope_value, nonce) in specs {
+            let request_id = insert_manual_reprocessing_page(
+                &pool,
+                &scope,
+                scope_kind,
+                scope_value.as_deref(),
+                nonce,
+                1,
+                None,
+            )
+            .await;
+            if scope_kind == "project" {
+                project_request = Some(request_id.clone());
+            }
+            request_ids.push(request_id);
+        }
+        for _ in 0..request_ids.len() {
+            assert!(
+                worker
+                    .schedule_reprocessing_request()
+                    .await
+                    .unwrap_or_else(|()| panic!("selector request must schedule"))
+            );
+        }
+        let selected = sqlx::query(
+            "SELECT count(*) AS selected_count, count(DISTINCT event_id) AS event_count, min(event_id::text) AS event_id, min(generation) AS min_generation, max(generation) AS max_generation FROM crash_reprocessing_request_events WHERE request_id::text = ANY($1::text[])",
+        )
+        .bind(&request_ids)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("selector results must load: {error}"));
+        assert_eq!(
+            selected.get::<i64, _>("selected_count"),
+            i64::try_from(request_ids.len())
+                .unwrap_or_else(|error| panic!("selector count must fit: {error}"))
+        );
+        assert_eq!(selected.get::<i64, _>("event_count"), 1);
+        assert_eq!(selected.get::<String, _>("event_id"), first_event);
+        assert_eq!(selected.get::<i64, _>("min_generation"), 1);
+        assert_eq!(selected.get::<i64, _>("max_generation"), 1);
+        let project_request =
+            project_request.unwrap_or_else(|| panic!("project request must exist"));
+        let project_page = sqlx::query(
+            "SELECT selection_truncated, next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_requests WHERE id::text = $1",
+        )
+        .bind(&project_request)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("project page must load: {error}"));
+        assert!(project_page.get::<bool, _>("selection_truncated"));
+        let next_cursor: String = project_page.get("next_cursor");
+        assert_eq!(next_cursor, first_event);
+
+        let next_request = insert_manual_reprocessing_page(
+            &pool,
+            &scope,
+            "project",
+            None,
+            "selector-project-next",
+            1,
+            Some(&next_cursor),
+        )
+        .await;
+        assert!(
+            worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("next page must schedule"))
+        );
+        let next = sqlx::query(
+            "SELECT x.event_id::text AS event_id, x.generation, r.selection_truncated, r.next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE x.request_id::text = $1",
+        )
+        .bind(&next_request)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("next page result must load: {error}"));
+        assert_eq!(next.get::<String, _>("event_id"), second_event);
+        assert_eq!(next.get::<i64, _>("generation"), 1);
+        assert!(!next.get::<bool, _>("selection_truncated"));
+        assert_eq!(next.get::<Option<String>, _>("next_cursor"), None);
+        let outside_generation: i64 = sqlx::query_scalar(
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+        )
+        .bind(&outside_event)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("outside generation must load: {error}"));
+        assert_eq!(outside_generation, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn automatic_reprocessing_pages_past_the_request_attempt_limit_when_configured() {
+        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let scope = insert_test_scope(&pool, "local-bootstrap", "automatic-backlog").await;
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '4.0.0', 'windows', 'x86_64', 'Shipping', '2026-04-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("release must insert: {error}"));
+        let ingest_key_id: String = sqlx::query_scalar(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, 'backlog') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(Sha256::digest(b"automatic-backlog-ingest").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("ingest key must insert: {error}"));
+        let inserted = sqlx::query(
+            "WITH objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'backlog/' || n::text, decode(lpad(to_hex(n), 64, '0'), 'hex'), 1, 'application/octet-stream' FROM generate_series(1, 501) n RETURNING id, split_part(object_key, '/', 2)::integer AS n), events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment, processing_state, state_reason, release_id, release_mapping_state, grouping_state) SELECT gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, o.id, 'production', 'awaiting_symbols', 'matching_symbols_missing', $4::uuid, 'matched', 'disabled' FROM objects o RETURNING id, raw_object_id), indexed AS MATERIALIZED (SELECT e.id AS event_id, o.n FROM events e JOIN objects o ON o.id = e.raw_object_id), results AS (INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) SELECT gen_random_uuid(), $1::uuid, $2::uuid, i.event_id, 1, 2, jsonb_build_object('fixture', i.n), decode(lpad(to_hex(i.n + 10000), 64, '0'), 'hex') FROM indexed i RETURNING event_id) SELECT (SELECT count(*) FROM events) AS events, (SELECT count(*) FROM results) AS results",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&ingest_key_id)
+        .bind(&release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("backlog fixtures must insert: {error}"));
+        assert_eq!(inserted.get::<i64, _>("events"), 501);
+        assert_eq!(inserted.get::<i64, _>("results"), 501);
+        let prepared = sqlx::query(
+            "WITH updated AS (UPDATE crash_events e SET current_result_id = r.id FROM crash_processing_results r WHERE e.id = r.event_id AND e.organization_id::text = $1 AND e.project_id::text = $2 AND e.current_result_id IS NULL RETURNING e.id AS event_id, e.current_result_id), inserted_jobs AS (INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, state, priority, attempt, idempotency_key, completed_at) SELECT gen_random_uuid(), $1::uuid, $2::uuid, u.event_id, 'process_crash', '{}'::jsonb, 'completed', 100, 1, 'automatic-backlog-' || u.event_id::text, now() FROM updated u RETURNING event_id), inserted_waiters AS (INSERT INTO crash_symbol_waiters (organization_id, project_id, event_id, result_id, release_id, required_artifact, module_name, architecture, debug_id, code_id) SELECT $1::uuid, $2::uuid, u.event_id, u.current_result_id, $3::uuid, 'pdb', 'game.exe', 'x86_64', 'DEBUG-A', '' FROM updated u RETURNING event_id) SELECT (SELECT count(*) FROM inserted_jobs) AS jobs, (SELECT count(*) FROM inserted_waiters) AS waiters",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&release_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("backlog state must prepare: {error}"));
+        assert_eq!(prepared.get::<i64, _>("jobs"), 501);
+        assert_eq!(prepared.get::<i64, _>("waiters"), 501);
+        let token_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'backlog') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&scope.user)
+        .bind(Sha256::digest(b"automatic-backlog-upload").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("upload token must insert: {error}"));
+        let manifest_id: String = sqlx::query_scalar(
+            "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 10, 'pdb', 'Game.pdb', 'x86_64', 'DEBUG-A', 'Game.pdb', '0.1.0', 'available', now()) RETURNING id::text",
+        )
+        .bind(&release_id)
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&scope.user)
+        .bind(&token_id)
+        .bind(Sha256::digest(b"automatic-backlog-pdb").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("manifest must insert: {error}"));
+        let mut transaction = pool
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("request transaction must begin: {error}"));
+        for _ in 0..2 {
+            crate::reprocessing::enqueue_artifact_request(
+                &mut transaction,
+                &scope.organization,
+                &scope.project,
+                &manifest_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("automatic request must enqueue: {error}"));
+        }
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("request transaction must commit: {error}"));
+        let worker = publication_worker(pool.clone(), "automatic-backlog-worker", false);
+        for page in 1_i64..=6 {
+            assert!(
+                worker
+                    .schedule_reprocessing_request()
+                    .await
+                    .unwrap_or_else(|()| panic!("automatic page must schedule"))
+            );
+            let progress = sqlx::query(
+                "SELECT state, selection_complete, selected_count, attempt FROM crash_reprocessing_requests WHERE scope_value = $1",
+            )
+            .bind(&manifest_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("automatic progress must load: {error}"));
+            assert_eq!(
+                progress.get::<i64, _>("selected_count"),
+                (page * 100).min(501)
+            );
+            assert_eq!(progress.get::<i32, _>("attempt"), i32::from(page == 6));
+            if page < 6 {
+                assert_eq!(progress.get::<String, _>("state"), "pending");
+                assert!(!progress.get::<bool, _>("selection_complete"));
+            } else {
+                assert_eq!(progress.get::<String, _>("state"), "running");
+                assert!(progress.get::<bool, _>("selection_complete"));
+            }
+        }
+        assert!(
+            !worker
+                .schedule_reprocessing_request()
+                .await
+                .unwrap_or_else(|()| panic!("empty scheduler pass must succeed"))
+        );
+        let aggregate = sqlx::query(
+            "SELECT count(*) AS events, min(requested_reprocessing_generation) AS minimum_generation, max(requested_reprocessing_generation) AS maximum_generation, count(*) FILTER (WHERE j.state = 'pending' AND j.priority = 200) AS pending_jobs, (SELECT count(*) FROM crash_reprocessing_requests) AS requests, (SELECT count(*) FROM crash_reprocessing_request_events) AS request_events FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.project_id::text = $1",
+        )
+        .bind(&scope.project)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("automatic aggregate must load: {error}"));
+        assert_eq!(aggregate.get::<i64, _>("events"), 501);
+        assert_eq!(aggregate.get::<i64, _>("minimum_generation"), 1);
+        assert_eq!(aggregate.get::<i64, _>("maximum_generation"), 1);
+        assert_eq!(aggregate.get::<i64, _>("pending_jobs"), 501);
+        assert_eq!(aggregate.get::<i64, _>("requests"), 1);
+        assert_eq!(aggregate.get::<i64, _>("request_events"), 501);
     }
 }

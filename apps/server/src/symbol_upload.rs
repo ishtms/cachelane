@@ -1360,7 +1360,32 @@ async fn mark_manifest_available(
     manifest_id: &str,
     debug_image_id: &str,
 ) -> Result<(), UploadError> {
-    update_manifest_state(pool, scope, manifest_id, "available", Some(debug_image_id)).await
+    let mut transaction = pool.begin().await.map_err(|_| UploadError::Unavailable)?;
+    let result = sqlx::query(
+        "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, failure_code = NULL, uploaded_at = now(), updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&scope.organization_id)
+    .bind(&scope.project_id)
+    .bind(manifest_id)
+    .bind(debug_image_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| UploadError::Unavailable)?;
+    if result.rows_affected() != 1 {
+        return Err(UploadError::NotFound);
+    }
+    crate::reprocessing::enqueue_artifact_request(
+        &mut transaction,
+        &scope.organization_id,
+        &scope.project_id,
+        manifest_id,
+    )
+    .await
+    .map_err(|_| UploadError::Unavailable)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| UploadError::Unavailable)
 }
 
 async fn mark_manifest_missing(
@@ -2636,6 +2661,14 @@ mod tests {
         assert_eq!(deduplicated["artifacts"][0]["status"], "already_present");
         assert_ne!(deduplicated["release"]["id"], release_id);
         assert_eq!(deduplicated["coverage"]["available"], 1);
+        let automatic_requests: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id::text = $1 AND source = 'automatic' AND scope_kind = 'artifact'",
+        )
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("automatic requests must load: {error}"));
+        assert_eq!(automatic_requests, 2);
 
         let provenance = sqlx::query(
             "SELECT source_path, cli_version, ci_job, state, uploaded_at IS NOT NULL AS has_uploaded_at FROM release_manifest_artifacts WHERE release_id::text = $1",
