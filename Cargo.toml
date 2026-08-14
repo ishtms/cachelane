@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/cli", "apps/server", "crates/domain", "crates/processing", "crates/symbols", "crates/unreal"]
+members = ["apps/cli", "apps/server", "crates/domain", "crates/grouping", "crates/processing", "crates/symbols", "crates/unreal"]
 exclude = ["fuzz"]
 resolver = "3"
 

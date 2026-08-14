@@ -25,6 +25,10 @@ use crate::{
 const MINIDUMP_VERSION: &str = "0.27.0";
 const MINIDUMP_PROCESSOR_VERSION: &str = "0.27.0";
 const MINIDUMP_UNWIND_VERSION: &str = "0.27.0";
+const MAX_EXCEPTION_REASON_CHARS: usize = 512;
+const MAX_ASSERTION_CHARS: usize = 4096;
+
+pub const SYMBOLICATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SymbolicationLimits {
@@ -250,6 +254,8 @@ pub struct SymbolicationResult {
     pub platform: &'static str,
     pub architecture: &'static str,
     pub faulting_thread_id: Option<u32>,
+    pub exception_reason: Option<String>,
+    pub assertion: Option<String>,
     pub modules: Vec<SymbolicatedModule>,
     pub threads: Vec<SymbolicatedThread>,
 }
@@ -629,7 +635,7 @@ fn build_result(
         .collect();
 
     SymbolicationResult {
-        schema_version: 1,
+        schema_version: SYMBOLICATION_SCHEMA_VERSION,
         symbolicator_version: env!("CARGO_PKG_VERSION"),
         minidump_version: MINIDUMP_VERSION,
         minidump_processor_version: MINIDUMP_PROCESSOR_VERSION,
@@ -637,9 +643,27 @@ fn build_result(
         platform: "windows",
         architecture: "x86_64",
         faulting_thread_id,
+        exception_reason: state
+            .exception_info
+            .as_ref()
+            .map(|info| info.reason.to_string())
+            .and_then(|value| bounded_text(&value, MAX_EXCEPTION_REASON_CHARS)),
+        assertion: state
+            .assertion
+            .as_deref()
+            .and_then(|value| bounded_text(value, MAX_ASSERTION_CHARS)),
         modules,
         threads,
     }
+}
+
+fn bounded_text(value: &str, maximum: usize) -> Option<String> {
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .take(maximum)
+        .collect::<String>();
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn map_frame(
@@ -874,5 +898,16 @@ mod tests {
 
         assert_eq!(error.kind(), SymbolicationErrorKind::TooManyModules);
         assert_eq!(error.to_string(), "minidump module limit exceeded");
+    }
+
+    #[test]
+    fn assertion_text_is_bounded_without_splitting_unicode() {
+        let value = format!("{}\u{00dc}", "a".repeat(MAX_ASSERTION_CHARS));
+        let bounded = bounded_text(&value, MAX_ASSERTION_CHARS)
+            .unwrap_or_else(|| panic!("bounded assertion must remain present"));
+
+        assert_eq!(bounded.chars().count(), MAX_ASSERTION_CHARS);
+        assert!(!bounded.ends_with('\u{00dc}'));
+        assert!(bounded_text("\0\r\n", MAX_ASSERTION_CHARS).is_none());
     }
 }
