@@ -18,12 +18,20 @@ export function CreatedSetupResult({ created }: { created: CreatedSetup }) {
       <h3>{created.configuration.default_engine_ini_path}</h3>
       <pre>{created.configuration.default_engine_ini}</pre>
 
-      <a
-        className="primary setup-link"
-        href={`/setup?project=${encodeURIComponent(created.setup.project.id)}`}
-      >
-        Open project setup
-      </a>
+      <div className="setup-panel-actions setup-link">
+        <a
+          className="button primary"
+          href={`/projects/${encodeURIComponent(created.setup.project.id)}`}
+        >
+          Open project dashboard
+        </a>
+        <a
+          className="button secondary"
+          href={`/setup?project=${encodeURIComponent(created.setup.project.id)}`}
+        >
+          Manage project setup
+        </a>
+      </div>
     </section>
   );
 }

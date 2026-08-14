@@ -208,6 +208,28 @@ paths:
           $ref: "#/components/responses/IngestNotFound"
         "500":
           $ref: "#/components/responses/IngestInternalError"
+  /api/v1/projects/{project_id}/overview:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectOverview
+      summary: Get a fixed 30-day project health and observed usage overview
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Project overview from one repeatable-read snapshot
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectOverview"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
   /api/v1/projects/{project_id}/issues:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -221,8 +243,8 @@ paths:
           in: query
           schema:
             type: string
-            format: uuid
-          description: Issue ID returned as next_cursor by the previous page.
+            maxLength: 2048
+          description: Opaque cursor returned by the previous page for the same project and filters.
         - name: limit
           in: query
           schema:
@@ -243,6 +265,57 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: crash_type
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: platform
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: architecture
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: engine_version
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: symbolication_state
+          in: query
+          schema:
+            $ref: "#/components/schemas/SymbolicationState"
+        - name: first_seen_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: first_seen_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: last_seen_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: last_seen_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: query
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 120
+          description: Literal search across issue title and approved current-result fields.
       responses:
         "200":
           description: Bounded issue page
@@ -280,6 +353,163 @@ paths:
                 $ref: "#/components/schemas/IssueDetail"
         "404":
           $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+    get:
+      operationId: listProjectIssueEvents
+      summary: List one issue's events and bounded facets in stable order
+      security:
+        - bootstrapAuthorization: []
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            maxLength: 2048
+          description: Opaque cursor returned by the previous event page.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Bounded issue event page
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueEventList"
+        "400":
+          $ref: "#/components/responses/IssueInvalidRequest"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+      - $ref: "#/components/parameters/EventId"
+    get:
+      operationId: getProjectIssueEvent
+      summary: Get bounded validated crash context, stacks, and processing history
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Readable event detail
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueEventDetail"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "409":
+          $ref: "#/components/responses/DashboardResultUnavailable"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}/log:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+      - $ref: "#/components/parameters/EventId"
+    get:
+      operationId: downloadProjectIssueEventLog
+      summary: Download the bounded derived UTF-8 log tail
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Bounded log attachment
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+            Content-Disposition:
+              schema:
+                type: string
+            X-Content-Type-Options:
+              schema:
+                type: string
+                const: nosniff
+            Content-Security-Policy:
+              schema:
+                type: string
+                const: sandbox
+            Referrer-Policy:
+              schema:
+                type: string
+                const: no-referrer
+          content:
+            text/plain:
+              schema:
+                type: string
+                maxLength: 65536
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "409":
+          $ref: "#/components/responses/DashboardResultUnavailable"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}/raw:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+      - $ref: "#/components/parameters/EventId"
+    get:
+      operationId: downloadProjectIssueEventRawBundle
+      summary: Stream the exact retained raw crash bundle through the control API
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Retained raw crash bundle
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+            Content-Disposition:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 67108864
+            Digest:
+              schema:
+                type: string
+            X-Content-Type-Options:
+              schema:
+                type: string
+                const: nosniff
+            Content-Security-Policy:
+              schema:
+                type: string
+                const: sandbox
+            Referrer-Policy:
+              schema:
+                type: string
+                const: no-referrer
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "503":
+          $ref: "#/components/responses/DashboardArtifactUnavailable"
         "500":
           $ref: "#/components/responses/IssueInternalError"
   /api/v1/projects/{project_id}/issues/{issue_id}/resolution:
@@ -747,6 +977,13 @@ components:
       schema:
         type: string
         format: uuid
+    EventId:
+      name: event_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     ReprocessingRequestId:
       name: request_id
       in: path
@@ -880,6 +1117,24 @@ components:
             $ref: "#/components/schemas/Error"
     IssueInternalError:
       description: Issue request could not be completed
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DashboardResultUnavailable:
+      description: The current stored processing result is missing, corrupt, or unsupported
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DashboardArtifactUnavailable:
+      description: The retained raw object cannot be streamed safely
       headers:
         Cache-Control:
           $ref: "#/components/headers/CacheControlNoStore"
@@ -1550,6 +1805,505 @@ components:
         updated_at:
           type: string
           format: date-time
+    SymbolicationState:
+      type: string
+      enum:
+        - readable
+        - partial
+        - missing
+        - failed
+        - processing
+    Distribution:
+      type: object
+      additionalProperties: false
+      required:
+        - key
+        - label
+        - count
+        - truncated
+      properties:
+        key:
+          type: string
+          maxLength: 256
+        label:
+          type: string
+          maxLength: 256
+        count:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+    OverviewWindow:
+      type: object
+      additionalProperties: false
+      required:
+        - start
+        - end
+        - days
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        days:
+          type: integer
+          const: 30
+    OverviewTotals:
+      type: object
+      additionalProperties: false
+      required:
+        - events
+        - issues
+        - new_issues
+        - regressed_issues
+      properties:
+        events:
+          type: integer
+          minimum: 0
+        issues:
+          type: integer
+          minimum: 0
+        new_issues:
+          type: integer
+          minimum: 0
+        regressed_issues:
+          type: integer
+          minimum: 0
+    EventTimeBucket:
+      type: object
+      additionalProperties: false
+      required:
+        - day
+        - count
+      properties:
+        day:
+          type: string
+          format: date
+        count:
+          type: integer
+          minimum: 0
+    TopIssue:
+      type: object
+      additionalProperties: false
+      required:
+        - issue_id
+        - path
+        - title
+        - status
+        - regression_state
+        - event_count
+        - last_seen_at
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        regression_state:
+          $ref: "#/components/schemas/IssueRegressionState"
+        event_count:
+          type: integer
+          minimum: 1
+        last_seen_at:
+          type: string
+          format: date-time
+    SymbolicationOverview:
+      type: object
+      additionalProperties: false
+      required:
+        - readable
+        - partial
+        - missing
+        - failed
+        - processing
+        - denominator
+        - success_percent
+      properties:
+        readable:
+          type: integer
+          minimum: 0
+        partial:
+          type: integer
+          minimum: 0
+        missing:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        processing:
+          type: integer
+          minimum: 0
+        denominator:
+          type: integer
+          minimum: 0
+        success_percent:
+          type:
+            - number
+            - "null"
+          minimum: 0
+          maximum: 100
+    IngestHealth:
+      type: object
+      additionalProperties: false
+      required:
+        - last_received_at
+        - events_in_window
+        - stored_or_received
+      properties:
+        last_received_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        events_in_window:
+          type: integer
+          minimum: 0
+        stored_or_received:
+          type: integer
+          minimum: 0
+    ProcessingHealth:
+      type: object
+      additionalProperties: false
+      required:
+        - pending_jobs
+        - leased_jobs
+        - failed_jobs
+        - dead_jobs
+        - oldest_pending_at
+        - states
+      properties:
+        pending_jobs:
+          type: integer
+          minimum: 0
+        leased_jobs:
+          type: integer
+          minimum: 0
+        failed_jobs:
+          type: integer
+          minimum: 0
+        dead_jobs:
+          type: integer
+          minimum: 0
+        oldest_pending_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        states:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+    ObservedUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - authoritative
+        - cycle_start
+        - accepted_events
+        - retained_raw_bytes
+        - project_artifact_bytes
+        - organization_projects
+      properties:
+        authoritative:
+          type: boolean
+          const: false
+        cycle_start:
+          type: string
+          format: date-time
+        accepted_events:
+          type: integer
+          minimum: 0
+        retained_raw_bytes:
+          type: integer
+          minimum: 0
+        project_artifact_bytes:
+          type: integer
+          minimum: 0
+        organization_projects:
+          type: integer
+          minimum: 1
+    ProjectOverview:
+      type: object
+      additionalProperties: false
+      required:
+        - generated_at
+        - window
+        - totals
+        - events_over_time
+        - top_issues
+        - releases
+        - releases_truncated
+        - releases_other_count
+        - platforms
+        - platforms_truncated
+        - platforms_other_count
+        - crash_types
+        - crash_types_truncated
+        - crash_types_other_count
+        - symbolication
+        - missing_symbol_count
+        - ingest
+        - processing
+        - observed_usage
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        window:
+          $ref: "#/components/schemas/OverviewWindow"
+        totals:
+          $ref: "#/components/schemas/OverviewTotals"
+        events_over_time:
+          type: array
+          minItems: 30
+          maxItems: 30
+          items:
+            $ref: "#/components/schemas/EventTimeBucket"
+        top_issues:
+          type: array
+          maxItems: 10
+          items:
+            $ref: "#/components/schemas/TopIssue"
+        releases:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        releases_truncated:
+          type: boolean
+        releases_other_count:
+          type: integer
+          minimum: 0
+        platforms:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        platforms_truncated:
+          type: boolean
+        platforms_other_count:
+          type: integer
+          minimum: 0
+        crash_types:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        crash_types_truncated:
+          type: boolean
+        crash_types_other_count:
+          type: integer
+          minimum: 0
+        symbolication:
+          $ref: "#/components/schemas/SymbolicationOverview"
+        missing_symbol_count:
+          type: integer
+          minimum: 0
+        ingest:
+          $ref: "#/components/schemas/IngestHealth"
+        processing:
+          $ref: "#/components/schemas/ProcessingHealth"
+        observed_usage:
+          $ref: "#/components/schemas/ObservedUsage"
+    IssueEventSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - path
+        - received_at
+        - environment
+        - processing_state
+        - state_reason
+        - release_id
+        - release_version
+        - crash_type
+        - platform
+        - architecture
+        - engine_version
+        - symbolication_state
+        - comment_excerpt
+        - comment_truncated
+        - metadata_truncated
+        - current_result_id
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        received_at:
+          type: string
+          format: date-time
+        environment:
+          type: string
+          maxLength: 64
+        processing_state:
+          $ref: "#/components/schemas/ProcessingState"
+        state_reason:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        release_version:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        crash_type:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        platform:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        architecture:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        engine_version:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        symbolication_state:
+          $ref: "#/components/schemas/SymbolicationState"
+        comment_excerpt:
+          type:
+            - string
+            - "null"
+          maxLength: 240
+        comment_truncated:
+          type: boolean
+        metadata_truncated:
+          type: boolean
+        current_result_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+    EventFacets:
+      type: object
+      additionalProperties: false
+      required:
+        - releases
+        - releases_truncated
+        - releases_other_count
+        - platforms
+        - platforms_truncated
+        - platforms_other_count
+        - architectures
+        - architectures_truncated
+        - architectures_other_count
+        - environments
+        - environments_truncated
+        - environments_other_count
+        - crash_types
+        - crash_types_truncated
+        - crash_types_other_count
+        - processing_states
+        - processing_states_truncated
+        - processing_states_other_count
+      properties:
+        releases:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        releases_truncated:
+          type: boolean
+        releases_other_count:
+          type: integer
+          minimum: 0
+        platforms:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        platforms_truncated:
+          type: boolean
+        platforms_other_count:
+          type: integer
+          minimum: 0
+        architectures:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        architectures_truncated:
+          type: boolean
+        architectures_other_count:
+          type: integer
+          minimum: 0
+        environments:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        environments_truncated:
+          type: boolean
+        environments_other_count:
+          type: integer
+          minimum: 0
+        crash_types:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        crash_types_truncated:
+          type: boolean
+        crash_types_other_count:
+          type: integer
+          minimum: 0
+        processing_states:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/Distribution"
+        processing_states_truncated:
+          type: boolean
+        processing_states_other_count:
+          type: integer
+          minimum: 0
+    IssueEventList:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - next_cursor
+        - facets
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IssueEventSummary"
+        next_cursor:
+          type:
+            - string
+            - "null"
+          maxLength: 2048
+        facets:
+          $ref: "#/components/schemas/EventFacets"
     IssueSummary:
       type: object
       additionalProperties: false
@@ -1644,7 +2398,483 @@ components:
           type:
             - string
             - "null"
+          maxLength: 2048
+    EventReleaseMapping:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - release_id
+        - candidate_release_ids
+        - candidate_release_ids_truncated
+      properties:
+        state:
+          $ref: "#/components/schemas/ReleaseMappingState"
+        release_id:
+          type:
+            - string
+            - "null"
           format: uuid
+        candidate_release_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+        candidate_release_ids_truncated:
+          type: boolean
+    ClassificationSignal:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - confidence
+        - evidence
+        - truncated
+      properties:
+        kind:
+          type: string
+          maxLength: 128
+        confidence:
+          type: string
+          maxLength: 128
+        evidence:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            maxLength: 128
+        truncated:
+          type: boolean
+    CrashClassification:
+      type: object
+      additionalProperties: false
+      required:
+        - crash_type
+        - confidence
+        - evidence
+        - signals
+        - truncated
+      properties:
+        crash_type:
+          type: string
+          maxLength: 128
+        confidence:
+          type: string
+          maxLength: 128
+        evidence:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            maxLength: 128
+        signals:
+          type: array
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/ClassificationSignal"
+        truncated:
+          type: boolean
+    ContextProperty:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - name_truncated
+        - value
+        - value_truncated
+      properties:
+        name:
+          type: string
+          maxLength: 256
+        name_truncated:
+          type: boolean
+        value:
+          type: string
+          maxLength: 4096
+        value_truncated:
+          type: boolean
+    EventLog:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - text
+        - truncated
+        - invalid_utf8
+        - download_path
+      properties:
+        name:
+          type: string
+          maxLength: 256
+        text:
+          type: string
+          maxLength: 65536
+        truncated:
+          type: boolean
+        invalid_utf8:
+          type: boolean
+        download_path:
+          type: string
+    InlineFrame:
+      type: object
+      additionalProperties: false
+      required:
+        - function
+        - source_file
+        - source_line
+        - truncated
+      properties:
+        function:
+          type: string
+          maxLength: 4096
+        source_file:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        source_line:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        truncated:
+          type: boolean
+    StackFrame:
+      type: object
+      additionalProperties: false
+      required:
+        - instruction
+        - module
+        - module_relative
+        - trust
+        - symbol_status
+        - function
+        - source_file
+        - source_line
+        - inlines
+        - inlines_truncated
+        - truncated
+      properties:
+        instruction:
+          type: string
+          maxLength: 128
+        module:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        module_relative:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        trust:
+          type: string
+          maxLength: 128
+        symbol_status:
+          type: string
+          maxLength: 128
+        function:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        source_file:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        source_line:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        inlines:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/InlineFrame"
+        inlines_truncated:
+          type: boolean
+        truncated:
+          type: boolean
+    StackThread:
+      type: object
+      additionalProperties: false
+      required:
+        - thread_id
+        - faulting
+        - name
+        - name_truncated
+        - unwind_status
+        - unwind_status_truncated
+        - frames_truncated
+        - frames
+      properties:
+        thread_id:
+          type: integer
+          minimum: 0
+        faulting:
+          type: boolean
+        name:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        name_truncated:
+          type: boolean
+        unwind_status:
+          type: string
+          maxLength: 128
+        unwind_status_truncated:
+          type: boolean
+        frames_truncated:
+          type: boolean
+        frames:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/StackFrame"
+    MissingSymbol:
+      type: object
+      additionalProperties: false
+      required:
+        - required_artifact
+        - module
+        - architecture
+        - debug_id
+        - code_id
+        - release_id
+        - release_version
+        - truncated
+      properties:
+        required_artifact:
+          type: string
+          enum:
+            - pe
+            - pdb
+        module:
+          type: string
+          maxLength: 4096
+        architecture:
+          type: string
+          maxLength: 128
+        debug_id:
+          type: string
+          maxLength: 256
+        code_id:
+          type:
+            - string
+            - "null"
+          maxLength: 256
+        release_id:
+          type: string
+          format: uuid
+        release_version:
+          type: string
+          maxLength: 4096
+        truncated:
+          type: boolean
+    ProcessingResultHistory:
+      type: object
+      additionalProperties: false
+      required:
+        - result_id
+        - schema_version
+        - processing_version
+        - checksum
+        - created_at
+        - current
+      properties:
+        result_id:
+          type: string
+          format: uuid
+        schema_version:
+          type: integer
+          minimum: 1
+        processing_version:
+          type: integer
+          minimum: 1
+        checksum:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        created_at:
+          type: string
+          format: date-time
+        current:
+          type: boolean
+    ReprocessingEventHistory:
+      type: object
+      additionalProperties: false
+      required:
+        - request_id
+        - source
+        - state
+        - failure_code
+        - created_at
+        - completed_at
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        source:
+          $ref: "#/components/schemas/ReprocessingSource"
+        state:
+          type: string
+          enum:
+            - queued
+            - running
+            - completed
+            - failed
+        failure_code:
+          type:
+            - string
+            - "null"
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+    EventProcessingHistory:
+      type: object
+      additionalProperties: false
+      required:
+        - results
+        - results_truncated
+        - requests
+        - requests_truncated
+      properties:
+        results:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/ProcessingResultHistory"
+        results_truncated:
+          type: boolean
+        requests:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/ReprocessingEventHistory"
+        requests_truncated:
+          type: boolean
+    IssueEventDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - event
+        - crash_guid
+        - crash_guid_truncated
+        - release_mapping
+        - classification
+        - error_message
+        - error_message_truncated
+        - build_version
+        - build_version_truncated
+        - build_configuration
+        - build_configuration_truncated
+        - user_comment
+        - user_comment_truncated
+        - game_data
+        - game_data_truncated
+        - system_context
+        - system_context_truncated
+        - log
+        - threads
+        - threads_truncated
+        - missing_symbols
+        - missing_symbols_truncated
+        - remediation_command
+        - processing_history
+        - raw_available
+      properties:
+        event:
+          $ref: "#/components/schemas/IssueEventSummary"
+        crash_guid:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        crash_guid_truncated:
+          type: boolean
+        release_mapping:
+          $ref: "#/components/schemas/EventReleaseMapping"
+        classification:
+          anyOf:
+            - $ref: "#/components/schemas/CrashClassification"
+            - type: "null"
+        error_message:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        error_message_truncated:
+          type: boolean
+        build_version:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        build_version_truncated:
+          type: boolean
+        build_configuration:
+          type:
+            - string
+            - "null"
+          maxLength: 4096
+        build_configuration_truncated:
+          type: boolean
+        user_comment:
+          type:
+            - string
+            - "null"
+          maxLength: 8192
+        user_comment_truncated:
+          type: boolean
+        game_data:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ContextProperty"
+        game_data_truncated:
+          type: boolean
+        system_context:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ContextProperty"
+        system_context_truncated:
+          type: boolean
+        log:
+          anyOf:
+            - $ref: "#/components/schemas/EventLog"
+            - type: "null"
+        threads:
+          type: array
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/StackThread"
+        threads_truncated:
+          type: boolean
+        missing_symbols:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/MissingSymbol"
+        missing_symbols_truncated:
+          type: boolean
+        remediation_command:
+          type:
+            - string
+            - "null"
+        processing_history:
+          $ref: "#/components/schemas/EventProcessingHistory"
+        raw_available:
+          type: boolean
     ReleaseMappingSummary:
       type: object
       additionalProperties: false

@@ -60,51 +60,20 @@ impl CrashIngest {
         if role == "api" {
             let mut state = Self::disabled();
             state.pool = Some(pool);
+            if env::var("FAULTLANE_DASHBOARD_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+                && env::var("FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED")
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+            {
+                state.objects = configured_objects()?;
+            }
             return Ok(state);
         }
         if role != "ingest" {
             return Ok(Self::disabled());
         }
 
-        let object_store_endpoint = required_env("OBJECT_STORE_ENDPOINT")?;
-        let object_store_bucket = required_env("OBJECT_STORE_BUCKET")?;
-        let object_store_access_key =
-            required_env("OBJECT_STORE_ACCESS_KEY").or_else(|_| required_env("MINIO_ROOT_USER"))?;
-        let object_store_secret_key = required_env("OBJECT_STORE_SECRET_KEY")
-            .or_else(|_| required_env("MINIO_ROOT_PASSWORD"))?;
-        let endpoint =
-            Url::parse(&object_store_endpoint).map_err(|_| StartupError::IngestConfiguration)?;
-        if endpoint.scheme() != "https"
-            && !(endpoint.scheme() == "http"
-                && endpoint
-                    .host_str()
-                    .and_then(|value| value.parse::<IpAddr>().ok())
-                    .is_some_and(|address| address.is_loopback()))
-        {
-            return Err(StartupError::IngestConfiguration);
-        }
-        let retry = RetryConfig {
-            max_retries: 2,
-            retry_timeout: Duration::from_secs(5),
-            ..RetryConfig::default()
-        };
-        let objects = AmazonS3Builder::new()
-            .with_bucket_name(object_store_bucket)
-            .with_region(env::var("OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".into()))
-            .with_endpoint(object_store_endpoint)
-            .with_access_key_id(object_store_access_key)
-            .with_secret_access_key(object_store_secret_key)
-            .with_allow_http(endpoint.scheme() == "http")
-            .with_virtual_hosted_style_request(false)
-            .with_retry(retry)
-            .with_client_options(
-                ClientOptions::new()
-                    .with_allow_http(endpoint.scheme() == "http")
-                    .with_connect_timeout(Duration::from_secs(3))
-                    .with_timeout(Duration::from_secs(30)),
-            )
-            .build()
-            .map_err(|_| StartupError::IngestConfiguration)?;
+        let objects = configured_objects()?;
         let spool_directory = env::var("FAULTLANE_INGEST_SPOOL_DIR")
             .map_or_else(|_| env::temp_dir().join("faultlane-ingest"), PathBuf::from);
         validate_spool_directory(&spool_directory)?;
@@ -120,7 +89,7 @@ impl CrashIngest {
 
         Ok(Self {
             pool: Some(pool),
-            objects: Arc::new(objects),
+            objects,
             spool_directory: Arc::new(spool_directory),
             rate_secret: Arc::from(rate_secret.into_bytes()),
             trusted_proxies: Arc::new(trusted_proxies),
@@ -157,6 +126,15 @@ impl CrashIngest {
     }
 
     #[cfg(test)]
+    pub(crate) fn control_test_with_objects(pool: PgPool, objects: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            pool: Some(pool),
+            objects,
+            ..Self::disabled()
+        }
+    }
+
+    #[cfg(test)]
     fn test(pool: PgPool, objects: Arc<dyn ObjectStore>, spool_directory: PathBuf) -> Self {
         validate_spool_directory(&spool_directory)
             .unwrap_or_else(|error| panic!("test spool directory must be valid: {error}"));
@@ -176,6 +154,29 @@ impl CrashIngest {
         self.pool.as_ref().ok_or(IngestError::Unavailable)
     }
 
+    pub(crate) async fn get_raw_object(
+        &self,
+        key: &str,
+        expected_size: u64,
+    ) -> Result<object_store::GetResult, RawObjectError> {
+        let result = self
+            .objects
+            .get(&ObjectPath::from(key.to_owned()))
+            .await
+            .map_err(|error| {
+                if matches!(error, object_store::Error::NotFound { .. }) {
+                    RawObjectError::Missing
+                } else {
+                    RawObjectError::Unavailable
+                }
+            })?;
+        let actual_size = result.meta.size;
+        if actual_size != expected_size || actual_size > MAX_COMPRESSED_BYTES {
+            return Err(RawObjectError::Invalid);
+        }
+        Ok(result)
+    }
+
     pub(crate) fn start_maintenance(&self) {
         if !self.enabled {
             return;
@@ -190,6 +191,56 @@ impl CrashIngest {
             }
         });
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RawObjectError {
+    Unavailable,
+    Missing,
+    Invalid,
+}
+
+fn configured_objects() -> Result<Arc<dyn ObjectStore>, StartupError> {
+    let object_store_endpoint = required_env("OBJECT_STORE_ENDPOINT")?;
+    let object_store_bucket = required_env("OBJECT_STORE_BUCKET")?;
+    let object_store_access_key =
+        required_env("OBJECT_STORE_ACCESS_KEY").or_else(|_| required_env("MINIO_ROOT_USER"))?;
+    let object_store_secret_key =
+        required_env("OBJECT_STORE_SECRET_KEY").or_else(|_| required_env("MINIO_ROOT_PASSWORD"))?;
+    let endpoint =
+        Url::parse(&object_store_endpoint).map_err(|_| StartupError::IngestConfiguration)?;
+    if endpoint.scheme() != "https"
+        && !(endpoint.scheme() == "http"
+            && endpoint
+                .host_str()
+                .and_then(|value| value.parse::<IpAddr>().ok())
+                .is_some_and(|address| address.is_loopback()))
+    {
+        return Err(StartupError::IngestConfiguration);
+    }
+    let retry = RetryConfig {
+        max_retries: 2,
+        retry_timeout: Duration::from_secs(5),
+        ..RetryConfig::default()
+    };
+    let objects = AmazonS3Builder::new()
+        .with_bucket_name(object_store_bucket)
+        .with_region(env::var("OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".into()))
+        .with_endpoint(object_store_endpoint)
+        .with_access_key_id(object_store_access_key)
+        .with_secret_access_key(object_store_secret_key)
+        .with_allow_http(endpoint.scheme() == "http")
+        .with_virtual_hosted_style_request(false)
+        .with_retry(retry)
+        .with_client_options(
+            ClientOptions::new()
+                .with_allow_http(endpoint.scheme() == "http")
+                .with_connect_timeout(Duration::from_secs(3))
+                .with_timeout(Duration::from_secs(30)),
+        )
+        .build()
+        .map_err(|_| StartupError::IngestConfiguration)?;
+    Ok(Arc::new(objects))
 }
 
 #[derive(Default)]

@@ -33,6 +33,8 @@ pub(crate) struct ServerState {
     bootstrap: BootstrapAuthorization,
     ingest_base_url: String,
     crash_ingest: crate::crash_ingest::CrashIngest,
+    dashboard_enabled: bool,
+    raw_artifact_download_enabled: bool,
     reprocessing_enabled: bool,
     symbol_uploads: crate::symbol_upload::SymbolUploads,
 }
@@ -86,6 +88,10 @@ impl ServerState {
             bootstrap,
             ingest_base_url,
             crash_ingest: crate::crash_ingest::CrashIngest::postgres(pool, role)?,
+            dashboard_enabled: env::var("FAULTLANE_DASHBOARD_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            raw_artifact_download_enabled: env::var("FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             reprocessing_enabled: env::var("FAULTLANE_REPROCESSING_ENABLED")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             symbol_uploads,
@@ -102,6 +108,8 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            dashboard_enabled: false,
+            raw_artifact_download_enabled: false,
             reprocessing_enabled: false,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
@@ -119,6 +127,8 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest,
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
@@ -136,6 +146,8 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads,
         }
@@ -149,6 +161,65 @@ impl ServerState {
                 .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: false,
+            reprocessing_enabled: true,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_test(
+        pool: PgPool,
+        objects: std::sync::Arc<dyn object_store::ObjectStore>,
+        secret: &str,
+    ) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test_with_objects(
+                pool, objects,
+            ),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: true,
+            reprocessing_enabled: true,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_without_raw_test(
+        pool: PgPool,
+        objects: std::sync::Arc<dyn object_store::ObjectStore>,
+        secret: &str,
+    ) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test_with_objects(
+                pool, objects,
+            ),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: false,
+            reprocessing_enabled: true,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_disabled_test(pool: PgPool, secret: &str) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            dashboard_enabled: false,
+            raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
         }
@@ -172,6 +243,14 @@ impl ServerState {
 
     pub(crate) fn crash_ingest(&self) -> &crate::crash_ingest::CrashIngest {
         &self.crash_ingest
+    }
+
+    pub(crate) fn dashboard_enabled(&self) -> bool {
+        self.dashboard_enabled
+    }
+
+    pub(crate) fn raw_artifact_download_enabled(&self) -> bool {
+        self.raw_artifact_download_enabled
     }
 
     pub(crate) fn symbol_uploads(&self) -> &crate::symbol_upload::SymbolUploads {
@@ -252,6 +331,7 @@ pub(crate) async fn migrate(database_url: &str) -> Result<(), StartupError> {
         .map_err(|_| StartupError::MigrationFailed)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
     let health = Router::new()
         .route("/health/live", get(move || async move { health(role) }))
@@ -291,6 +371,26 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
                 put(crate::issues::resolve_issue)
                     .delete(crate::issues::reopen_issue)
                     .layer(DefaultBodyLimit::max(4 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/overview",
+                get(crate::dashboard::get_overview),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}/events",
+                get(crate::dashboard::list_issue_events),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}",
+                get(crate::dashboard::get_issue_event),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}/log",
+                get(crate::dashboard::download_log),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}/events/{event_id}/raw",
+                get(crate::dashboard::download_raw),
             )
             .route(
                 "/api/v1/projects/{project_id}/reprocessing",

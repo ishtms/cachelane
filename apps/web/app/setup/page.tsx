@@ -45,7 +45,15 @@ async function ExistingProject({ projectId }: { projectId: string }) {
           </div>
         ))}
       </div>
-      <RotateKey projectId={setup.project.id} />
+      <div className="setup-panel-actions">
+        <Link
+          className="button primary"
+          href={`/projects/${encodeURIComponent(setup.project.id)}`}
+        >
+          Open project dashboard
+        </Link>
+        <RotateKey projectId={setup.project.id} />
+      </div>
     </section>
   );
 }

@@ -4,14 +4,19 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{PgConnection, Row};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::project_setup::ServerState;
 
 const DEFAULT_PAGE_SIZE: u16 = 50;
 const MAX_PAGE_SIZE: u16 = 100;
 const MAX_DETAIL_ROWS: usize = 100;
+const MAX_CURSOR_BYTES: usize = 1024;
+const MAX_SEARCH_BYTES: usize = 120;
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +26,43 @@ pub(crate) struct IssueListQuery {
     status: Option<String>,
     regression_state: Option<String>,
     release_id: Option<String>,
+    crash_type: Option<String>,
+    platform: Option<String>,
+    architecture: Option<String>,
+    engine_version: Option<String>,
+    symbolication_state: Option<String>,
+    first_seen_from: Option<String>,
+    first_seen_to: Option<String>,
+    last_seen_from: Option<String>,
+    last_seen_to: Option<String>,
+    query: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IssueFilterIdentity<'query> {
+    status: Option<&'query str>,
+    regression_state: Option<&'query str>,
+    release_id: Option<&'query str>,
+    crash_type: Option<&'query str>,
+    platform: Option<&'query str>,
+    architecture: Option<&'query str>,
+    engine_version: Option<&'query str>,
+    symbolication_state: Option<&'query str>,
+    first_seen_from: Option<&'query str>,
+    first_seen_to: Option<&'query str>,
+    last_seen_from: Option<&'query str>,
+    last_seen_to: Option<&'query str>,
+    query: Option<&'query str>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueCursor {
+    version: u8,
+    project_id: String,
+    filter_hash: String,
+    last_seen_at: String,
+    issue_id: String,
 }
 
 #[derive(Deserialize)]
@@ -152,20 +194,50 @@ pub(crate) async fn list_issues(
     authorize(&state, &headers)?;
     let Query(query) = query.map_err(|_| IssueError::InvalidRequest)?;
     let query = validate_list_query(query)?;
+    if dashboard_filters_requested(&query) && !state.dashboard_enabled() {
+        return Err(IssueError::NotFound);
+    }
     let pool = state.control_pool().ok_or(IssueError::Internal)?;
-    let scope = project_scope(pool, &project_id).await?;
+    let mut transaction = pool.begin().await.map_err(|_| IssueError::Internal)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| IssueError::Internal)?;
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| IssueError::Internal)?;
+    let scope = transaction_scope(&mut transaction, &project_id).await?;
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    let filter_hash = issue_filter_hash(&query)?;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|value| decode_issue_cursor(value, &scope.project_id, &filter_hash))
+        .transpose()?;
+    let search = query.query.as_deref().map(search_pattern);
     let rows = sqlx::query(
-        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id::text = $1 AND i.project_id::text = $2 AND ($3::uuid IS NULL OR (i.last_seen_at, i.id) < (SELECT c.last_seen_at, c.id FROM issues c WHERE c.id = $3::uuid AND c.organization_id = i.organization_id AND c.project_id = i.project_id)) AND ($4::text IS NULL OR i.status = $4) AND ($5::text IS NULL OR i.regression_state = $5) AND ($6::uuid IS NULL OR EXISTS (SELECT 1 FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id AND ir.release_id = $6::uuid)) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $7",
+        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND ($3::timestamptz IS NULL OR (i.last_seen_at, i.id) < ($3::timestamptz, $4::uuid)) AND ($5::text IS NULL OR i.status = $5) AND ($6::text IS NULL OR i.regression_state = $6) AND ($8::timestamptz IS NULL OR i.first_seen_at >= $8::timestamptz) AND ($9::timestamptz IS NULL OR i.first_seen_at < $9::timestamptz) AND ($10::timestamptz IS NULL OR i.last_seen_at >= $10::timestamptz) AND ($11::timestamptz IS NULL OR i.last_seen_at < $11::timestamptz) AND (($7::uuid IS NULL AND $12::text IS NULL AND $13::text IS NULL AND $14::text IS NULL AND $15::text IS NULL AND $16::text IS NULL) OR EXISTS (SELECT 1 FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND ($7::uuid IS NULL OR e.release_id = $7::uuid) AND ($12::text IS NULL OR s.crash_type = $12) AND ($13::text IS NULL OR s.platform = $13) AND ($14::text IS NULL OR s.architecture = $14) AND ($15::text IS NULL OR s.engine_version = $15) AND ($16::text IS NULL OR CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END = $16))) AND ($17::text IS NULL OR i.title ILIKE $17 ESCAPE E'\\\\' OR EXISTS (SELECT 1 FROM crash_events e JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND s.search_text ILIKE $17 ESCAPE E'\\\\')) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $18",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
-    .bind(query.cursor.as_deref())
+    .bind(cursor.as_ref().map(|value| value.last_seen_at.as_str()))
+    .bind(cursor.as_ref().map(|value| value.issue_id.as_str()))
     .bind(query.status.as_deref())
     .bind(query.regression_state.as_deref())
     .bind(query.release_id.as_deref())
+    .bind(query.first_seen_from.as_deref())
+    .bind(query.first_seen_to.as_deref())
+    .bind(query.last_seen_from.as_deref())
+    .bind(query.last_seen_to.as_deref())
+    .bind(query.crash_type.as_deref())
+    .bind(query.platform.as_deref())
+    .bind(query.architecture.as_deref())
+    .bind(query.engine_version.as_deref())
+    .bind(query.symbolication_state.as_deref())
+    .bind(search.as_deref())
     .bind(i64::from(limit) + 1)
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await
     .map_err(|_| IssueError::Internal)?;
     let mut items = rows
@@ -174,9 +246,26 @@ pub(crate) async fn list_issues(
         .collect::<Vec<_>>();
     let has_next = items.len() > usize::from(limit);
     items.truncate(usize::from(limit));
-    let next_cursor = has_next
-        .then(|| items.last().map(|issue| issue.issue_id.clone()))
-        .flatten();
+    let next_cursor = if has_next {
+        items
+            .last()
+            .map(|issue| {
+                encode_issue_cursor(&IssueCursor {
+                    version: 1,
+                    project_id: scope.project_id.clone(),
+                    filter_hash,
+                    last_seen_at: issue.last_seen_at.clone(),
+                    issue_id: issue.issue_id.clone(),
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    transaction
+        .commit()
+        .await
+        .map_err(|_| IssueError::Internal)?;
     Ok(no_store(
         StatusCode::OK,
         &IssueListResponse { items, next_cursor },
@@ -296,10 +385,9 @@ fn validate_list_query(query: IssueListQuery) -> Result<IssueListQuery, IssueErr
     if query
         .limit
         .is_some_and(|limit| limit == 0 || limit > MAX_PAGE_SIZE)
-        || query
-            .cursor
-            .as_deref()
-            .is_some_and(|value| !valid_uuid(value))
+        || query.cursor.as_deref().is_some_and(|value| {
+            value.is_empty() || value.len() > MAX_CURSOR_BYTES.saturating_mul(2)
+        })
         || query
             .release_id
             .as_deref()
@@ -314,10 +402,165 @@ fn validate_list_query(query: IssueListQuery) -> Result<IssueListQuery, IssueErr
                 "new" | "ongoing" | "resolved" | "regressed" | "unknown"
             )
         })
+        || [
+            query.crash_type.as_deref(),
+            query.platform.as_deref(),
+            query.architecture.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !valid_filter_token(value, 64))
+        || query
+            .engine_version
+            .as_deref()
+            .is_some_and(|value| !valid_filter_text(value, 128))
+        || query.symbolication_state.as_deref().is_some_and(|value| {
+            !matches!(
+                value,
+                "readable" | "partial" | "missing" | "failed" | "processing"
+            )
+        })
+        || [
+            query.first_seen_from.as_deref(),
+            query.first_seen_to.as_deref(),
+            query.last_seen_from.as_deref(),
+            query.last_seen_to.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
+        || !valid_time_range(
+            query.first_seen_from.as_deref(),
+            query.first_seen_to.as_deref(),
+        )
+        || !valid_time_range(
+            query.last_seen_from.as_deref(),
+            query.last_seen_to.as_deref(),
+        )
+        || query.query.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_SEARCH_BYTES
+                || value.chars().any(char::is_control)
+        })
     {
         return Err(IssueError::InvalidRequest);
     }
     Ok(query)
+}
+
+fn dashboard_filters_requested(query: &IssueListQuery) -> bool {
+    query.crash_type.is_some()
+        || query.platform.is_some()
+        || query.architecture.is_some()
+        || query.engine_version.is_some()
+        || query.symbolication_state.is_some()
+        || query.first_seen_from.is_some()
+        || query.first_seen_to.is_some()
+        || query.last_seen_from.is_some()
+        || query.last_seen_to.is_some()
+        || query.query.is_some()
+}
+
+fn valid_filter_token(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-+.".contains(&byte)
+        })
+}
+
+fn valid_filter_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn valid_time_range(from: Option<&str>, to: Option<&str>) -> bool {
+    let (Some(from), Some(to)) = (from, to) else {
+        return true;
+    };
+    let Ok(from) = OffsetDateTime::parse(from, &Rfc3339) else {
+        return false;
+    };
+    let Ok(to) = OffsetDateTime::parse(to, &Rfc3339) else {
+        return false;
+    };
+    from < to
+}
+
+fn issue_filter_hash(query: &IssueListQuery) -> Result<String, IssueError> {
+    let identity = IssueFilterIdentity {
+        status: query.status.as_deref(),
+        regression_state: query.regression_state.as_deref(),
+        release_id: query.release_id.as_deref(),
+        crash_type: query.crash_type.as_deref(),
+        platform: query.platform.as_deref(),
+        architecture: query.architecture.as_deref(),
+        engine_version: query.engine_version.as_deref(),
+        symbolication_state: query.symbolication_state.as_deref(),
+        first_seen_from: query.first_seen_from.as_deref(),
+        first_seen_to: query.first_seen_to.as_deref(),
+        last_seen_from: query.last_seen_from.as_deref(),
+        last_seen_to: query.last_seen_to.as_deref(),
+        query: query.query.as_deref(),
+    };
+    let bytes = serde_json::to_vec(&identity).map_err(|_| IssueError::Internal)?;
+    Ok(lower_hex(&Sha256::digest(bytes)))
+}
+
+fn encode_issue_cursor(cursor: &IssueCursor) -> Result<String, IssueError> {
+    let bytes = serde_json::to_vec(&cursor).map_err(|_| IssueError::Internal)?;
+    if bytes.len() > MAX_CURSOR_BYTES {
+        return Err(IssueError::Internal);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_issue_cursor(
+    value: &str,
+    project_id: &str,
+    filter_hash: &str,
+) -> Result<IssueCursor, IssueError> {
+    if value.is_empty() || value.len() > MAX_CURSOR_BYTES.saturating_mul(2) {
+        return Err(IssueError::InvalidRequest);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| IssueError::InvalidRequest)?;
+    if bytes.len() > MAX_CURSOR_BYTES {
+        return Err(IssueError::InvalidRequest);
+    }
+    let cursor: IssueCursor =
+        serde_json::from_slice(&bytes).map_err(|_| IssueError::InvalidRequest)?;
+    if cursor.version != 1
+        || cursor.project_id != project_id
+        || cursor.filter_hash != filter_hash
+        || !valid_uuid(&cursor.issue_id)
+        || OffsetDateTime::parse(&cursor.last_seen_at, &Rfc3339).is_err()
+    {
+        return Err(IssueError::InvalidRequest);
+    }
+    Ok(cursor)
+}
+
+fn search_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    pattern.push('%');
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut value, "{byte:02x}");
+    }
+    value
 }
 
 fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<(), IssueError> {
@@ -326,24 +569,6 @@ fn authorize(state: &ServerState, headers: &HeaderMap) -> Result<(), IssueError>
     } else {
         Err(IssueError::NotFound)
     }
-}
-
-async fn project_scope(pool: &PgPool, project_id: &str) -> Result<ProjectScope, IssueError> {
-    if !valid_uuid(project_id) {
-        return Err(IssueError::NotFound);
-    }
-    let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, p.id::text AS project_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| IssueError::Internal)?
-    .ok_or(IssueError::NotFound)?;
-    Ok(ProjectScope {
-        organization_id: row.get("organization_id"),
-        project_id: row.get("project_id"),
-    })
 }
 
 async fn transaction_scope(
@@ -616,12 +841,15 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use tower::ServiceExt;
 
-    use super::{IssueError, IssueListQuery, valid_uuid, validate_list_query};
+    use super::{
+        IssueCursor, IssueError, IssueListQuery, decode_issue_cursor, encode_issue_cursor,
+        issue_filter_hash, search_pattern, valid_uuid, validate_list_query,
+    };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
 
     const SECRET: &str = "issue-api-secret-with-at-least-32-bytes";
@@ -635,6 +863,34 @@ mod tests {
                 limit: Some(101),
                 ..IssueListQuery::default()
             }),
+            Err(IssueError::InvalidRequest)
+        ));
+        assert_eq!(search_pattern("100%_safe\\path"), "%100\\%\\_safe\\\\path%");
+        let query = IssueListQuery::default();
+        let filter_hash =
+            issue_filter_hash(&query).unwrap_or_else(|_| panic!("default filters must hash"));
+        let cursor = encode_issue_cursor(&IssueCursor {
+            version: 1,
+            project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+            filter_hash: filter_hash.clone(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_owned(),
+            issue_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_owned(),
+        })
+        .unwrap_or_else(|_| panic!("valid cursor must encode"));
+        assert!(
+            decode_issue_cursor(
+                &cursor,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &filter_hash
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            decode_issue_cursor(
+                &cursor,
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                &filter_hash
+            ),
             Err(IssueError::InvalidRequest)
         ));
         assert!(matches!(
@@ -701,6 +957,125 @@ mod tests {
         let second_page = json_body(second_page).await?;
         assert_eq!(second_page["items"][0]["issue_id"], first.issue_id);
         assert!(second_page["next_cursor"].is_null());
+
+        for filter in [
+            "status=open",
+            "regression_state=new",
+            &format!("release_id={}", owned.release),
+            "crash_type=crash",
+            "platform=windows",
+            "architecture=x86_64",
+            "engine_version=5.8.1",
+            "symbolication_state=readable",
+            "first_seen_from=2026-01-01T00%3A00%3A00Z",
+            "last_seen_to=2026-01-04T00%3A00%3A00Z",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized(Request::builder().uri(format!(
+                        "/api/v1/projects/{}/issues?{filter}",
+                        owned.project
+                    )))
+                    .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "filter: {filter}");
+            assert_eq!(
+                json_body(response).await?["items"].as_array().map(Vec::len),
+                Some(2),
+                "filter: {filter}"
+            );
+        }
+        for (filter, expected_issue) in [
+            (
+                "query=second%3A%3ARoot%28%29",
+                Some(second.issue_id.as_str()),
+            ),
+            ("query=second%20player", Some(second.issue_id.as_str())),
+            ("query=%25", None),
+            (
+                "last_seen_to=2026-01-03T00%3A00%3A00Z",
+                Some(first.issue_id.as_str()),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized(Request::builder().uri(format!(
+                        "/api/v1/projects/{}/issues?{filter}",
+                        owned.project
+                    )))
+                    .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "filter: {filter}");
+            let body = json_body(response).await?;
+            if let Some(expected_issue) = expected_issue {
+                assert_eq!(
+                    body["items"].as_array().map(Vec::len),
+                    Some(1),
+                    "filter: {filter}"
+                );
+                assert_eq!(body["items"][0]["issue_id"], expected_issue);
+            } else {
+                assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+            }
+        }
+        let cross_filter_cursor = app
+            .clone()
+            .oneshot(
+                authorized(Request::builder().uri(format!(
+                    "/api/v1/projects/{}/issues?limit=1&status=open&cursor={cursor}",
+                    owned.project
+                )))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(cross_filter_cursor.status(), StatusCode::BAD_REQUEST);
+        assert_no_store(&cross_filter_cursor);
+
+        sqlx::query(
+            "UPDATE issues SET last_seen_at = '2026-01-03T00:00:00Z' WHERE id::text IN ($1, $2)",
+        )
+        .bind(&first.issue_id)
+        .bind(&second.issue_id)
+        .execute(&pool)
+        .await?;
+        let tied_page = app
+            .clone()
+            .oneshot(
+                authorized(
+                    Request::builder()
+                        .uri(format!("/api/v1/projects/{}/issues?limit=1", owned.project)),
+                )
+                .body(Body::empty())?,
+            )
+            .await?;
+        let tied_page = json_body(tied_page).await?;
+        let tied_first_id = tied_page["items"][0]["issue_id"]
+            .as_str()
+            .ok_or("tied page must include an issue")?;
+        let tied_cursor = tied_page["next_cursor"]
+            .as_str()
+            .ok_or("tied page must include a cursor")?;
+        sqlx::query("UPDATE issues SET last_seen_at = '2026-02-01T00:00:00Z' WHERE id::text = $1")
+            .bind(tied_first_id)
+            .execute(&pool)
+            .await?;
+        let tied_second_page = app
+            .clone()
+            .oneshot(
+                authorized(Request::builder().uri(format!(
+                    "/api/v1/projects/{}/issues?limit=1&cursor={tied_cursor}",
+                    owned.project
+                )))
+                .body(Body::empty())?,
+            )
+            .await?;
+        let tied_second_page = json_body(tied_second_page).await?;
+        assert_eq!(tied_second_page["items"].as_array().map(Vec::len), Some(1));
+        assert_ne!(tied_second_page["items"][0]["issue_id"], tied_first_id);
 
         let detail = app
             .clone()
@@ -930,6 +1305,7 @@ mod tests {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn insert_issue(
         pool: &PgPool,
         scope: &Scope,
@@ -956,6 +1332,52 @@ mod tests {
         .bind(received_at)
         .fetch_one(pool)
         .await?;
+        let result = json!({
+            "crash_context": {
+                "crash_type": "crash",
+                "platform": {"normalized": "windows"},
+                "architecture": "x86_64",
+                "engine_version": "5.8.1",
+                "error_message": format!("{suffix} access violation"),
+                "user_comment": format!("{suffix} player report")
+            },
+            "current": {
+                "symbolication": {
+                    "modules": [{"module": format!("{suffix}.exe"), "status": "matched"}],
+                    "threads": [{"frames": [{
+                        "function": format!("{suffix}::Root()"),
+                        "symbol_status": "resolved"
+                    }]}]
+                }
+            }
+        });
+        let result_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, 1, 2, $4, $5) RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&event_id)
+        .bind(result)
+        .bind(Sha256::digest(format!("{suffix}-result")).to_vec())
+        .fetch_one(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO crash_event_search (organization_id, project_id, event_id, result_id, search_text, crash_type, platform, architecture, engine_version, symbolication_state) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'crash', 'windows', 'x86_64', '5.8.1', 'readable')",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&event_id)
+        .bind(&result_id)
+        .bind(format!(
+            "{suffix} access violation\u{1f}{suffix} player report\u{1f}{suffix}.exe\u{1f}{suffix}::Root()"
+        ))
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id::text = $1")
+            .bind(&event_id)
+            .bind(&result_id)
+            .execute(pool)
+            .await?;
         let fingerprint = fingerprint_character.to_string().repeat(64);
         let variant = if fingerprint_character == 'f' {
             "e".repeat(64)
