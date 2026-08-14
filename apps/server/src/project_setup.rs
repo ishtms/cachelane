@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,18 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    pub(crate) fn issue_test(pool: PgPool, secret: &str) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool),
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+        }
+    }
+
+    #[cfg(test)]
     fn add_outside_project(&self, project_id: &str) {
         let ProjectStore::Memory(store) = &self.store else {
             panic!("test state must use memory storage");
@@ -157,6 +169,21 @@ impl ServerState {
 
     pub(crate) fn symbol_uploads(&self) -> &crate::symbol_upload::SymbolUploads {
         &self.symbol_uploads
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "test routers can use memory storage without exposing a database"
+        )
+    )]
+    pub(crate) fn control_pool(&self) -> Option<&PgPool> {
+        match &self.store {
+            ProjectStore::Postgres(pool) => Some(pool),
+            #[cfg(test)]
+            ProjectStore::Memory(_) => None,
+        }
     }
 
     pub(crate) fn start_maintenance(&self, role: &str) {
@@ -239,6 +266,20 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
             .route(
                 "/api/v1/projects/{project_id}/events/{event_id}",
                 get(crate::crash_ingest::get_event_state),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues",
+                get(crate::issues::list_issues),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}",
+                get(crate::issues::get_issue),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/issues/{issue_id}/resolution",
+                put(crate::issues::resolve_issue)
+                    .delete(crate::issues::reopen_issue)
+                    .layer(DefaultBodyLimit::max(4 * 1024)),
             )
             .route(
                 "/api/v1/projects/{project_id}/artifact-upload-tokens",

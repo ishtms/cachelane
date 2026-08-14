@@ -208,6 +208,130 @@ paths:
           $ref: "#/components/responses/IngestNotFound"
         "500":
           $ref: "#/components/responses/IngestInternalError"
+  /api/v1/projects/{project_id}/issues:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: listProjectIssues
+      summary: List bounded project issues in stable last-seen order
+      security:
+        - bootstrapAuthorization: []
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Issue ID returned as next_cursor by the previous page.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/IssueStatus"
+        - name: regression_state
+          in: query
+          schema:
+            $ref: "#/components/schemas/IssueRegressionState"
+        - name: release_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Bounded issue page
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueList"
+        "400":
+          $ref: "#/components/responses/IssueInvalidRequest"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+    get:
+      operationId: getProjectIssue
+      summary: Get bounded issue details, variants, and affected releases
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Issue details
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueDetail"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+  /api/v1/projects/{project_id}/issues/{issue_id}/resolution:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/IssueId"
+    put:
+      operationId: resolveProjectIssue
+      summary: Resolve an issue against one ordered project release
+      security:
+        - bootstrapAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveIssueRequest"
+      responses:
+        "200":
+          description: Issue resolution state
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueResolution"
+        "400":
+          $ref: "#/components/responses/IssueInvalidRequest"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
+    delete:
+      operationId: reopenProjectIssue
+      summary: Reopen an issue and recalculate its retained release state
+      security:
+        - bootstrapAuthorization: []
+      responses:
+        "200":
+          description: Reopened issue state
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueResolution"
+        "404":
+          $ref: "#/components/responses/IssueNotFound"
+        "500":
+          $ref: "#/components/responses/IssueInternalError"
   /api/v1/projects/{project_id}/artifact-upload-tokens:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -550,9 +674,16 @@ components:
       schema:
         type: string
         format: uuid
+    IssueId:
+      name: issue_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   headers:
     CacheControlNoStore:
-      description: Prevent storage of credential and artifact metadata responses.
+      description: Prevent storage of sensitive control and artifact metadata responses.
       schema:
         type: string
         const: no-store
@@ -656,6 +787,33 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/UploadError"
+    IssueInvalidRequest:
+      description: Issue request validation failed
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    IssueNotFound:
+      description: The issue resource is unavailable or outside the caller's organization
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    IssueInternalError:
+      description: Issue request could not be completed
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControlNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
   schemas:
     Health:
       type: object
@@ -897,6 +1055,41 @@ components:
         - processed
         - failed
         - quarantined
+    GroupingState:
+      type: string
+      enum:
+        - pending
+        - disabled
+        - insufficient
+        - grouped
+    ReleaseMappingState:
+      type: string
+      enum:
+        - pending
+        - matched
+        - missing
+        - ambiguous
+    Fingerprint:
+      type: string
+      pattern: ^[a-f0-9]{64}$
+    NullableFingerprint:
+      type:
+        - string
+        - "null"
+      pattern: ^[a-f0-9]{64}$
+    IssueStatus:
+      type: string
+      enum:
+        - open
+        - resolved
+    IssueRegressionState:
+      type: string
+      enum:
+        - new
+        - ongoing
+        - resolved
+        - regressed
+        - unknown
     EventState:
       type: object
       additionalProperties: false
@@ -909,6 +1102,18 @@ components:
         - reason
         - retryable
         - retry_at
+        - grouping_state
+        - fingerprint_algorithm
+        - fingerprint_version
+        - fingerprint
+        - variant_fingerprint
+        - grouping_quality
+        - issue_id
+        - issue_path
+        - release_mapping_state
+        - release_id
+        - candidate_release_ids
+        - candidate_release_ids_truncated
         - received_at
         - updated_at
       properties:
@@ -938,11 +1143,370 @@ components:
             - string
             - "null"
           format: date-time
+        grouping_state:
+          $ref: "#/components/schemas/GroupingState"
+        fingerprint_algorithm:
+          type:
+            - string
+            - "null"
+          pattern: ^[a-z][a-z0-9_]{0,31}$
+        fingerprint_version:
+          type:
+            - integer
+            - "null"
+          minimum: 1
+        fingerprint:
+          $ref: "#/components/schemas/NullableFingerprint"
+        variant_fingerprint:
+          $ref: "#/components/schemas/NullableFingerprint"
+        grouping_quality:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        issue_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        issue_path:
+          type:
+            - string
+            - "null"
+        release_mapping_state:
+          $ref: "#/components/schemas/ReleaseMappingState"
+        release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        candidate_release_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+        candidate_release_ids_truncated:
+          type: boolean
         received_at:
           type: string
           format: date-time
         updated_at:
           type: string
+          format: date-time
+    IssueSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - issue_id
+        - path
+        - title
+        - fingerprint_algorithm
+        - fingerprint_version
+        - fingerprint
+        - status
+        - regression_state
+        - first_seen_at
+        - last_seen_at
+        - event_count
+        - representative_event_id
+        - first_release_id
+        - last_release_id
+        - resolved_in_release_id
+        - resolved_at
+        - affected_release_count
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        fingerprint_algorithm:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,31}$
+        fingerprint_version:
+          type: integer
+          minimum: 1
+        fingerprint:
+          $ref: "#/components/schemas/Fingerprint"
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        regression_state:
+          $ref: "#/components/schemas/IssueRegressionState"
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+        representative_event_id:
+          type: string
+          format: uuid
+        first_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        last_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        resolved_in_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        resolved_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        affected_release_count:
+          type: integer
+          minimum: 0
+    IssueList:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IssueSummary"
+        next_cursor:
+          type:
+            - string
+            - "null"
+          format: uuid
+    ReleaseMappingSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - matched
+        - missing
+        - ambiguous
+      properties:
+        matched:
+          type: integer
+          minimum: 0
+        missing:
+          type: integer
+          minimum: 0
+        ambiguous:
+          type: integer
+          minimum: 0
+    IssueVariant:
+      type: object
+      additionalProperties: false
+      required:
+        - fingerprint
+        - first_seen_at
+        - last_seen_at
+        - event_count
+        - representative_event_id
+      properties:
+        fingerprint:
+          $ref: "#/components/schemas/Fingerprint"
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+        representative_event_id:
+          type: string
+          format: uuid
+    IssueRelease:
+      type: object
+      additionalProperties: false
+      required:
+        - release_id
+        - version
+        - platform
+        - architecture
+        - configuration
+        - build_timestamp
+        - first_seen_at
+        - last_seen_at
+        - event_count
+        - representative_event_id
+      properties:
+        release_id:
+          type: string
+          format: uuid
+        version:
+          type: string
+        platform:
+          type: string
+        architecture:
+          type: string
+        configuration:
+          type: string
+        build_timestamp:
+          type:
+            - string
+            - "null"
+          format: date-time
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+        representative_event_id:
+          type: string
+          format: uuid
+    IssueDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - issue_id
+        - path
+        - title
+        - fingerprint_algorithm
+        - fingerprint_version
+        - fingerprint
+        - status
+        - regression_state
+        - first_seen_at
+        - last_seen_at
+        - event_count
+        - representative_event_id
+        - first_release_id
+        - last_release_id
+        - resolved_in_release_id
+        - resolved_at
+        - affected_release_count
+        - release_mapping
+        - variants
+        - variants_truncated
+        - releases
+        - releases_truncated
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        fingerprint_algorithm:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,31}$
+        fingerprint_version:
+          type: integer
+          minimum: 1
+        fingerprint:
+          $ref: "#/components/schemas/Fingerprint"
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        regression_state:
+          $ref: "#/components/schemas/IssueRegressionState"
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+        representative_event_id:
+          type: string
+          format: uuid
+        first_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        last_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        resolved_in_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        resolved_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        affected_release_count:
+          type: integer
+          minimum: 0
+        release_mapping:
+          $ref: "#/components/schemas/ReleaseMappingSummary"
+        variants:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IssueVariant"
+        variants_truncated:
+          type: boolean
+        releases:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IssueRelease"
+        releases_truncated:
+          type: boolean
+    ResolveIssueRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - release_id
+      properties:
+        release_id:
+          type: string
+          format: uuid
+    IssueResolution:
+      type: object
+      additionalProperties: false
+      required:
+        - issue_id
+        - status
+        - regression_state
+        - resolved_in_release_id
+        - resolved_at
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        regression_state:
+          $ref: "#/components/schemas/IssueRegressionState"
+        resolved_in_release_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        resolved_at:
+          type:
+            - string
+            - "null"
           format: date-time
     CreatedArtifactUploadToken:
       type: object

@@ -1203,7 +1203,7 @@ async fn upsert_release(
     release: &ReleaseRequest,
 ) -> Result<ReleaseView, UploadError> {
     let row = sqlx::query(
-        "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, revision, channel, build_timestamp) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::timestamptz) ON CONFLICT (project_id, version, platform, architecture, configuration) DO UPDATE SET revision = COALESCE(EXCLUDED.revision, releases.revision), channel = COALESCE(EXCLUDED.channel, releases.channel), build_timestamp = COALESCE(EXCLUDED.build_timestamp, releases.build_timestamp), updated_at = now() WHERE releases.organization_id = EXCLUDED.organization_id RETURNING id::text AS id, version, platform, architecture, configuration, revision, channel, build_timestamp",
+        "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, revision, channel, build_timestamp) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::timestamptz) ON CONFLICT (project_id, version, platform, architecture, configuration) DO UPDATE SET revision = COALESCE(EXCLUDED.revision, releases.revision), channel = COALESCE(EXCLUDED.channel, releases.channel), build_timestamp = COALESCE(releases.build_timestamp, EXCLUDED.build_timestamp), updated_at = now() WHERE releases.organization_id = EXCLUDED.organization_id RETURNING id::text AS id, version, platform, architecture, configuration, revision, channel, build_timestamp",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -2403,6 +2403,26 @@ mod tests {
         let release_id = negotiated["release"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("release ID must exist"));
+
+        let mut retimestamped = request.clone();
+        retimestamped["release"]["build_timestamp"] = json!("2030-01-01T00:00:00Z");
+        let (status, retimestamped) = request_json(
+            &state,
+            bearer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/faultlane-proof/artifact-uploads"),
+                token,
+            )
+            .body(Body::from(retimestamped.to_string()))
+            .unwrap_or_else(|error| panic!("request must build: {error}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retimestamped}");
+        assert_eq!(
+            retimestamped["release"]["build_timestamp"],
+            "2026-08-14T00:00:00Z"
+        );
 
         let concurrent_left = request_json(
             &state,
