@@ -43,8 +43,11 @@ export default function Home() {
           grouped issues with useful stacks and clear diagnostics.
         </p>
         <div className="actions">
+          <a className="primary" href="/sign-in">
+            Sign in
+          </a>
           <a className="primary" href="/setup">
-            Set up a project
+            Local setup
           </a>
           <a className="primary" href="https://github.com/ishtms/faultlane">
             View repository

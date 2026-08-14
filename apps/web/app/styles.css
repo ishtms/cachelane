@@ -74,6 +74,14 @@ main {
   text-transform: uppercase;
 }
 
+.nav-actions {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .hero {
   display: flex;
   min-height: 650px;
@@ -285,6 +293,16 @@ footer {
   font: inherit;
 }
 
+.setup-form select,
+.account-actions select {
+  padding: 11px 12px;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #080b10;
+  color: var(--text);
+  font: inherit;
+}
+
 .setup-form input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgb(124 246 199 / 10%);
@@ -309,6 +327,48 @@ button.primary {
 button:disabled {
   cursor: wait;
   opacity: 0.6;
+}
+
+.account-card {
+  display: grid;
+  gap: 34px;
+}
+
+.account-card section {
+  display: grid;
+  gap: 16px;
+}
+
+.account-invite {
+  padding: 24px;
+}
+
+.account-row,
+.account-actions,
+.account-actions form {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.account-row {
+  justify-content: space-between;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.account-actions {
+  flex-wrap: wrap;
+}
+
+.account-row button,
+.account-actions button {
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
 }
 
 .setup-result h2,

@@ -77,6 +77,341 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/v1/auth/providers:
+    get:
+      operationId: getAuthenticationProviders
+      summary: List configured hosted sign-in providers
+      responses:
+        "200":
+          description: Hosted sign-in provider availability
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthProviders"
+  /api/v1/auth/github/start:
+    post:
+      operationId: startGitHubSignIn
+      summary: Start GitHub OAuth sign-in
+      responses:
+        "200":
+          description: GitHub authorization URL
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GitHubStart"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/auth/github/callback:
+    post:
+      operationId: completeGitHubSignIn
+      summary: Exchange a GitHub OAuth callback for a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitHubCallback"
+      responses:
+        "201":
+          description: Hosted session created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionCreated"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/auth/email/start:
+    post:
+      operationId: startEmailSignIn
+      summary: Send a single-use email sign-in link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailStart"
+      responses:
+        "202":
+          description: Sign-in request accepted
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/auth/email/verify:
+    post:
+      operationId: verifyEmailSignIn
+      summary: Exchange a single-use email token for a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretRequest"
+      responses:
+        "201":
+          description: Hosted session created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionCreated"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/auth/session:
+    get:
+      operationId: getCurrentSession
+      summary: Get the current hosted session and memberships
+      security:
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Current hosted session
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/auth/sessions:
+    get:
+      operationId: listSessions
+      summary: List active sessions for the current user
+      security:
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Active hosted sessions
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/auth/sessions/{session_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    delete:
+      operationId: revokeSession
+      summary: Revoke one session owned by the current user
+      security:
+        - sessionAuthorization: []
+      responses:
+        "204":
+          description: Session revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/organizations/{organization_id}/members:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationMembers
+      summary: List members and manageable pending invitations
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Organization members
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/organizations/{organization_id}/members/{user_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/UserId"
+    patch:
+      operationId: updateOrganizationMember
+      summary: Change an organization member role
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMember"
+      responses:
+        "200":
+          description: Updated organization member
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: removeOrganizationMember
+      summary: Remove an organization member
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "204":
+          description: Organization member removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/v1/organizations/{organization_id}/invitations:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    post:
+      operationId: createOrganizationInvitation
+      summary: Invite an organization member
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInvitation"
+      responses:
+        "201":
+          description: Organization invitation created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Invitation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/organizations/{organization_id}/invitations/{invitation_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/InvitationId"
+    delete:
+      operationId: revokeOrganizationInvitation
+      summary: Revoke a pending organization invitation
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "204":
+          description: Organization invitation revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/invitations/accept:
+    post:
+      operationId: acceptOrganizationInvitation
+      summary: Accept an organization invitation and create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretRequest"
+      responses:
+        "200":
+          description: Invitation accepted and hosted session created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionCreated"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/organizations/{organization_id}/audit:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationAuditLog
+      summary: List recent organization audit entries
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Recent organization audit entries
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/projects/{project_id}/setup:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -85,6 +420,7 @@ paths:
       summary: Get setup details without raw ingest keys
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Project setup details
@@ -111,6 +447,7 @@ paths:
       description: The raw ingest key is returned once.
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       requestBody:
         required: false
         content:
@@ -142,6 +479,7 @@ paths:
       summary: Update one ingest key environment and source allowlist
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       requestBody:
         required: true
         content:
@@ -176,6 +514,7 @@ paths:
       summary: Revoke a project ingest key
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "204":
           description: Ingest key revoked
@@ -197,6 +536,7 @@ paths:
       summary: Get one project-scoped crash processing state
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Current crash processing state
@@ -216,6 +556,7 @@ paths:
       summary: Get a fixed 30-day project health and observed usage overview
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Project overview from one repeatable-read snapshot
@@ -238,6 +579,7 @@ paths:
       summary: List bounded project issues in stable last-seen order
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       parameters:
         - name: cursor
           in: query
@@ -341,6 +683,7 @@ paths:
       summary: Get bounded issue details, variants, and affected releases
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Issue details
@@ -364,6 +707,7 @@ paths:
       summary: List one issue's events and bounded facets in stable order
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       parameters:
         - name: cursor
           in: query
@@ -404,6 +748,7 @@ paths:
       summary: Get bounded validated crash context, stacks, and processing history
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Readable event detail
@@ -430,6 +775,7 @@ paths:
       summary: Download the bounded derived UTF-8 log tail
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Bounded log attachment
@@ -472,6 +818,7 @@ paths:
       summary: Stream the exact retained raw crash bundle through the control API
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Retained raw crash bundle
@@ -521,6 +868,7 @@ paths:
       summary: Resolve an issue against one ordered project release
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       requestBody:
         required: true
         content:
@@ -548,6 +896,7 @@ paths:
       summary: Reopen an issue and recalculate its retained release state
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Reopened issue state
@@ -570,6 +919,7 @@ paths:
       summary: Start one bounded project reprocessing request
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -614,6 +964,7 @@ paths:
       summary: Get bounded reprocessing progress and failure counts
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "200":
           description: Current reprocessing request progress
@@ -637,6 +988,7 @@ paths:
       description: The raw token is returned once and only its SHA-256 digest is stored.
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "201":
           description: Artifact upload token created
@@ -662,6 +1014,7 @@ paths:
       summary: Revoke a project-scoped artifact upload token
       security:
         - bootstrapAuthorization: []
+        - sessionAuthorization: []
       responses:
         "204":
           description: Artifact upload token revoked
@@ -930,6 +1283,11 @@ components:
       in: header
       name: Authorization
       description: Loopback-only Authorization header using the value Bootstrap followed by the configured secret.
+    sessionAuthorization:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Authorization header using Session followed by the hosted session token.
     artifactUploadToken:
       type: http
       scheme: bearer
@@ -991,6 +1349,34 @@ components:
       schema:
         type: string
         format: uuid
+    OrganizationId:
+      name: organization_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    InvitationId:
+      name: invitation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   headers:
     CacheControlNoStore:
       description: Prevent storage of sensitive control and artifact metadata responses.
@@ -1020,13 +1406,31 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Unauthorized:
-      description: Bootstrap authorization is missing or invalid
+      description: Authorization is missing or invalid
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
       description: The resource is unavailable or outside the caller's organization
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The authenticated role cannot perform this operation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: The request conflicts with current state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unavailable:
+      description: The authentication or delivery service is unavailable
       content:
         application/json:
           schema:
@@ -1188,6 +1592,295 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    AuthProviders:
+      type: object
+      additionalProperties: false
+      required:
+        - github
+        - email
+      properties:
+        github:
+          type: boolean
+        email:
+          type: boolean
+    GitHubStart:
+      type: object
+      additionalProperties: false
+      required:
+        - authorization_url
+      properties:
+        authorization_url:
+          type: string
+          format: uri
+    GitHubCallback:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - state
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 512
+        state:
+          type: string
+          minLength: 68
+          maxLength: 68
+    EmailStart:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+    SecretRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          minLength: 68
+          maxLength: 68
+    Role:
+      type: string
+      enum:
+        - owner
+        - admin
+        - developer
+        - viewer
+    User:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - email
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+    Membership:
+      type: object
+      additionalProperties: false
+      required:
+        - organization_id
+        - organization_name
+        - organization_slug
+        - role
+      properties:
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        organization_slug:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - created_at
+        - last_seen_at
+        - expires_at
+        - current
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        current:
+          type: boolean
+    SessionResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - session
+        - user
+        - memberships
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        user:
+          $ref: "#/components/schemas/User"
+        memberships:
+          type: array
+          items:
+            $ref: "#/components/schemas/Membership"
+    SessionCreated:
+      type: object
+      additionalProperties: false
+      required:
+        - token
+        - session
+        - user
+        - memberships
+      properties:
+        token:
+          type: string
+          writeOnly: true
+        session:
+          $ref: "#/components/schemas/Session"
+        user:
+          $ref: "#/components/schemas/User"
+        memberships:
+          type: array
+          items:
+            $ref: "#/components/schemas/Membership"
+    SessionList:
+      type: object
+      additionalProperties: false
+      required:
+        - sessions
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Session"
+    Member:
+      type: object
+      additionalProperties: false
+      required:
+        - user_id
+        - email
+        - role
+        - joined_at
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: "#/components/schemas/Role"
+        joined_at:
+          type: string
+          format: date-time
+    Invitation:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - email
+        - role
+        - expires_at
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: "#/components/schemas/Role"
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    MemberList:
+      type: object
+      additionalProperties: false
+      required:
+        - members
+        - invitations
+      properties:
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/Member"
+        invitations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Invitation"
+    CreateInvitation:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - role
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        role:
+          $ref: "#/components/schemas/Role"
+    UpdateMember:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+    AuditEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - actor_user_id
+        - action
+        - target_type
+        - target_id
+        - result
+        - occurred_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        actor_user_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        action:
+          type: string
+        target_type:
+          type: string
+        target_id:
+          type: string
+        result:
+          type: string
+          enum:
+            - succeeded
+            - denied
+            - failed
+        occurred_at:
+          type: string
+          format: date-time
+    AuditList:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AuditEntry"
     Health:
       type: object
       additionalProperties: false

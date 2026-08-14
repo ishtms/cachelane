@@ -625,6 +625,7 @@ fn no_store(response: impl IntoResponse) -> Response {
 pub(crate) enum UploadError {
     Invalid,
     Unauthorized,
+    Forbidden,
     NotFound,
     Conflict,
     Mismatch,
@@ -645,6 +646,12 @@ impl IntoResponse for UploadError {
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "artifact upload authorization is required",
+                false,
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "operation is not allowed",
                 false,
             ),
             Self::NotFound => (
@@ -703,23 +710,46 @@ pub(crate) async fn create_upload_token(
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UploadError> {
-    if !state.authorize_control(&headers) {
-        return Err(UploadError::Unauthorized);
-    }
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageProject,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::auth::AuthorizationError::Forbidden => UploadError::Forbidden,
+        crate::auth::AuthorizationError::Unavailable => UploadError::Unavailable,
+        crate::auth::AuthorizationError::Unauthorized => UploadError::Unauthorized,
+        crate::auth::AuthorizationError::NotFound => UploadError::NotFound,
+    })?;
     let uploads = state.symbol_uploads();
     let secret = GeneratedSecret::new()?;
     let row = sqlx::query(
-        "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) SELECT p.organization_id, p.id, u.id, $2, $3 FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id AND u.bootstrap_subject = 'local-bootstrap' WHERE p.id::text = $1 RETURNING id::text AS id, project_id::text AS project_id, created_at::text AS created_at",
+        "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5) RETURNING id::text AS id, project_id::text AS project_id, created_at::text AS created_at",
     )
-    .bind(&project_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
+    .bind(&actor.actor.user_id)
     .bind(secret.digest.to_vec())
     .bind(&secret.suffix)
     .fetch_optional(uploads.pool()?)
     .await
     .map_err(|_| UploadError::Unavailable)?
     .ok_or(UploadError::NotFound)?;
+    let token_id: String = row.get("id");
+    crate::auth::audit(
+        uploads.pool()?,
+        &actor.organization_id,
+        Some(&actor.actor.user_id),
+        "artifact_upload_token.created",
+        "artifact_upload_token",
+        &token_id,
+        "succeeded",
+    )
+    .await;
     let response = Json(CreatedToken {
-        id: row.get("id"),
+        id: token_id,
         project_id: row.get("project_id"),
         token: secret.value,
         display_suffix: secret.suffix,
@@ -733,20 +763,41 @@ pub(crate) async fn revoke_upload_token(
     Path((project_id, token_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, UploadError> {
-    if !state.authorize_control(&headers) {
-        return Err(UploadError::Unauthorized);
-    }
-    let result = sqlx::query(
-        "UPDATE artifact_upload_tokens t SET revoked_at = COALESCE(t.revoked_at, now()) FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id AND u.bootstrap_subject = 'local-bootstrap' WHERE t.id::text = $2 AND t.project_id = p.id AND t.organization_id = p.organization_id AND p.id::text = $1",
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ManageProject,
     )
-    .bind(project_id)
-    .bind(token_id)
+    .await
+    .map_err(|error| match error {
+        crate::auth::AuthorizationError::Forbidden => UploadError::Forbidden,
+        crate::auth::AuthorizationError::Unavailable => UploadError::Unavailable,
+        crate::auth::AuthorizationError::Unauthorized => UploadError::Unauthorized,
+        crate::auth::AuthorizationError::NotFound => UploadError::NotFound,
+    })?;
+    let result = sqlx::query(
+        "UPDATE artifact_upload_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+    )
+    .bind(&token_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
     .execute(state.symbol_uploads().pool()?)
     .await
     .map_err(|_| UploadError::Unavailable)?;
     if result.rows_affected() == 0 {
         return Err(UploadError::NotFound);
     }
+    crate::auth::audit(
+        state.symbol_uploads().pool()?,
+        &actor.organization_id,
+        Some(&actor.actor.user_id),
+        "artifact_upload_token.revoked",
+        "artifact_upload_token",
+        &token_id,
+        "succeeded",
+    )
+    .await;
     Ok(no_store(StatusCode::NO_CONTENT))
 }
 

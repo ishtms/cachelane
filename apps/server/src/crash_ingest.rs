@@ -480,14 +480,23 @@ pub(crate) async fn get_event_state(
     headers: HeaderMap,
     Path((project_id, event_id)): Path<(String, String)>,
 ) -> Result<Response, IngestError> {
-    if !state.authorize_control(&headers) {
-        return Err(IngestError::NotFound);
-    }
+    let actor = crate::auth::authorize_project(
+        &state,
+        &headers,
+        &project_id,
+        crate::auth::Permission::ReadProject,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::auth::AuthorizationError::Unavailable => IngestError::Unavailable,
+        _ => IngestError::NotFound,
+    })?;
     let pool = state.crash_ingest().pool()?;
     let row = sqlx::query(
-        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id AND m.role = 'owner' JOIN users u ON u.id = m.user_id WHERE u.bootstrap_subject = 'local-bootstrap' AND p.id::text = $1 AND e.id::text = $2",
+        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.id::text = $3",
     )
-    .bind(&project_id)
+    .bind(&actor.organization_id)
+    .bind(&actor.project_id)
     .bind(event_id)
     .fetch_optional(pool)
     .await
