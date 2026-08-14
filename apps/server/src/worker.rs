@@ -1743,19 +1743,19 @@ fn verify_private_windows_acl(path: &Path, sid: &str, icacls: &Path) -> Result<(
         }
         let bytes = fs::read(&dump)?;
         let descriptor = decode_windows_acl(&bytes)?;
-        if windows_acl_is_private(&descriptor, sid) {
+        let current = format!("*{sid}");
+        let current_sid_found = std::process::Command::new(icacls)
+            .arg(path)
+            .args(["/findsid", &current])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success();
+        if windows_acl_is_private(&descriptor, sid, current_sid_found) {
             Ok(())
         } else {
-            #[cfg(test)]
-            let message = format!(
-                "worker scratch ACL is not private: {}",
-                descriptor
-                    .replace(sid, "CURRENT_USER")
-                    .replace(['\r', '\n'], "")
-            );
-            #[cfg(not(test))]
-            let message = "worker scratch ACL is not private";
-            Err(std::io::Error::other(message))
+            Err(std::io::Error::other("worker scratch ACL is not private"))
         }
     });
     let _ = fs::remove_file(dump);
@@ -1777,7 +1777,10 @@ fn decode_windows_acl(bytes: &[u8]) -> Result<String, std::io::Error> {
 }
 
 #[cfg(windows)]
-fn windows_acl_is_private(descriptor: &str, sid: &str) -> bool {
+fn windows_acl_is_private(descriptor: &str, sid: &str, current_sid_present: bool) -> bool {
+    if !current_sid_present {
+        return false;
+    }
     let Some((dacl, first_ace)) = descriptor
         .lines()
         .map(str::trim)
@@ -1791,28 +1794,23 @@ fn windows_acl_is_private(descriptor: &str, sid: &str) -> bool {
     else {
         return false;
     };
-    let mut actual: Vec<&str> = dacl[first_ace..]
+    let mut trustees: Vec<&str> = dacl[first_ace..]
         .split('(')
         .skip(1)
         .filter_map(|ace| ace.strip_suffix(')'))
+        .filter_map(|ace| ace.strip_prefix("A;OICI;FA;;;"))
         .collect();
-    if actual.iter().any(|ace| ace.contains(['(', ')'])) {
+    let ace_count = dacl[first_ace..].matches('(').count();
+    if trustees.len() != ace_count || trustees.iter().any(|trustee| trustee.contains(['(', ')'])) {
         return false;
     }
-    let user = match sid {
-        "S-1-5-18" => "SY",
-        "S-1-5-19" => "LS",
-        "S-1-5-20" => "NS",
-        value => value,
-    };
-    let system = "A;OICI;FA;;;SY";
-    let user = format!("A;OICI;FA;;;{user}");
-    let mut expected = vec![system, user.as_str()];
-    actual.sort_unstable();
-    actual.dedup();
-    expected.sort_unstable();
-    expected.dedup();
-    actual == expected
+    trustees.sort_unstable();
+    trustees.dedup();
+    let system_count = trustees
+        .iter()
+        .filter(|trustee| matches!(**trustee, "SY" | "S-1-5-18"))
+        .count();
+    system_count == 1 && trustees.len() == usize::from(sid != "S-1-5-18") + 1
 }
 
 #[cfg(windows)]
@@ -1959,10 +1957,26 @@ mod tests {
         let sid = "S-1-5-21-1000";
         let descriptor =
             format!("D:\\a\\faultlane\\scratch\r\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})\r\n");
-        assert!(super::windows_acl_is_private(&descriptor, sid));
+        assert!(super::windows_acl_is_private(&descriptor, sid, true));
+        assert!(super::windows_acl_is_private(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)\r\n",
+            sid,
+            true
+        ));
+        assert!(!super::windows_acl_is_private(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)\r\n",
+            sid,
+            false
+        ));
         assert!(!super::windows_acl_is_private(
             "D:NO_ACCESS_CONTROL\r\n",
-            sid
+            sid,
+            true
+        ));
+        assert!(!super::windows_acl_is_private(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)(A;OICI;FA;;;BA)\r\n",
+            sid,
+            true
         ));
     }
 
