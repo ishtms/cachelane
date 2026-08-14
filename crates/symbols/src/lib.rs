@@ -18,11 +18,16 @@ use pdb::MachineType;
 use serde::Serialize;
 
 mod symbolicate;
+mod symcache;
 
 pub use symbolicate::{
     FrameSymbolStatus, InlineSymbol, ModuleSymbolStatus, SymbolicatedFrame, SymbolicatedModule,
     SymbolicatedThread, SymbolicationError, SymbolicationErrorKind, SymbolicationLimits,
     SymbolicationResult, ThreadUnwindStatus, symbolicate_minidump, symbolicate_minidump_bytes,
+};
+pub use symcache::{
+    SYMCACHE_FORMAT_VERSION, SYMCACHE_PROCESSOR_VERSION, SymCacheArtifact, SymCacheGenerationError,
+    SymCacheMetadata, generate_symcache, symbolicate_minidump_bytes_with_symcaches,
 };
 
 pub const ARTIFACT_SCAN_SCHEMA_VERSION: u32 = 1;

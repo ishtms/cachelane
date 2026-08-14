@@ -12,6 +12,7 @@ aws-sdk-s3.workspace = true
 axum.workspace = true
 base64.workspace = true
 faultlane-domain = { path = "../../crates/domain" }
+faultlane-processing = { path = "../../crates/processing" }
 faultlane-symbols = { path = "../../crates/symbols" }
 faultlane-unreal = { path = "../../crates/unreal" }
 clap.workspace = true

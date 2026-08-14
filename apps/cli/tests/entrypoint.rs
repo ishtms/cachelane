@@ -444,6 +444,8 @@ fn coverage_json(available: u64, missing: u64) -> serde_json::Value {
         "available": available,
         "missing": missing,
         "mismatch": 0,
+        "processing": 0,
+        "quarantined": 0,
         "ready": missing == 0
     })
 }

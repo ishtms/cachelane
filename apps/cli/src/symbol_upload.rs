@@ -5,7 +5,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -28,6 +28,8 @@ const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_API_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PARTS: u32 = 10_000;
+const INDEX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const INDEX_POLL_TIMEOUT: Duration = Duration::from_mins(3);
 
 pub(crate) struct UploadOptions {
     pub(crate) path: PathBuf,
@@ -141,7 +143,12 @@ pub(crate) fn upload(options: &UploadOptions) -> Result<(), UploadError> {
                 );
                 let completed: CompleteResponse =
                     api.json::<(), _>(Method::POST, &complete_path, None)?;
-                if completed.release_id != release.id || completed.artifact_status != "available" {
+                if completed.release_id != release.id
+                    || !matches!(
+                        completed.artifact_status.as_str(),
+                        "available" | "processing"
+                    )
+                {
                     return Err(UploadError::Internal);
                 }
                 coverage = completed.coverage;
@@ -154,8 +161,8 @@ pub(crate) fn upload(options: &UploadOptions) -> Result<(), UploadError> {
         "/api/v1/releases/{}/coverage",
         percent_encode_segment(&release.id)
     );
-    let final_coverage: CoverageResponse = api.json::<(), _>(Method::GET, &coverage_path, None)?;
-    if final_coverage.release.id != release.id || final_coverage.coverage != coverage {
+    let final_coverage = wait_for_coverage(&api, &coverage_path, &release.id)?;
+    if final_coverage.coverage != coverage && coverage.processing == 0 {
         return Err(UploadError::Internal);
     }
     let result = UploadResult {
@@ -171,6 +178,32 @@ pub(crate) fn upload(options: &UploadOptions) -> Result<(), UploadError> {
     let mut output = stdout.lock();
     serde_json::to_writer(&mut output, &result).map_err(|_| UploadError::Internal)?;
     writeln!(output).map_err(|_| UploadError::Internal)
+}
+
+fn wait_for_coverage(
+    api: &ApiClient,
+    path: &str,
+    release_id: &str,
+) -> Result<CoverageResponse, UploadError> {
+    let deadline = Instant::now() + INDEX_POLL_TIMEOUT;
+    loop {
+        let response: CoverageResponse = api.json::<(), _>(Method::GET, path, None)?;
+        if response.release.id != release_id {
+            return Err(UploadError::Internal);
+        }
+        if response.coverage.quarantined > 0 || response.coverage.mismatch > 0 {
+            return Err(UploadError::Validation(
+                "artifact indexing rejected one or more uploaded files".to_owned(),
+            ));
+        }
+        if response.coverage.processing == 0 {
+            return Ok(response);
+        }
+        if Instant::now() >= deadline {
+            return Err(UploadError::Retryable);
+        }
+        std::thread::sleep(INDEX_POLL_INTERVAL);
+    }
 }
 
 fn collect_artifacts(options: &UploadOptions) -> Result<(Vec<LocalArtifact>, String), UploadError> {
@@ -741,6 +774,10 @@ struct Coverage {
     available: u64,
     missing: u64,
     mismatch: u64,
+    #[serde(default)]
+    processing: u64,
+    #[serde(default)]
+    quarantined: u64,
     ready: bool,
 }
 

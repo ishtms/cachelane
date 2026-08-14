@@ -366,12 +366,12 @@ paths:
       - $ref: "#/components/parameters/UploadId"
     post:
       operationId: completeArtifactUpload
-      summary: Complete, verify, and publish one artifact upload
+      summary: Complete one artifact upload and queue isolated indexing
       security:
         - artifactUploadToken: []
       responses:
         "200":
-          description: Artifact published and release coverage updated
+          description: Artifact accepted for isolated indexing
           headers:
             Cache-Control:
               $ref: "#/components/headers/CacheControlNoStore"
@@ -1166,6 +1166,8 @@ components:
         - available
         - missing
         - mismatch
+        - processing
+        - quarantined
         - ready
       properties:
         total:
@@ -1178,6 +1180,12 @@ components:
           type: integer
           minimum: 0
         mismatch:
+          type: integer
+          minimum: 0
+        processing:
+          type: integer
+          minimum: 0
+        quarantined:
           type: integer
           minimum: 0
         ready:
@@ -1267,7 +1275,9 @@ components:
           format: uuid
         artifact_status:
           type: string
-          const: available
+          enum:
+            - processing
+            - available
         coverage:
           $ref: "#/components/schemas/ReleaseCoverage"
     ReleaseCoverageResponse:

@@ -5,8 +5,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod crash_ingest;
+mod processor_runner;
 mod project_setup;
 mod symbol_upload;
+mod worker;
 
 use project_setup::{ServerState, migrate, router};
 
@@ -36,7 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command.unwrap_or(Command::Api) {
         Command::Api => serve("api", "FAULTLANE_API_PORT", 8080).await?,
         Command::Ingest => serve("ingest", "FAULTLANE_INGEST_PORT", 8081).await?,
-        Command::Worker => wait_for_shutdown("worker").await?,
+        Command::Worker => {
+            if env::var("FAULTLANE_ISOLATED_PROCESSING_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+            {
+                worker::run().await?;
+            } else {
+                wait_for_shutdown("worker").await?;
+            }
+        }
         Command::Scheduler => wait_for_shutdown("scheduler").await?,
         Command::Migrate => migrate(&required_env("DATABASE_URL")?).await?,
     }

@@ -1,18 +1,14 @@
 use std::{
-    collections::BTreeMap,
-    env, fmt,
-    net::IpAddr,
-    path::{Path as FilePath, PathBuf},
-    sync::Arc,
-    time::Duration,
+    collections::BTreeMap, env, fmt, net::IpAddr, path::Path as FilePath, sync::Arc, time::Duration,
 };
 
 #[cfg(test)]
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use aws_sdk_s3::{
     config::{Credentials, Region, RequestChecksumCalculation},
     presigning::PresigningConfig,
+    primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use axum::{
@@ -22,9 +18,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use faultlane_symbols::{
-    Architecture, ArtifactScanLimits, ArtifactType, scan_artifacts_with_limits,
-};
+#[cfg(test)]
+use faultlane_symbols::{Architecture, ArtifactType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -51,7 +46,6 @@ const MAX_TEXT_BYTES: usize = 256;
 pub(crate) struct SymbolUploads {
     pool: Option<PgPool>,
     objects: ArtifactObjects,
-    spool_directory: Arc<PathBuf>,
     enabled: bool,
 }
 
@@ -59,72 +53,20 @@ impl SymbolUploads {
     pub(crate) fn postgres(
         pool: PgPool,
         role: &'static str,
-        host: &str,
+        _host: &str,
     ) -> Result<Self, StartupError> {
-        if role != "api"
-            || !env::var("FAULTLANE_SYMBOL_UPLOAD_ENABLED")
-                .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
-        {
+        if !symbol_upload_available(
+            role,
+            env::var("FAULTLANE_SYMBOL_UPLOAD_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            env::var("FAULTLANE_ISOLATED_PROCESSING_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+        ) {
             return Ok(Self::disabled());
         }
-        if !valid_upload_host(host) {
-            return Err(StartupError::SymbolUploadConfiguration);
-        }
-
-        let endpoint = required_env("OBJECT_STORE_ENDPOINT")?;
-        let endpoint_url =
-            Url::parse(&endpoint).map_err(|_| StartupError::SymbolUploadConfiguration)?;
-        if endpoint_url.host_str().is_none()
-            || !endpoint_url.username().is_empty()
-            || endpoint_url.password().is_some()
-            || endpoint_url.path() != "/"
-            || endpoint_url.query().is_some()
-            || endpoint_url.fragment().is_some()
-            || (endpoint_url.scheme() != "https"
-                && !(endpoint_url.scheme() == "http"
-                    && endpoint_url
-                        .host_str()
-                        .and_then(|value| value.parse::<IpAddr>().ok())
-                        .is_some_and(|address| address.is_loopback())))
-        {
-            return Err(StartupError::SymbolUploadConfiguration);
-        }
-        let bucket = required_env("OBJECT_STORE_BUCKET")?;
-        let access_key =
-            required_env("OBJECT_STORE_ACCESS_KEY").or_else(|_| required_env("MINIO_ROOT_USER"))?;
-        let secret_key = required_env("OBJECT_STORE_SECRET_KEY")
-            .or_else(|_| required_env("MINIO_ROOT_PASSWORD"))?;
-        let region = env::var("OBJECT_STORE_REGION")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "auto".to_owned());
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(Region::new(region))
-            .credentials_provider(Credentials::new(
-                access_key,
-                secret_key,
-                None,
-                None,
-                "faultlane-object-store",
-            ))
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .build();
-        let spool_directory = env::var("FAULTLANE_ARTIFACT_SPOOL_DIR").map_or_else(
-            |_| env::temp_dir().join("faultlane-artifacts"),
-            PathBuf::from,
-        );
-        validate_spool_directory(&spool_directory)?;
-
         Ok(Self {
             pool: Some(pool),
-            objects: ArtifactObjects::S3 {
-                client: aws_sdk_s3::Client::from_conf(config),
-                bucket: Arc::from(bucket),
-            },
-            spool_directory: Arc::new(spool_directory),
+            objects: ArtifactObjects::from_environment()?,
             enabled: true,
         })
     }
@@ -133,19 +75,15 @@ impl SymbolUploads {
         Self {
             pool: None,
             objects: ArtifactObjects::Disabled,
-            spool_directory: Arc::new(env::temp_dir().join("faultlane-artifacts-disabled")),
             enabled: false,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn test(pool: PgPool, spool_directory: PathBuf) -> Self {
-        validate_spool_directory(&spool_directory)
-            .unwrap_or_else(|error| panic!("test spool directory must be valid: {error}"));
+    pub(crate) fn test(pool: PgPool, _spool_directory: PathBuf) -> Self {
         Self {
             pool: Some(pool),
             objects: ArtifactObjects::Memory(Arc::new(Mutex::new(MemoryObjects::default()))),
-            spool_directory: Arc::new(spool_directory),
             enabled: true,
         }
     }
@@ -188,8 +126,12 @@ impl SymbolUploads {
     }
 }
 
+fn symbol_upload_available(role: &str, enabled: bool, isolated: bool) -> bool {
+    role == "api" && enabled && isolated
+}
+
 #[derive(Clone)]
-enum ArtifactObjects {
+pub(crate) enum ArtifactObjects {
     S3 {
         client: aws_sdk_s3::Client,
         bucket: Arc<str>,
@@ -201,7 +143,7 @@ enum ArtifactObjects {
 
 #[cfg(test)]
 #[derive(Default)]
-struct MemoryObjects {
+pub(crate) struct MemoryObjects {
     next_id: u64,
     uploads: HashMap<String, MemoryMultipart>,
     objects: HashMap<String, Vec<u8>>,
@@ -213,8 +155,8 @@ struct MemoryMultipart {
     parts: BTreeMap<i32, Vec<u8>>,
 }
 
-#[derive(Debug)]
-enum ObjectError {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ObjectError {
     Unavailable,
     Missing,
     Invalid,
@@ -233,6 +175,54 @@ struct SignedPart {
 }
 
 impl ArtifactObjects {
+    pub(crate) fn from_environment() -> Result<Self, StartupError> {
+        let endpoint = required_env("OBJECT_STORE_ENDPOINT")?;
+        let endpoint_url =
+            Url::parse(&endpoint).map_err(|_| StartupError::SymbolUploadConfiguration)?;
+        if endpoint_url.host_str().is_none()
+            || !endpoint_url.username().is_empty()
+            || endpoint_url.password().is_some()
+            || endpoint_url.path() != "/"
+            || endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+            || (endpoint_url.scheme() != "https"
+                && !(endpoint_url.scheme() == "http"
+                    && endpoint_url
+                        .host_str()
+                        .and_then(|value| value.parse::<IpAddr>().ok())
+                        .is_some_and(|address| address.is_loopback())))
+        {
+            return Err(StartupError::SymbolUploadConfiguration);
+        }
+        let bucket = required_env("OBJECT_STORE_BUCKET")?;
+        let access_key =
+            required_env("OBJECT_STORE_ACCESS_KEY").or_else(|_| required_env("MINIO_ROOT_USER"))?;
+        let secret_key = required_env("OBJECT_STORE_SECRET_KEY")
+            .or_else(|_| required_env("MINIO_ROOT_PASSWORD"))?;
+        let region = env::var("OBJECT_STORE_REGION")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "auto".to_owned());
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(Region::new(region))
+            .credentials_provider(Credentials::new(
+                access_key,
+                secret_key,
+                None,
+                None,
+                "faultlane-object-store",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .build();
+        Ok(Self::S3 {
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket: Arc::from(bucket),
+        })
+    }
+
     async fn create_multipart(&self, key: &str) -> Result<String, ObjectError> {
         #[cfg(test)]
         if let Self::Memory(objects) = self {
@@ -462,7 +452,7 @@ impl ArtifactObjects {
         let _ = tokio::time::timeout(Duration::from_secs(STORAGE_SECONDS), request).await;
     }
 
-    async fn download_to(
+    pub(crate) async fn download_to(
         &self,
         key: &str,
         path: &FilePath,
@@ -550,7 +540,7 @@ impl ArtifactObjects {
             .map_err(|_| ObjectError::Unavailable)?
     }
 
-    async fn delete_object(&self, key: &str) {
+    pub(crate) async fn delete_object(&self, key: &str) {
         #[cfg(test)]
         if let Self::Memory(objects) = self {
             if let Ok(mut objects) = objects.lock() {
@@ -567,6 +557,41 @@ impl ArtifactObjects {
             .key(key)
             .send();
         let _ = tokio::time::timeout(Duration::from_secs(STORAGE_SECONDS), request).await;
+    }
+
+    pub(crate) async fn put_from_path(
+        &self,
+        key: &str,
+        path: &FilePath,
+    ) -> Result<(), ObjectError> {
+        #[cfg(test)]
+        if let Self::Memory(objects) = self {
+            let bytes = fs::read(path).await.map_err(|_| ObjectError::Unavailable)?;
+            objects
+                .lock()
+                .map_err(|_| ObjectError::Unavailable)?
+                .objects
+                .insert(key.to_owned(), bytes);
+            return Ok(());
+        }
+        let Self::S3 { client, bucket } = self else {
+            return Err(ObjectError::Unavailable);
+        };
+        let body = ByteStream::from_path(path)
+            .await
+            .map_err(|_| ObjectError::Unavailable)?;
+        let request = client
+            .put_object()
+            .bucket(bucket.as_ref())
+            .key(key)
+            .content_type("application/octet-stream")
+            .body(body)
+            .send();
+        tokio::time::timeout(Duration::from_secs(STORAGE_SECONDS), request)
+            .await
+            .map_err(|_| ObjectError::Unavailable)?
+            .map_err(|_| ObjectError::Unavailable)?;
+        Ok(())
     }
 }
 
@@ -799,27 +824,6 @@ fn required_env(name: &str) -> Result<String, StartupError> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or(StartupError::SymbolUploadConfiguration)
-}
-
-fn valid_upload_host(host: &str) -> bool {
-    host.parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
-}
-
-fn validate_spool_directory(path: &FilePath) -> Result<(), StartupError> {
-    std::fs::create_dir_all(path).map_err(|_| StartupError::SymbolUploadConfiguration)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| StartupError::SymbolUploadConfiguration)?;
-    }
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| StartupError::SymbolUploadConfiguration)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(StartupError::SymbolUploadConfiguration);
-    }
-    Ok(())
 }
 
 pub(crate) async fn negotiate_uploads(
@@ -1060,6 +1064,8 @@ struct Coverage {
     available: u64,
     missing: u64,
     mismatch: u64,
+    processing: u64,
+    quarantined: u64,
     ready: bool,
 }
 
@@ -1103,8 +1109,6 @@ struct Session {
     id: String,
     release_id: String,
     manifest_artifact_id: String,
-    upload_token_id: String,
-    uploaded_by_user_id: String,
     object_key: String,
     provider_upload_id: String,
     checksum: Vec<u8>,
@@ -1116,8 +1120,6 @@ struct Session {
     architecture: String,
     debug_id: String,
     code_id: Option<String>,
-    ci_job: Option<String>,
-    cli_version: String,
     state: String,
     expired: bool,
 }
@@ -1260,7 +1262,7 @@ async fn try_upsert_manifest_artifact(
     ci_job: Option<&str>,
 ) -> Result<Option<String>, UploadError> {
     sqlx::query_scalar(
-        "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, code_id, ci_job, source_path, cli_version) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT (release_id, source_path) DO UPDATE SET uploaded_by_user_id = EXCLUDED.uploaded_by_user_id, upload_token_id = EXCLUDED.upload_token_id, checksum = EXCLUDED.checksum, byte_size = EXCLUDED.byte_size, artifact_type = EXCLUDED.artifact_type, module_name = EXCLUDED.module_name, architecture = EXCLUDED.architecture, debug_id = EXCLUDED.debug_id, code_id = EXCLUDED.code_id, ci_job = EXCLUDED.ci_job, cli_version = EXCLUDED.cli_version, debug_image_id = NULL, state = 'missing', uploaded_at = NULL, updated_at = now() WHERE release_manifest_artifacts.organization_id = EXCLUDED.organization_id AND release_manifest_artifacts.project_id = EXCLUDED.project_id AND (NOT EXISTS (SELECT 1 FROM artifact_upload_sessions s WHERE s.manifest_artifact_id = release_manifest_artifacts.id AND s.organization_id = release_manifest_artifacts.organization_id AND s.project_id = release_manifest_artifacts.project_id AND s.state IN ('active', 'completing')) OR (release_manifest_artifacts.checksum = EXCLUDED.checksum AND release_manifest_artifacts.byte_size = EXCLUDED.byte_size AND release_manifest_artifacts.artifact_type = EXCLUDED.artifact_type AND release_manifest_artifacts.module_name = EXCLUDED.module_name AND release_manifest_artifacts.architecture = EXCLUDED.architecture AND release_manifest_artifacts.debug_id = EXCLUDED.debug_id AND release_manifest_artifacts.code_id IS NOT DISTINCT FROM EXCLUDED.code_id)) RETURNING id::text",
+        "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, code_id, ci_job, source_path, cli_version) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT (release_id, source_path) DO UPDATE SET uploaded_by_user_id = EXCLUDED.uploaded_by_user_id, upload_token_id = EXCLUDED.upload_token_id, checksum = EXCLUDED.checksum, byte_size = EXCLUDED.byte_size, artifact_type = EXCLUDED.artifact_type, module_name = EXCLUDED.module_name, architecture = EXCLUDED.architecture, debug_id = EXCLUDED.debug_id, code_id = EXCLUDED.code_id, ci_job = EXCLUDED.ci_job, cli_version = EXCLUDED.cli_version, debug_image_id = NULL, state = CASE WHEN release_manifest_artifacts.state = 'processing' AND release_manifest_artifacts.checksum = EXCLUDED.checksum AND release_manifest_artifacts.byte_size = EXCLUDED.byte_size AND release_manifest_artifacts.artifact_type = EXCLUDED.artifact_type AND release_manifest_artifacts.module_name = EXCLUDED.module_name AND release_manifest_artifacts.architecture = EXCLUDED.architecture AND release_manifest_artifacts.debug_id = EXCLUDED.debug_id AND release_manifest_artifacts.code_id IS NOT DISTINCT FROM EXCLUDED.code_id THEN 'processing' ELSE 'missing' END, uploaded_at = NULL, updated_at = now() WHERE release_manifest_artifacts.organization_id = EXCLUDED.organization_id AND release_manifest_artifacts.project_id = EXCLUDED.project_id AND (NOT EXISTS (SELECT 1 FROM artifact_upload_sessions s WHERE s.manifest_artifact_id = release_manifest_artifacts.id AND s.organization_id = release_manifest_artifacts.organization_id AND s.project_id = release_manifest_artifacts.project_id AND s.state IN ('active', 'completing', 'processing')) OR (release_manifest_artifacts.checksum = EXCLUDED.checksum AND release_manifest_artifacts.byte_size = EXCLUDED.byte_size AND release_manifest_artifacts.artifact_type = EXCLUDED.artifact_type AND release_manifest_artifacts.module_name = EXCLUDED.module_name AND release_manifest_artifacts.architecture = EXCLUDED.architecture AND release_manifest_artifacts.debug_id = EXCLUDED.debug_id AND release_manifest_artifacts.code_id IS NOT DISTINCT FROM EXCLUDED.code_id)) RETURNING id::text",
     )
     .bind(release_id)
     .bind(&scope.organization_id)
@@ -1385,7 +1387,7 @@ async fn update_manifest_state(
     debug_image_id: Option<&str>,
 ) -> Result<(), UploadError> {
     let result = sqlx::query(
-        "UPDATE release_manifest_artifacts SET state = $4, debug_image_id = $5::uuid, uploaded_at = CASE WHEN $4 = 'available' THEN now() ELSE NULL END, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "UPDATE release_manifest_artifacts SET state = $4, debug_image_id = $5::uuid, uploaded_at = CASE WHEN $4 = 'available' THEN now() ELSE NULL END, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND NOT (state = 'processing' AND $4 = 'missing')",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1395,7 +1397,7 @@ async fn update_manifest_state(
     .execute(pool)
     .await
     .map_err(|_| UploadError::Unavailable)?;
-    if result.rows_affected() != 1 {
+    if result.rows_affected() != 1 && state != "missing" {
         return Err(UploadError::NotFound);
     }
     Ok(())
@@ -1519,7 +1521,7 @@ async fn retire_stale_session(
             .await;
     }
     let completing: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM artifact_upload_sessions WHERE organization_id = $1::uuid AND project_id = $2::uuid AND manifest_artifact_id = $3::uuid AND state = 'completing' AND (checksum <> $4 OR byte_size <> $5 OR artifact_type <> $6 OR module_name <> $7 OR architecture <> $8 OR debug_id <> $9 OR code_id IS DISTINCT FROM $10))",
+        "SELECT EXISTS(SELECT 1 FROM artifact_upload_sessions WHERE organization_id = $1::uuid AND project_id = $2::uuid AND manifest_artifact_id = $3::uuid AND state IN ('completing', 'processing') AND (checksum <> $4 OR byte_size <> $5 OR artifact_type <> $6 OR module_name <> $7 OR architecture <> $8 OR debug_id <> $9 OR code_id IS DISTINCT FROM $10))",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1546,7 +1548,7 @@ async fn load_active_session(
     manifest_id: &str,
 ) -> Result<Option<Session>, UploadError> {
     let row = sqlx::query(
-        "SELECT id::text AS id, release_id::text AS release_id, manifest_artifact_id::text AS manifest_artifact_id, upload_token_id::text AS upload_token_id, uploaded_by_user_id::text AS uploaded_by_user_id, object_key, provider_upload_id, checksum, byte_size, part_size, part_count, artifact_type, module_name, architecture, debug_id, code_id, ci_job, cli_version, state, expires_at <= now() AS expired FROM artifact_upload_sessions WHERE organization_id = $1::uuid AND project_id = $2::uuid AND manifest_artifact_id = $3::uuid AND (state = 'completing' OR (state = 'active' AND expires_at > now())) ORDER BY created_at DESC LIMIT 1",
+        "SELECT id::text AS id, release_id::text AS release_id, manifest_artifact_id::text AS manifest_artifact_id, upload_token_id::text AS upload_token_id, uploaded_by_user_id::text AS uploaded_by_user_id, object_key, provider_upload_id, checksum, byte_size, part_size, part_count, artifact_type, module_name, architecture, debug_id, code_id, ci_job, cli_version, state, expires_at <= now() AS expired FROM artifact_upload_sessions WHERE organization_id = $1::uuid AND project_id = $2::uuid AND manifest_artifact_id = $3::uuid AND (state IN ('completing', 'processing') OR (state = 'active' AND expires_at > now())) ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1580,8 +1582,6 @@ fn session_from_row(row: &sqlx::postgres::PgRow) -> Session {
         id: row.get("id"),
         release_id: row.get("release_id"),
         manifest_artifact_id: row.get("manifest_artifact_id"),
-        upload_token_id: row.get("upload_token_id"),
-        uploaded_by_user_id: row.get("uploaded_by_user_id"),
         object_key: row.get("object_key"),
         provider_upload_id: row.get("provider_upload_id"),
         checksum: row.get("checksum"),
@@ -1593,8 +1593,6 @@ fn session_from_row(row: &sqlx::postgres::PgRow) -> Session {
         architecture: row.get("architecture"),
         debug_id: row.get("debug_id"),
         code_id: row.get("code_id"),
-        ci_job: row.get("ci_job"),
-        cli_version: row.get("cli_version"),
         state: row.get("state"),
         expired: row.get("expired"),
     }
@@ -1719,7 +1717,10 @@ async fn complete(
     let mut session = load_session(uploads.pool()?, scope, upload_id).await?;
     if session.state == "completed" {
         cleanup_duplicate_object(uploads, scope, &session).await?;
-        return complete_response(uploads.pool()?, scope, &session.release_id).await;
+        return complete_response(uploads.pool()?, scope, &session.release_id, "available").await;
+    }
+    if session.state == "processing" {
+        return complete_response(uploads.pool()?, scope, &session.release_id, "processing").await;
     }
     if session.state == "failed" {
         uploads.objects.delete_object(&session.object_key).await;
@@ -1759,18 +1760,64 @@ async fn complete(
             .await
             .map_err(|_| UploadError::Unavailable)?;
     }
-    let verified = verify_object(uploads, &session).await;
-    let record = match verified {
-        Ok(record) => record,
-        Err(VerifyError::Mismatch) => {
-            fail_session(uploads.pool()?, scope, &session, "artifact_mismatch").await?;
-            uploads.objects.delete_object(&session.object_key).await;
-            return Err(UploadError::Mismatch);
-        }
-        Err(VerifyError::Unavailable) => return Err(UploadError::Unavailable),
-    };
-    publish_artifact(uploads, scope, &session, record).await?;
-    complete_response(uploads.pool()?, scope, &session.release_id).await
+    enqueue_artifact_index(uploads.pool()?, scope, &session).await?;
+    complete_response(uploads.pool()?, scope, &session.release_id, "processing").await
+}
+
+async fn enqueue_artifact_index(
+    pool: &PgPool,
+    scope: &TokenScope,
+    session: &Session,
+) -> Result<(), UploadError> {
+    let job_id = random_uuid()?;
+    let mut transaction = pool.begin().await.map_err(|_| UploadError::Unavailable)?;
+    let updated = sqlx::query(
+        "UPDATE artifact_upload_sessions SET state = 'processing', updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'completing'",
+    )
+    .bind(&scope.organization_id)
+    .bind(&scope.project_id)
+    .bind(&session.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| UploadError::Unavailable)?;
+    if updated.rows_affected() != 1 {
+        return Err(UploadError::Conflict);
+    }
+    let manifest = sqlx::query(
+        "UPDATE release_manifest_artifacts SET state = 'processing', debug_image_id = NULL, failure_code = NULL, uploaded_at = NULL, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND checksum = $4 AND byte_size = $5 AND artifact_type = $6 AND module_name = $7 AND architecture = $8 AND debug_id = $9 AND code_id IS NOT DISTINCT FROM $10",
+    )
+    .bind(&scope.organization_id)
+    .bind(&scope.project_id)
+    .bind(&session.manifest_artifact_id)
+    .bind(&session.checksum)
+    .bind(session.byte_size)
+    .bind(&session.artifact_type)
+    .bind(&session.module_name)
+    .bind(&session.architecture)
+    .bind(&session.debug_id)
+    .bind(&session.code_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| UploadError::Unavailable)?;
+    if manifest.rows_affected() != 1 {
+        return Err(UploadError::Conflict);
+    }
+    sqlx::query(
+        "INSERT INTO jobs (id, organization_id, project_id, event_id, artifact_upload_id, job_type, payload, idempotency_key) VALUES ($1::uuid, $2::uuid, $3::uuid, NULL, $4::uuid, 'index_artifact', $5, $6) ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(&scope.organization_id)
+    .bind(&scope.project_id)
+    .bind(&session.id)
+    .bind(serde_json::json!({ "artifact_upload_id": session.id }))
+    .bind(format!("index_artifact:{}", session.id))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| UploadError::Unavailable)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| UploadError::Unavailable)
 }
 
 async fn cleanup_duplicate_object(
@@ -1828,256 +1875,15 @@ async fn load_provider_parts(
     Ok(parts)
 }
 
-enum VerifyError {
-    Mismatch,
-    Unavailable,
-}
-
-struct VerifiedRecord {
-    artifact_type: String,
-    architecture: String,
-    debug_id: String,
-    code_id: Option<String>,
-}
-
-async fn verify_object(
-    uploads: &SymbolUploads,
-    session: &Session,
-) -> Result<VerifiedRecord, VerifyError> {
-    let extension = match session.artifact_type.as_str() {
-        "pdb" => "pdb",
-        "pe_dynamic_library" => "dll",
-        "pe_executable" => "exe",
-        _ => return Err(VerifyError::Mismatch),
-    };
-    let spool_id = random_uuid().map_err(|_| VerifyError::Unavailable)?;
-    let path = uploads
-        .spool_directory
-        .join(format!("faultlane-{spool_id}.{extension}"));
-    let downloaded = uploads
-        .objects
-        .download_to(
-            &session.object_key,
-            &path,
-            u64::try_from(session.byte_size).map_err(|_| VerifyError::Mismatch)?,
-        )
-        .await;
-    let (size, digest) = match downloaded {
-        Ok(value) => value,
-        Err(ObjectError::Invalid) => {
-            let _ = fs::remove_file(&path).await;
-            return Err(VerifyError::Mismatch);
-        }
-        Err(ObjectError::Unavailable | ObjectError::Missing) => {
-            let _ = fs::remove_file(&path).await;
-            return Err(VerifyError::Unavailable);
-        }
-    };
-    if size != u64::try_from(session.byte_size).map_err(|_| VerifyError::Mismatch)?
-        || digest.as_slice() != session.checksum.as_slice()
-    {
-        let _ = fs::remove_file(&path).await;
-        return Err(VerifyError::Mismatch);
-    }
-    let scan_path = path.clone();
-    let scan_size = size;
-    let scan = tokio::task::spawn_blocking(move || {
-        scan_artifacts_with_limits(
-            &scan_path,
-            ArtifactScanLimits {
-                entries: 1,
-                depth: 0,
-                files: 1,
-                file_bytes: scan_size,
-                total_bytes: scan_size,
-            },
-        )
-    })
-    .await
-    .map_err(|_| VerifyError::Unavailable)?
-    .map_err(|_| VerifyError::Mismatch);
-    let _ = fs::remove_file(&path).await;
-    let scan = scan?;
-    let Some(record) = scan.artifacts.into_iter().next() else {
-        return Err(VerifyError::Mismatch);
-    };
-    if record.error.is_some() {
-        return Err(VerifyError::Mismatch);
-    }
-    let artifact_type = artifact_type_name(record.artifact_type);
-    let architecture = record.architecture.map(architecture_name);
-    if artifact_type != session.artifact_type
-        || architecture.as_deref() != Some(session.architecture.as_str())
-        || record.debug_id.as_deref() != Some(session.debug_id.as_str())
-        || record.code_id != session.code_id
-    {
-        return Err(VerifyError::Mismatch);
-    }
-    Ok(VerifiedRecord {
-        artifact_type,
-        architecture: architecture.unwrap_or_default(),
-        debug_id: record.debug_id.unwrap_or_default(),
-        code_id: record.code_id,
-    })
-}
-
-async fn publish_artifact(
-    uploads: &SymbolUploads,
-    scope: &TokenScope,
-    session: &Session,
-    record: VerifiedRecord,
-) -> Result<(), UploadError> {
-    let mut transaction = uploads
-        .pool()?
-        .begin()
-        .await
-        .map_err(|_| UploadError::Unavailable)?;
-    let object = sqlx::query(
-        "INSERT INTO artifact_objects (organization_id, object_key, checksum, byte_size) VALUES ($1::uuid, $2, $3, $4) ON CONFLICT (organization_id, checksum) DO UPDATE SET checksum = EXCLUDED.checksum RETURNING id::text AS id, object_key",
-    )
-    .bind(&scope.organization_id)
-    .bind(&session.object_key)
-    .bind(&session.checksum)
-    .bind(session.byte_size)
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    let object_id: String = object.get("id");
-    let canonical_key: String = object.get("object_key");
-    let inserted_debug_image: Option<String> = sqlx::query_scalar(
-        "INSERT INTO artifact_debug_images (organization_id, object_id, artifact_type, module_name, architecture, debug_id, code_id) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING RETURNING id::text",
-    )
-    .bind(&scope.organization_id)
-    .bind(&object_id)
-    .bind(&record.artifact_type)
-    .bind(&session.module_name)
-    .bind(&record.architecture)
-    .bind(&record.debug_id)
-    .bind(&record.code_id)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    let debug_image_id = if let Some(id) = inserted_debug_image {
-        id
-    } else {
-        sqlx::query_scalar(
-            "SELECT id::text FROM artifact_debug_images WHERE organization_id = $1::uuid AND object_id = $2::uuid AND artifact_type = $3 AND debug_id = $4 AND code_id IS NOT DISTINCT FROM $5",
-        )
-        .bind(&scope.organization_id)
-        .bind(&object_id)
-        .bind(&record.artifact_type)
-        .bind(&record.debug_id)
-        .bind(&record.code_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|_| UploadError::Unavailable)?
-    };
-    let manifest = sqlx::query(
-        "UPDATE release_manifest_artifacts SET debug_image_id = $4::uuid, uploaded_by_user_id = $5::uuid, upload_token_id = $6::uuid, ci_job = $7, cli_version = $8, state = 'available', uploaded_at = now(), updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND checksum = $9 AND byte_size = $10 AND artifact_type = $11 AND module_name = $12 AND architecture = $13 AND debug_id = $14 AND code_id IS NOT DISTINCT FROM $15",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&session.manifest_artifact_id)
-    .bind(debug_image_id)
-    .bind(&session.uploaded_by_user_id)
-    .bind(&session.upload_token_id)
-    .bind(&session.ci_job)
-    .bind(&session.cli_version)
-    .bind(&session.checksum)
-    .bind(session.byte_size)
-    .bind(&session.artifact_type)
-    .bind(&session.module_name)
-    .bind(&session.architecture)
-    .bind(&session.debug_id)
-    .bind(&session.code_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    if manifest.rows_affected() != 1 {
-        transaction
-            .rollback()
-            .await
-            .map_err(|_| UploadError::Unavailable)?;
-        abort_replaced_completion(uploads.pool()?, scope, session).await?;
-        uploads.objects.delete_object(&session.object_key).await;
-        return Err(UploadError::Conflict);
-    }
-    sqlx::query(
-        "UPDATE artifact_upload_sessions SET state = 'completed', updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&session.id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| UploadError::Unavailable)?;
-    if canonical_key != session.object_key {
-        uploads.objects.delete_object(&session.object_key).await;
-    }
-    Ok(())
-}
-
-async fn abort_replaced_completion(
-    pool: &PgPool,
-    scope: &TokenScope,
-    session: &Session,
-) -> Result<(), UploadError> {
-    sqlx::query(
-        "UPDATE artifact_upload_sessions SET state = 'aborted', updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'completing'",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&session.id)
-    .execute(pool)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    Ok(())
-}
-
-async fn fail_session(
-    pool: &PgPool,
-    scope: &TokenScope,
-    session: &Session,
-    failure_code: &str,
-) -> Result<(), UploadError> {
-    let mut transaction = pool.begin().await.map_err(|_| UploadError::Unavailable)?;
-    sqlx::query(
-        "UPDATE artifact_upload_sessions SET state = 'failed', failure_code = $4, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&session.id)
-    .bind(failure_code)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    sqlx::query(
-        "UPDATE release_manifest_artifacts SET state = 'mismatch', debug_image_id = NULL, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&session.manifest_artifact_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| UploadError::Unavailable)?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| UploadError::Unavailable)
-}
-
 async fn complete_response(
     pool: &PgPool,
     scope: &TokenScope,
     release_id: &str,
+    artifact_status: &'static str,
 ) -> Result<CompleteResponse, UploadError> {
     Ok(CompleteResponse {
         release_id: release_id.to_owned(),
-        artifact_status: "available",
+        artifact_status,
         coverage: load_coverage(pool, scope, release_id).await?,
     })
 }
@@ -2109,7 +1915,7 @@ async fn load_coverage(
     release_id: &str,
 ) -> Result<Coverage, UploadError> {
     let row = sqlx::query(
-        "SELECT count(*)::bigint AS total, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'missing')::bigint AS missing, count(*) FILTER (WHERE state = 'mismatch')::bigint AS mismatch FROM release_manifest_artifacts WHERE release_id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "SELECT count(*)::bigint AS total, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'missing')::bigint AS missing, count(*) FILTER (WHERE state = 'mismatch')::bigint AS mismatch, count(*) FILTER (WHERE state = 'processing')::bigint AS processing, count(*) FILTER (WHERE state = 'quarantined')::bigint AS quarantined FROM release_manifest_artifacts WHERE release_id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -2123,11 +1929,17 @@ async fn load_coverage(
     let missing = u64::try_from(row.get::<i64, _>("missing")).map_err(|_| UploadError::Internal)?;
     let mismatch =
         u64::try_from(row.get::<i64, _>("mismatch")).map_err(|_| UploadError::Internal)?;
+    let processing =
+        u64::try_from(row.get::<i64, _>("processing")).map_err(|_| UploadError::Internal)?;
+    let quarantined =
+        u64::try_from(row.get::<i64, _>("quarantined")).map_err(|_| UploadError::Internal)?;
     Ok(Coverage {
         total,
         available,
         missing,
         mismatch,
+        processing,
+        quarantined,
         ready: total > 0 && available == total,
     })
 }
@@ -2292,6 +2104,7 @@ fn random_uuid() -> Result<String, UploadError> {
     ))
 }
 
+#[cfg(test)]
 fn artifact_type_name(value: ArtifactType) -> String {
     match value {
         ArtifactType::PeExecutable => "pe_executable",
@@ -2301,6 +2114,7 @@ fn artifact_type_name(value: ArtifactType) -> String {
     .to_owned()
 }
 
+#[cfg(test)]
 fn architecture_name(value: Architecture) -> String {
     match value {
         Architecture::X86 => "x86",
@@ -2322,25 +2136,16 @@ mod tests {
     use faultlane_symbols::scan_artifacts;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
-    use sqlx::Row;
+    use sqlx::{PgPool, Row};
     use tower::ServiceExt;
 
     use super::{
         BASE64, GeneratedSecret, SymbolUploads, architecture_name, artifact_type_name, lower_hex,
-        valid_artifact_module, valid_build_timestamp, valid_upload_host,
+        symbol_upload_available, valid_artifact_module, valid_build_timestamp,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
 
     const BOOTSTRAP_SECRET: &str = "local-bootstrap-secret-with-32-bytes";
-
-    #[test]
-    fn upload_feature_requires_a_literal_loopback_host() {
-        assert!(valid_upload_host("127.0.0.1"));
-        assert!(valid_upload_host("::1"));
-        assert!(!valid_upload_host("localhost"));
-        assert!(!valid_upload_host("0.0.0.0"));
-        assert!(!valid_upload_host("203.0.113.10"));
-    }
 
     #[test]
     fn build_timestamp_requires_rfc3339() {
@@ -2359,6 +2164,13 @@ mod tests {
             "symbols/Game-Win64-Shipping.pdb",
             "Other.pdb"
         ));
+    }
+
+    #[test]
+    fn isolation_flag_disables_uploads_without_disabling_the_api() {
+        assert!(symbol_upload_available("api", true, true));
+        assert!(!symbol_upload_available("api", true, false));
+        assert!(!symbol_upload_available("ingest", true, true));
     }
 
     fn bootstrap(request: Builder) -> Builder {
@@ -2391,6 +2203,79 @@ mod tests {
             .unwrap_or_else(|error| panic!("router must answer: {error}"));
         let status = response.status();
         (status, json_body(response).await)
+    }
+
+    async fn publish_indexed_artifact(pool: &PgPool, upload_id: &str) {
+        let session = sqlx::query(
+            "SELECT organization_id::text AS organization_id, project_id::text AS project_id, manifest_artifact_id::text AS manifest_artifact_id, object_key, checksum, byte_size, artifact_type, module_name, architecture, debug_id, code_id FROM artifact_upload_sessions WHERE id::text = $1",
+        )
+        .bind(upload_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("processing session must exist: {error}"));
+        let organization_id: String = session.get("organization_id");
+        let project_id: String = session.get("project_id");
+        let object_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_objects (organization_id, object_key, checksum, byte_size) VALUES ($1::uuid, $2, $3, $4) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(session.get::<String, _>("object_key"))
+        .bind(session.get::<Vec<u8>, _>("checksum"))
+        .bind(session.get::<i64, _>("byte_size"))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("indexed object must publish: {error}"));
+        let debug_image_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_debug_images (organization_id, object_id, artifact_type, module_name, architecture, debug_id, code_id) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(object_id)
+        .bind(session.get::<String, _>("artifact_type"))
+        .bind(session.get::<String, _>("module_name"))
+        .bind(session.get::<String, _>("architecture"))
+        .bind(session.get::<String, _>("debug_id"))
+        .bind(session.get::<Option<String>, _>("code_id"))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("debug image must publish: {error}"));
+        sqlx::query(
+            "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, uploaded_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        )
+        .bind(session.get::<String, _>("manifest_artifact_id"))
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(debug_image_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|error| panic!("manifest must publish: {error}"));
+        sqlx::query("UPDATE artifact_upload_sessions SET state = 'completed' WHERE id::text = $1")
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("session must complete: {error}"));
+        sqlx::query("UPDATE jobs SET state = 'completed', completed_at = now() WHERE artifact_upload_id::text = $1")
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("index job must complete: {error}"));
+    }
+
+    async fn quarantine_artifact(pool: &PgPool, upload_id: &str) {
+        sqlx::query("UPDATE artifact_upload_sessions SET state = 'failed', failure_code = 'artifact_malformed' WHERE id::text = $1")
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("session must fail: {error}"));
+        sqlx::query("UPDATE release_manifest_artifacts m SET state = 'quarantined', failure_code = 'artifact_malformed' FROM artifact_upload_sessions s WHERE s.id::text = $1 AND m.id = s.manifest_artifact_id AND m.organization_id = s.organization_id AND m.project_id = s.project_id")
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("manifest must quarantine: {error}"));
+        sqlx::query("UPDATE jobs SET state = 'completed', failure_code = 'artifact_malformed', completed_at = now() WHERE artifact_upload_id::text = $1")
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("index job must complete: {error}"));
     }
 
     #[tokio::test]
@@ -2665,8 +2550,18 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{completed}");
-        assert_eq!(completed["coverage"]["available"], 1);
-        assert_eq!(completed["coverage"]["ready"], true);
+        assert_eq!(completed["artifact_status"], "processing");
+        assert_eq!(completed["coverage"]["available"], 0);
+        assert_eq!(completed["coverage"]["processing"], 1);
+        assert_eq!(completed["coverage"]["ready"], false);
+        let queued_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE artifact_upload_id::text = $1 AND job_type = 'index_artifact' AND state = 'pending'",
+        )
+        .bind(upload_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("index job must be queued: {error}"));
+        assert_eq!(queued_jobs, 1);
 
         let (status, repeated_complete) = request_json(
             &state,
@@ -2683,6 +2578,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{repeated_complete}");
         assert_eq!(repeated_complete["coverage"], completed["coverage"]);
 
+        publish_indexed_artifact(&pool, upload_id).await;
+
         let (status, repeated) = request_json(
             &state,
             bearer(
@@ -2697,7 +2594,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{repeated}");
         assert_eq!(repeated["artifacts"][0]["status"], "already_present");
-        assert_eq!(repeated["coverage"], completed["coverage"]);
+        assert_eq!(repeated["coverage"]["available"], 1);
+        assert_eq!(repeated["coverage"]["ready"], true);
         assert_eq!(repeated["release"]["id"], release_id);
 
         let mut next_release = request.clone();
@@ -2838,9 +2736,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("request must build: {error}")),
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mismatch}");
-        assert_eq!(mismatch["code"], "artifact_mismatch");
-        assert_eq!(mismatch["retryable"], false);
+        assert_eq!(status, StatusCode::OK, "{mismatch}");
+        assert_eq!(mismatch["artifact_status"], "processing");
+        assert_eq!(mismatch["coverage"]["processing"], 1);
+        quarantine_artifact(&pool, mismatch_upload_id).await;
         let (status, mismatch_coverage) = request_json(
             &state,
             bearer(
@@ -2854,7 +2753,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{mismatch_coverage}");
-        assert_eq!(mismatch_coverage["coverage"]["mismatch"], 1);
+        assert_eq!(mismatch_coverage["coverage"]["quarantined"], 1);
         assert_eq!(mismatch_coverage["coverage"]["ready"], false);
 
         let user_id: String = sqlx::query_scalar(

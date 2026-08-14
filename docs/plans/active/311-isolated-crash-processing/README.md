@@ -164,22 +164,30 @@ Composite foreign keys and every application query retain organization and proje
 
 ## Verification and staging evidence
 
-Behavior tests cover lease expiry, concurrent claims, stale publication, retry backoff, cancellation, shutdown, cache versioning, concurrent cache generation, artifact mismatch, release ambiguity, missing symbols, malformed output, every resource limit, and quarantine isolation.
+The final implementation passes `scripts/check-fast`. That run includes 26 CLI tests, 36 database-backed server tests, 10 domain tests, 11 symbol unit tests, 6 symbol scan tests, 26 Unreal tests, 9 Unreal request tests, the processing crate test, Rust formatting and Clippy, plus web formatting, linting, and type checking. Focused tests cover lease expiry, concurrent claims, stale publication, retry backoff, cancellation, shutdown, cache versioning, concurrent cache generation, artifact mismatch, release ambiguity, missing symbols, malformed output, resource retry followed by dependency waiting and quarantine, Windows scratch ACL hardening, ownership-marker enforcement, abandoned scratch reconciliation, feature-flag rollback, and duplicate SymCache identity rejection.
 
-The final proof uses a dedicated Compose project with unique PostgreSQL, MinIO, network, volumes, ports, bucket, worker scratch root, and processor image. It will:
+The final proof used a dedicated Compose project with unique PostgreSQL, MinIO, network, volumes, ports, bucket, worker scratch root, and processor image. It:
 
-1. apply migrations twice and start API, ingest, and worker roles on loopback;
-2. upload and asynchronously index the checked-in synthetic PE and PDB fixtures;
-3. submit one valid symbolicated crash and one resource-exhausting synthetic input together;
-4. show that the valid event reaches `processed` with a readable frame while the unsafe event retries once and reaches `quarantined`;
-5. show no ingest request performs processing and unrelated project work continues;
-6. expire a lease during an attempt and prove the stale worker cannot publish;
-7. start concurrent workers and prove one result and one versioned SymCache are published;
-8. rerun the valid event and prove the existing cache is reused without another cache object;
-9. deny processor network and unrelated filesystem reads, inspect mounts and environment, and verify CPU, memory, scratch, process, output, and wall limits;
-10. stop MinIO and PostgreSQL separately, verify safe retry state, restore them, and complete the job;
-11. start the pre-change server against the expanded schema and verify readiness;
-12. inspect logs, rows, objects, and scratch data for tenant scope, fixed errors, and absence of credentials, source paths, raw content, or processor stderr.
+1. applied migrations twice and started API, ingest, and worker roles on loopback;
+2. uploaded and asynchronously indexed the checked-in synthetic PE and PDB fixtures;
+3. submitted one valid symbolicated crash and one resource-exhausting synthetic input together;
+4. showed that the valid event reached `processed` with a readable frame while the unsafe event retried once and reached `quarantined`;
+5. showed no ingest request performed processing and unrelated project work continued;
+6. expired a lease during an attempt and proved the stale worker could not publish;
+7. started concurrent workers and proved one result and one versioned SymCache were published;
+8. reran the valid event and proved the existing cache was reused without another cache object;
+9. denied processor network and unrelated filesystem reads, inspected mounts and environment, and verified CPU, memory, scratch, process, output, and wall limits;
+10. stopped MinIO and PostgreSQL separately, verified safe retry state, restored them, and completed the job;
+11. started the pre-change server against the expanded schema and verified readiness;
+12. inspected logs, rows, objects, and scratch data for tenant scope, fixed errors, and absence of credentials, source paths, raw content, or processor stderr.
+
+The proof completed with one valid symbolicated event in `processed`, one resource-exhausting event in `quarantined` after two attempts, one repeated event in `processed`, one recovered stale-lease event in `processed`, one storage-outage event in `processed`, and one database-outage event in `processed`. It found two available artifacts, one shared SymCache job, two normalized results, a readable frame, and a zero-byte second upload. The structured result also confirmed concurrent-worker behavior, boundary inspection, orphan cleanup, scratch-only cleanup, storage recovery, database recovery, successful-run log inspection, a valid scratch ownership marker, and no retained attempt directory.
+
+The boundary proof exercised denial of processor network access, host filesystem access, read-only input mutation, scratch overuse, and oversized output. It inspected the running container to confirm the configured CPU, memory, swap, PID, open-file, CPU-time, wall-time, mount, capability, privilege, user, network, read-only-root, scratch, and output limits. Unit tests cover parent timeout and exact-container cleanup without making the final proof wait through each maximum duration.
+
+The pre-change server at commit `d2aa55c` built successfully and returned its normal readiness payload while connected to the expanded schema. This verifies the additive migration remains compatible with the prior application.
+
+The final head passes `scripts/check`, including the release workspace build, production web build, and repository policy checks. It also passes `scripts/smoke` with live API, ingest, and web processes started through the canonical development lifecycle. All smoke processes were stopped afterward, the default development containers were restored to their prior stopped state, and the dedicated #311 containers, networks, volumes, images, logs, and scratch directories were removed.
 
 All dedicated containers, networks, volumes, images, and scratch files are removed after evidence is recorded. No hosted staging target exists, so isolated local Docker staging satisfies this change's staging gate. No production deployment is performed.
 

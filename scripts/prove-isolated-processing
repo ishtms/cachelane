@@ -1,0 +1,746 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ ! -f .env ]]; then
+  echo "missing .env; run ./scripts/setup" >&2
+  exit 1
+fi
+
+set -a
+source .env
+set +a
+
+proof_id="$$"
+compose_project="faultlane-311-proof-$proof_id"
+processor_base_image="faultlane-processor:proof-base-$proof_id"
+processor_image="faultlane-processor:proof-$proof_id"
+boundary_container="faultlane-311-boundary-$proof_id"
+proof_directory="$(mktemp -d -t faultlane-311-proof.XXXXXX)"
+proof_directory="$(cd "$proof_directory" && pwd -P)"
+proof_temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+proof_name="$(basename "$proof_directory")"
+export FAULTLANE_WORKER_SCRATCH_DIR="$(cygpath -w "$proof_directory/worker-scratch")"
+server_executable="$(cygpath -w "$repo_root/target/debug/faultlane-server.exe")"
+api_pid=""
+ingest_pid=""
+worker_pid=""
+worker_two_pid=""
+started_pid=""
+
+export POSTGRES_DB="faultlane_311_proof"
+export FAULTLANE_POSTGRES_PORT="${FAULTLANE_PROOF_POSTGRES_PORT:-55433}"
+export FAULTLANE_MINIO_PORT="${FAULTLANE_PROOF_MINIO_PORT:-59010}"
+export FAULTLANE_MINIO_CONSOLE_PORT="${FAULTLANE_PROOF_MINIO_CONSOLE_PORT:-59011}"
+export OBJECT_STORE_BUCKET="faultlane-311-proof"
+export OBJECT_STORE_ENDPOINT="http://127.0.0.1:$FAULTLANE_MINIO_PORT"
+export DATABASE_URL="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$FAULTLANE_POSTGRES_PORT/$POSTGRES_DB"
+export FAULTLANE_API_PORT="${FAULTLANE_PROOF_API_PORT:-58090}"
+export FAULTLANE_INGEST_PORT="${FAULTLANE_PROOF_INGEST_PORT:-58091}"
+export FAULTLANE_API_URL="http://127.0.0.1:$FAULTLANE_API_PORT"
+export INGEST_BASE_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
+export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
+export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
+export FAULTLANE_PROCESSOR_IMAGE="$processor_image"
+
+start_role() {
+  local role="$1"
+  local log_name="${2:-$role}"
+  local executable
+  local stdout_log
+  local stderr_log
+  local pid_file
+  executable="$server_executable"
+  stdout_log="$(cygpath -w "$proof_directory/$log_name.log")"
+  stderr_log="$(cygpath -w "$proof_directory/$log_name-error.log")"
+  pid_file="$(cygpath -w "$proof_directory/$log_name.pid")"
+  powershell.exe -NoProfile -NonInteractive -Command \
+    "\$process = Start-Process -FilePath '$executable' -ArgumentList '$role' -RedirectStandardOutput '$stdout_log' -RedirectStandardError '$stderr_log' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_file', \$process.Id.ToString())" \
+    >/dev/null
+  started_pid="$(tr -d '\r\n' <"$proof_directory/$log_name.pid")"
+  if [[ ! "$started_pid" =~ ^[0-9]+$ ]]; then
+    echo "failed to start $role role" >&2
+    exit 1
+  fi
+}
+
+stop_role() {
+  local pid="$1"
+  if [[ -n "$pid" ]]; then
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Get-Process -Id $pid -ErrorAction SilentlyContinue; if (\$null -ne \$process -and [IO.Path]::GetFullPath(\$process.Path) -eq [IO.Path]::GetFullPath('$server_executable')) { Stop-Process -Id $pid -Force; Wait-Process -Id $pid -Timeout 10 -ErrorAction SilentlyContinue }" >/dev/null
+  fi
+}
+
+cleanup() {
+  local status="$?"
+  if [[ "$status" -ne 0 ]]; then
+    for log in "$proof_directory"/*.log; do
+      if [[ -f "$log" ]]; then
+        echo "==> $log" >&2
+        cat "$log" >&2
+      fi
+    done
+    if docker compose \
+      --project-name "$compose_project" \
+      --env-file .env \
+      -f deploy/docker-compose/compose.yml \
+      exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+      "SELECT to_regclass('public.jobs');" 2>/dev/null | grep -q jobs; then
+      docker compose \
+        --project-name "$compose_project" \
+        --env-file .env \
+        -f deploy/docker-compose/compose.yml \
+        exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+        "SELECT job_type, state, attempt, resource_failures, failure_code FROM jobs ORDER BY created_at; SELECT artifact_type, state, failure_code FROM artifact_upload_sessions ORDER BY created_at; SELECT artifact_type, state, failure_code FROM release_manifest_artifacts ORDER BY source_path;" >&2 || true
+    fi
+  fi
+  for pid in "$api_pid" "$ingest_pid" "$worker_pid" "$worker_two_pid"; do
+    stop_role "$pid" || true
+  done
+  docker rm --force "$boundary_container" >/dev/null 2>&1 || true
+  docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker image rm "$processor_image" >/dev/null 2>&1 || true
+  docker image rm "$processor_base_image" >/dev/null 2>&1 || true
+  if [[ "$(dirname "$proof_directory")" == "$proof_temp_root" \
+    && "$proof_name" =~ ^faultlane-311-proof\.[A-Za-z0-9]+$ \
+    && "$proof_directory" == "$proof_temp_root/$proof_name" ]]; then
+    rm -rf -- "$proof_directory"
+  fi
+}
+
+trap cleanup EXIT INT TERM
+
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait postgres minio
+
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  run --rm minio-init >/dev/null
+
+docker build --quiet --tag "$processor_base_image" --file deploy/processor/Dockerfile . >/dev/null
+docker build --quiet --tag "$processor_image" \
+  --build-arg "PROCESSOR_IMAGE=$processor_base_image" \
+  --file deploy/processor/proof.Dockerfile . >/dev/null
+
+mkdir "$proof_directory/boundary-input"
+docker create \
+  --name "$boundary_container" \
+  --network none \
+  --read-only \
+  --mount "type=bind,src=$proof_directory/boundary-input,dst=/input,readonly" \
+  --tmpfs "/scratch:rw,noexec,nosuid,nodev,size=67108864,mode=0700,uid=65532,gid=65532" \
+  --user 65532:65532 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --cpus 1 \
+  --memory 2147483648 \
+  --memory-swap 2147483648 \
+  --pids-limit 64 \
+  --ulimit nofile=256:256 \
+  --ulimit cpu=120:120 \
+  --entrypoint //bin/sleep \
+  "$processor_image" infinity >/dev/null
+docker start "$boundary_container" >/dev/null
+
+boundary_inspect="$(docker inspect "$boundary_container")"
+BOUNDARY_INSPECT="$boundary_inspect" node -e '
+  const [container] = JSON.parse(process.env.BOUNDARY_INSPECT);
+  const host = container.HostConfig;
+  const input = container.Mounts.find(mount => mount.Destination === "/input");
+  const limits = new Map(host.Ulimits.map(limit => [limit.Name, limit]));
+  const valid = host.NetworkMode === "none"
+    && host.ReadonlyRootfs === true
+    && host.NanoCpus === 1_000_000_000
+    && host.Memory === 2_147_483_648
+    && host.MemorySwap === 2_147_483_648
+    && host.PidsLimit === 64
+    && host.CapDrop.includes("ALL")
+    && host.SecurityOpt.includes("no-new-privileges")
+    && host.Tmpfs["/scratch"].includes("size=67108864")
+    && limits.get("nofile").Hard === 256
+    && limits.get("cpu").Hard === 120
+    && container.Config.User === "65532:65532"
+    && container.Config.Env.every(value => value.startsWith("PATH="))
+    && input && input.Type === "bind" && input.RW === false;
+  if (!valid) throw new Error("processor boundary inspection failed");
+'
+
+boundary_environment="$(docker exec "$boundary_container" //usr/bin/env)"
+if grep -Eiq '^(AWS_|FAULTLANE_|DATABASE_URL=|OBJECT_STORE_|[^=]*(PASSWORD|SECRET|TOKEN|KEY)=)' \
+  <<<"$boundary_environment"; then
+  echo "processor received a credential-like environment variable" >&2
+  exit 1
+fi
+if timeout 5 docker exec "$boundary_container" getent ahosts example.com >/dev/null 2>&1; then
+  echo "processor resolved an external host" >&2
+  exit 1
+fi
+if docker exec "$boundary_container" touch //etc/faultlane-proof >/dev/null 2>&1; then
+  echo "processor wrote to its root filesystem" >&2
+  exit 1
+fi
+if docker exec "$boundary_container" touch //input/faultlane-proof >/dev/null 2>&1; then
+  echo "processor wrote to its input mount" >&2
+  exit 1
+fi
+docker exec "$boundary_container" touch //scratch/faultlane-proof
+if docker exec "$boundary_container" dd if=/dev/zero of=//scratch/fill bs=1048576 count=65 \
+  >/dev/null 2>&1; then
+  echo "processor exceeded its scratch limit" >&2
+  exit 1
+fi
+docker rm --force "$boundary_container" >/dev/null
+boundary_container=""
+
+cargo build --quiet --package faultlane-server --package faultlane-cli
+./target/debug/faultlane-server migrate
+if FAULTLANE_PROCESSOR_IMAGE="faultlane-processor:missing-$proof_id" \
+  ./target/debug/faultlane-server worker \
+  >"$proof_directory/missing-image.log" 2>&1; then
+  echo "worker started without a usable processor image" >&2
+  exit 1
+fi
+
+start_role api
+api_pid="$started_pid"
+start_role ingest
+ingest_pid="$started_pid"
+start_role worker
+worker_pid="$started_pid"
+
+for _ in $(seq 1 60); do
+  if curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:$FAULTLANE_INGEST_PORT/health/ready" >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+curl --fail --silent "$FAULTLANE_API_URL/health/ready" >/dev/null
+curl --fail --silent "http://127.0.0.1:$FAULTLANE_INGEST_PORT/health/ready" >/dev/null
+
+json_field() {
+  local path="$1"
+  node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const path = process.argv[1].split(".");
+      const value = path.reduce((current, field) => current[field], JSON.parse(input));
+      process.stdout.write(String(value));
+    });
+  ' "$path"
+}
+
+setup_response="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  -H "Content-Type: application/json" \
+  --data '{"owner_email":"owner@example.com","organization_name":"FaultLane Processing Proof","organization_slug":"faultlane-processing-proof","project_name":"Windows Game","project_slug":"windows-game"}' \
+  "$FAULTLANE_API_URL/api/v1/setup")"
+project_id="$(json_field setup.project.id <<<"$setup_response")"
+ingest_key="$(json_field ingest_key.value <<<"$setup_response")"
+
+token_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$project_id/artifact-upload-tokens")"
+upload_token="$(json_field token <<<"$token_response")"
+
+run_upload() {
+  FAULTLANE_TOKEN="$upload_token" ./target/debug/faultlane symbols upload \
+    apps/cli/tests/fixtures/windows-symbolication \
+    --project windows-game \
+    --release 1.0.0 \
+    --configuration shipping \
+    --revision fixture \
+    --channel staging \
+    --build-timestamp 2026-08-14T00:00:00Z \
+    --ci-job isolated-proof \
+    --api-url "$FAULTLANE_API_URL"
+}
+
+first_upload="$(run_upload)"
+second_upload="$(run_upload)"
+
+stop_role "$worker_pid"
+worker_pid=""
+
+request_path="$proof_directory/crash.bundle"
+resource_path="$proof_directory/resource.bundle"
+repeat_path="$proof_directory/repeat.bundle"
+orphan_path="$proof_directory/orphan.bundle"
+storage_path="$proof_directory/storage-outage.bundle"
+database_path="$proof_directory/database-outage.bundle"
+node -e '
+  const fs = require("node:fs");
+  const zlib = require("node:zlib");
+  const dump = fs.readFileSync(process.argv[1]);
+  const integer = value => {
+    const output = Buffer.alloc(4);
+    output.writeInt32LE(value);
+    return output;
+  };
+  const field = value => {
+    const output = Buffer.alloc(264);
+    output.writeInt32LE(260);
+    output.write(value, 4, "ascii");
+    return output;
+  };
+  const create = (guid, outputPath) => {
+    const xml = Buffer.from(`
+      <FGenericCrashContext><RuntimeProperties>
+        <CrashGUID>${guid}</CrashGUID>
+        <CrashType>Crash</CrashType>
+        <BuildVersion>1.0.0</BuildVersion>
+        <EngineVersion>5.8.1</EngineVersion>
+        <PlatformName>Win64</PlatformName>
+        <PlatformArchitecture>x86_64</PlatformArchitecture>
+        <BuildConfiguration>Shipping</BuildConfiguration>
+      </RuntimeProperties></FGenericCrashContext>
+    `);
+    const parts = [
+      Buffer.from("CR1"),
+      field(guid),
+      field(`${guid}.uecrash`),
+      integer(0),
+      integer(2),
+      integer(0),
+      field("CrashContext.runtime-xml"),
+      integer(xml.length),
+      xml,
+      integer(1),
+      field("UEMinidump.dmp"),
+      integer(dump.length),
+      dump,
+    ];
+    const expanded = Buffer.concat(parts);
+    expanded.writeInt32LE(expanded.length, 531);
+    fs.writeFileSync(outputPath, zlib.deflateSync(expanded));
+  };
+  create("UECC-Windows-Proof-311", process.argv[2]);
+  create("UECC-Windows-Resource-311", process.argv[3]);
+  create("UECC-Windows-Repeat-311", process.argv[4]);
+  create("UECC-Windows-Orphan-311", process.argv[5]);
+  create("UECC-Windows-Storage-311", process.argv[6]);
+  create("UECC-Windows-Database-311", process.argv[7]);
+' apps/cli/tests/fixtures/windows-symbolication/faultlane-symbolication.dmp "$request_path" "$resource_path" "$repeat_path" "$orphan_path" "$storage_path" "$database_path"
+
+resource_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$resource_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+resource_event_id="$(json_field event_id <<<"$resource_response")"
+
+ingest_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$request_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+event_id="$(json_field event_id <<<"$ingest_response")"
+
+start_role worker
+worker_pid="$started_pid"
+start_role worker worker-two
+worker_two_pid="$started_pid"
+
+event_state=""
+for _ in $(seq 1 180); do
+  event_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$event_id")"
+  if [[ "$(json_field state <<<"$event_state")" == "processed" ]]; then
+    break
+  fi
+  if [[ "$(json_field state <<<"$event_state")" =~ ^(failed|quarantined)$ ]]; then
+    cat "$proof_directory"/worker*.log >&2
+    echo "$event_state" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ "$(json_field state <<<"$event_state")" != "processed" ]]; then
+  cat "$proof_directory"/worker*.log >&2
+  echo "event did not finish processing" >&2
+  exit 1
+fi
+
+resource_state=""
+for _ in $(seq 1 180); do
+  resource_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$resource_event_id")"
+  if [[ "$(json_field state <<<"$resource_state")" == "quarantined" ]]; then
+    break
+  fi
+  if [[ "$(json_field state <<<"$resource_state")" == "failed" ]]; then
+    cat "$proof_directory"/worker*.log >&2
+    echo "$resource_state" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ "$(json_field state <<<"$resource_state")" != "quarantined" ]]; then
+  cat "$proof_directory"/worker*.log >&2
+  echo "resource event did not reach quarantine" >&2
+  exit 1
+fi
+
+repeat_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$repeat_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+repeat_event_id="$(json_field event_id <<<"$repeat_response")"
+repeat_state=""
+for _ in $(seq 1 180); do
+  repeat_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$repeat_event_id")"
+  if [[ "$(json_field state <<<"$repeat_state")" == "processed" ]]; then
+    break
+  fi
+  if [[ "$(json_field state <<<"$repeat_state")" =~ ^(failed|quarantined)$ ]]; then
+    cat "$proof_directory"/worker*.log >&2
+    echo "$repeat_state" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ "$(json_field state <<<"$repeat_state")" != "processed" ]]; then
+  cat "$proof_directory"/worker*.log >&2
+  echo "repeat event did not finish processing" >&2
+  exit 1
+fi
+
+stop_role "$worker_pid"
+worker_pid=""
+stop_role "$worker_two_pid"
+worker_two_pid=""
+
+orphan_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$orphan_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+orphan_event_id="$(json_field event_id <<<"$orphan_response")"
+orphan_job_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT id::text FROM jobs WHERE event_id::text = '$orphan_event_id';")"
+
+start_role worker orphan-worker
+worker_pid="$started_pid"
+old_container=""
+for _ in $(seq 1 30); do
+  old_container="$(docker ps \
+    --filter "label=com.faultlane.job-id=$orphan_job_id" \
+    --format '{{.Names}}' | head -n 1)"
+  if [[ -n "$old_container" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$old_container" ]]; then
+  echo "worker did not start the orphan cleanup fixture" >&2
+  exit 1
+fi
+old_lease_token="$(docker inspect \
+  --format '{{ index .Config.Labels "com.faultlane.lease-token" }}' \
+  "$old_container")"
+old_attempt="$proof_directory/worker-scratch/attempt-$orphan_job_id-$old_lease_token"
+if [[ ! -d "$old_attempt" ]]; then
+  echo "worker attempt ownership marker is missing" >&2
+  exit 1
+fi
+
+stop_role "$worker_pid"
+worker_pid=""
+if ! docker inspect "$old_container" >/dev/null 2>&1; then
+  echo "forced worker termination did not leave the cleanup fixture" >&2
+  exit 1
+fi
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id::text = '$orphan_job_id' AND state = 'leased';" \
+  >/dev/null
+scratch_only="$proof_directory/worker-scratch/attempt-00000000-0000-4000-8000-000000000311-00000000-0000-4000-8000-000000000312"
+mkdir "$scratch_only"
+
+start_role worker reconciler-worker
+worker_pid="$started_pid"
+for _ in $(seq 1 60); do
+  if ! docker inspect "$old_container" >/dev/null 2>&1 \
+    && [[ ! -e "$old_attempt" ]] \
+    && [[ ! -e "$scratch_only" ]]; then
+    break
+  fi
+  sleep 1
+done
+if docker inspect "$old_container" >/dev/null 2>&1 \
+  || [[ -e "$old_attempt" ]] \
+  || [[ -e "$scratch_only" ]]; then
+  echo "stale processor resources were not reconciled" >&2
+  exit 1
+fi
+
+orphan_state=""
+for _ in $(seq 1 60); do
+  orphan_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$orphan_event_id")"
+  if [[ "$(json_field state <<<"$orphan_state")" == "processed" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(json_field state <<<"$orphan_state")" != "processed" ]]; then
+  echo "reconciled crash did not finish processing" >&2
+  exit 1
+fi
+
+stop_role "$worker_pid"
+worker_pid=""
+
+storage_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$storage_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+storage_event_id="$(json_field event_id <<<"$storage_response")"
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  stop minio >/dev/null
+
+start_role worker storage-outage-worker
+worker_pid="$started_pid"
+storage_retry=""
+for _ in $(seq 1 240); do
+  storage_retry="$(docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+    "WITH frozen AS (UPDATE jobs SET available_at = now() + interval '1 hour' WHERE event_id::text = '$storage_event_id' AND state = 'pending' AND failure_code = 'object_store_unavailable' RETURNING attempt) SELECT attempt FROM frozen;")"
+  if [[ -n "$storage_retry" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$storage_retry" != "1" ]]; then
+  echo "object-store outage did not leave one safe retry" >&2
+  exit 1
+fi
+stop_role "$worker_pid"
+worker_pid=""
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait minio >/dev/null
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "UPDATE jobs SET available_at = now() WHERE event_id::text = '$storage_event_id' AND state = 'pending';" \
+  >/dev/null
+start_role worker storage-recovery-worker
+worker_pid="$started_pid"
+storage_state=""
+for _ in $(seq 1 60); do
+  storage_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$storage_event_id")"
+  if [[ "$(json_field state <<<"$storage_state")" == "processed" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(json_field state <<<"$storage_state")" != "processed" ]]; then
+  echo "object-store outage job did not recover" >&2
+  exit 1
+fi
+
+stop_role "$worker_pid"
+worker_pid=""
+database_response="$(curl --fail --silent --show-error \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@$database_path" \
+  "http://127.0.0.1:$FAULTLANE_INGEST_PORT/u/$ingest_key?AppID=WindowsGame&AppVersion=1.0.0&AppEnvironment=Shipping&UploadType=crashreports&UserID=")"
+database_event_id="$(json_field event_id <<<"$database_response")"
+database_job_id="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT id::text FROM jobs WHERE event_id::text = '$database_event_id';")"
+start_role worker database-outage-worker
+worker_pid="$started_pid"
+database_container=""
+for _ in $(seq 1 30); do
+  database_container="$(docker ps \
+    --filter "label=com.faultlane.job-id=$database_job_id" \
+    --format '{{.Names}}' | head -n 1)"
+  if [[ -n "$database_container" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$database_container" ]]; then
+  echo "worker did not start the database outage fixture" >&2
+  exit 1
+fi
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  stop postgres >/dev/null
+for _ in $(seq 1 30); do
+  if ! docker inspect "$database_container" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if docker inspect "$database_container" >/dev/null 2>&1; then
+  echo "database outage processor did not finish while PostgreSQL was unavailable" >&2
+  exit 1
+fi
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait postgres >/dev/null
+database_retry="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT j.state || '|' || j.attempt || '|' || count(r.id) FROM jobs j LEFT JOIN crash_processing_results r ON r.event_id = j.event_id AND r.organization_id = j.organization_id AND r.project_id = j.project_id WHERE j.id::text = '$database_job_id' GROUP BY j.state, j.attempt;")"
+if [[ "$database_retry" != "leased|1|0" ]]; then
+  echo "database outage changed durable processing state: $database_retry" >&2
+  exit 1
+fi
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id::text = '$database_job_id' AND state = 'leased';" \
+  >/dev/null
+database_state=""
+for _ in $(seq 1 60); do
+  database_state="$(curl --fail --silent --show-error \
+    -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+    "$FAULTLANE_API_URL/api/v1/projects/$project_id/events/$database_event_id")"
+  if [[ "$(json_field state <<<"$database_state")" == "processed" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(json_field state <<<"$database_state")" != "processed" ]]; then
+  echo "database outage job did not recover" >&2
+  exit 1
+fi
+
+for sensitive in \
+  "$POSTGRES_PASSWORD" \
+  "$MINIO_ROOT_PASSWORD" \
+  "$FAULTLANE_BOOTSTRAP_SECRET" \
+  "$ingest_key" \
+  "$upload_token" \
+  "UECC-Windows-" \
+  "faultlane-symbolication.pdb"; do
+  if [[ -n "$sensitive" ]] \
+    && grep -F -- "$sensitive" "$proof_directory"/*.log >/dev/null 2>&1; then
+    echo "sensitive processing content reached a service log" >&2
+    exit 1
+  fi
+done
+if ! printf 'faultlane-worker-scratch-v1\n' \
+  | cmp -s - "$proof_directory/worker-scratch/.faultlane-worker-scratch"; then
+  echo "worker scratch ownership marker is invalid" >&2
+  exit 1
+fi
+if find "$proof_directory/worker-scratch" -mindepth 1 -maxdepth 1 \
+  ! -name '.faultlane-worker-scratch' -print -quit \
+  | grep -q .; then
+  echo "worker scratch retained an attempt after processing" >&2
+  exit 1
+fi
+
+database_evidence="$(docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+  "SELECT (SELECT count(*) FROM derived_symbol_caches WHERE state = 'available'), (SELECT count(*) FROM crash_processing_results WHERE event_id IN ('$event_id'::uuid, '$repeat_event_id'::uuid)), (SELECT jsonb_path_exists(result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') FROM crash_processing_results WHERE event_id::text = '$event_id' ORDER BY created_at DESC LIMIT 1), (SELECT state FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT resource_failures FROM jobs WHERE event_id::text = '$resource_event_id'), (SELECT processing_state FROM crash_events WHERE id::text = '$resource_event_id'), (SELECT count(*) FROM jobs WHERE job_type = 'generate_symcache'), (SELECT attempt FROM jobs WHERE event_id::text = '$storage_event_id'), (SELECT attempt FROM jobs WHERE event_id::text = '$database_event_id');")"
+
+FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$database_evidence" EVENT_STATE="$event_state" RESOURCE_STATE="$resource_state" REPEAT_STATE="$repeat_state" ORPHAN_STATE="$orphan_state" STORAGE_STATE="$storage_state" DATABASE_STATE="$database_state" node -e '
+  const first = JSON.parse(process.env.FIRST_UPLOAD);
+  const second = JSON.parse(process.env.SECOND_UPLOAD);
+  const event = JSON.parse(process.env.EVENT_STATE);
+  const resource = JSON.parse(process.env.RESOURCE_STATE);
+  const repeat = JSON.parse(process.env.REPEAT_STATE);
+  const orphan = JSON.parse(process.env.ORPHAN_STATE);
+  const storage = JSON.parse(process.env.STORAGE_STATE);
+  const database = JSON.parse(process.env.DATABASE_STATE);
+  if (first.uploaded !== 2 || first.bytes_transferred <= 0 || !first.coverage.ready) {
+    throw new Error("first isolated upload failed");
+  }
+  if (second.uploaded !== 0 || second.already_present !== 2 || second.bytes_transferred !== 0) {
+    throw new Error("second upload transferred bytes");
+  }
+  const evidence = process.env.DATABASE_EVIDENCE.trim().split("|");
+  if (evidence.slice(0, 9).join("|") !== "1|2|t|failed|2|2|quarantined|1|2"
+      || !["1", "2"].includes(evidence[9])) {
+    throw new Error(`processing evidence is invalid: ${process.env.DATABASE_EVIDENCE}`);
+  }
+  process.stdout.write(JSON.stringify({
+    release_id: first.release.id,
+    event_id: event.event_id,
+    state: event.state,
+    available_artifacts: first.coverage.available,
+    second_upload_bytes: second.bytes_transferred,
+    symcaches: 1,
+    normalized_results: 2,
+    readable_frame: true,
+    resource_event_id: resource.event_id,
+    resource_state: resource.state,
+    resource_attempts: 2,
+    repeat_event_id: repeat.event_id,
+    repeat_state: repeat.state,
+    symcache_jobs: 1,
+    concurrent_workers: 2,
+    boundary_verified: true,
+    orphan_event_id: orphan.event_id,
+    orphan_state: orphan.state,
+    orphan_cleanup_verified: true,
+    scratch_only_cleanup_verified: true,
+    storage_event_id: storage.event_id,
+    storage_state: storage.state,
+    storage_retry_verified: true,
+    database_event_id: database.event_id,
+    database_state: database.state,
+    database_attempts: Number(evidence[9]),
+    database_retry_verified: true,
+    logs_and_scratch_verified: true,
+  }) + "\n");
+'
