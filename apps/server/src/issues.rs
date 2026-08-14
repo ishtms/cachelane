@@ -998,6 +998,17 @@ mod tests {
         let second = insert_issue(&pool, &owned, "second", 'b', "2026-01-03T00:00:00Z").await?;
         let outside_issue =
             insert_issue(&pool, &outside, "outside", 'c', "2026-01-04T00:00:00Z").await?;
+        for (scope, issue) in [(&owned, &second), (&outside, &outside_issue)] {
+            sqlx::query(
+                "INSERT INTO crash_event_context_facets (organization_id, project_id, event_id, result_id, data_rules_version, key, value) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 1, 'MapName', 'Arena-[REDACTED]')",
+            )
+            .bind(&scope.organization)
+            .bind(&scope.project)
+            .bind(&issue.event_id)
+            .bind(&issue.result)
+            .execute(&pool)
+            .await?;
+        }
         let app = router("api", ServerState::issue_test(pool.clone(), SECRET));
 
         let first_page = app
@@ -1072,6 +1083,11 @@ mod tests {
                 "last_seen_to=2026-01-03T00%3A00%3A00Z",
                 Some(first.issue_id.as_str()),
             ),
+            (
+                "context_key=MapName&context_value=Arena-%5BREDACTED%5D",
+                Some(second.issue_id.as_str()),
+            ),
+            ("context_key=MapName&context_value=Private", None),
         ] {
             let response = app
                 .clone()
@@ -1296,6 +1312,7 @@ mod tests {
             assert_no_store(&response);
         }
         let invalid_query = app
+            .clone()
             .oneshot(
                 authorized(Request::builder().uri(format!(
                     "/api/v1/projects/{}/issues?limit=101",
@@ -1306,6 +1323,17 @@ mod tests {
             .await?;
         assert_eq!(invalid_query.status(), StatusCode::BAD_REQUEST);
         assert_no_store(&invalid_query);
+        let incomplete_context_filter = app
+            .oneshot(
+                authorized(Request::builder().uri(format!(
+                    "/api/v1/projects/{}/issues?context_key=MapName",
+                    owned.project
+                )))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(incomplete_context_filter.status(), StatusCode::BAD_REQUEST);
+        assert_no_store(&incomplete_context_filter);
         Ok(())
     }
 
@@ -1319,6 +1347,7 @@ mod tests {
     struct SeededIssue {
         issue_id: String,
         event_id: String,
+        result: String,
     }
 
     async fn insert_scope(
@@ -1512,7 +1541,11 @@ mod tests {
         .bind(&event_id)
         .execute(pool)
         .await?;
-        Ok(SeededIssue { issue_id, event_id })
+        Ok(SeededIssue {
+            issue_id,
+            event_id,
+            result: result_id,
+        })
     }
 
     fn authorized(request: axum::http::request::Builder) -> axum::http::request::Builder {
