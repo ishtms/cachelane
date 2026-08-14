@@ -1885,6 +1885,7 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use std::{
         env,
+        path::PathBuf,
         sync::{Arc, Mutex},
     };
 
@@ -1903,6 +1904,17 @@ mod tests {
         processor_runner::{OwnedContainer, ProcessorRunner},
         symbol_upload::{ArtifactObjects, MemoryObjects},
     };
+
+    fn test_temp_directory() -> PathBuf {
+        #[cfg(windows)]
+        {
+            env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map_or_else(env::temp_dir, |path| path.join("Temp"))
+        }
+        #[cfg(not(windows))]
+        env::temp_dir()
+    }
 
     #[test]
     fn container_names_use_only_internal_identifiers() {
@@ -1938,12 +1950,16 @@ mod tests {
         let descriptor =
             format!("D:\\a\\faultlane\\scratch\r\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})\r\n");
         assert!(super::windows_acl_is_private(&descriptor, sid));
+        assert!(!super::windows_acl_is_private(
+            "D:NO_ACCESS_CONTROL\r\n",
+            sid
+        ));
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_scratch_acl_uses_system_tools() {
-        let path = env::temp_dir().join(format!(
+        let path = test_temp_directory().join(format!(
             "faultlane-private-scratch-test-{}",
             std::process::id()
         ));
@@ -2006,7 +2022,7 @@ mod tests {
 
     #[test]
     fn worker_scratch_reuses_only_owned_directories() {
-        let owned = env::temp_dir().join(format!(
+        let owned = test_temp_directory().join(format!(
             "faultlane-owned-scratch-test-{}",
             random_uuid().unwrap_or_else(|error| panic!("test UUID must generate: {error}"))
         ));
@@ -2022,7 +2038,7 @@ mod tests {
         std::fs::remove_dir_all(&owned)
             .unwrap_or_else(|error| panic!("owned scratch must be removed: {error}"));
 
-        let unowned = env::temp_dir().join(format!(
+        let unowned = test_temp_directory().join(format!(
             "faultlane-unowned-scratch-test-{}",
             random_uuid().unwrap_or_else(|error| panic!("test UUID must generate: {error}"))
         ));
