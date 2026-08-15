@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod alerts;
 mod auth;
 mod crash_ingest;
 mod dashboard;
@@ -45,15 +46,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Api => serve("api", "FAULTLANE_API_PORT", 8080).await?,
         Command::Ingest => serve("ingest", "FAULTLANE_INGEST_PORT", 8081).await?,
         Command::Worker => {
-            if env::var("FAULTLANE_ISOLATED_PROCESSING_ENABLED")
-                .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
-            {
-                worker::run().await?;
-            } else {
-                wait_for_shutdown("worker").await?;
+            let processing = env::var("FAULTLANE_ISOLATED_PROCESSING_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+            match (processing, alerts::enabled_from_environment()) {
+                (true, true) => tokio::select! {
+                    result = worker::run() => result?,
+                    result = alerts::run_worker() => result?,
+                },
+                (true, false) => worker::run().await?,
+                (false, true) => alerts::run_worker().await?,
+                (false, false) => wait_for_shutdown("worker").await?,
             }
         }
-        Command::Scheduler => usage::run_scheduler().await?,
+        Command::Scheduler => {
+            if alerts::enabled_from_environment() {
+                tokio::select! {
+                    result = usage::run_scheduler() => result?,
+                    result = alerts::run_scheduler() => result?,
+                }
+            } else {
+                usage::run_scheduler().await?;
+            }
+        }
         Command::Migrate => migrate(&required_env("DATABASE_URL")?).await?,
     }
 

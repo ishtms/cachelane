@@ -15,6 +15,7 @@ repository = "https://github.com/ishtms/faultlane"
 aws-sdk-s3 = { version = "1.141.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
 axum = "0.8.9"
 base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3.31"

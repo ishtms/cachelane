@@ -749,6 +749,45 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.alerts-settings {
+  display: grid;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.alerts-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.alerts-form-grid > form {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.alerts-form-grid label,
+.quiet-hours label {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.quiet-hours {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.secret-callout {
+  overflow-wrap: anywhere;
+}
+
 .issue-link {
   color: var(--text);
   font-weight: 700;
@@ -1364,6 +1403,8 @@ button:disabled {
   .filter-form,
   .data-rules-form,
   .usage-settings-form,
+  .alerts-form-grid,
+  .quiet-hours,
   .advanced-filters > div {
     grid-template-columns: 1fr;
   }

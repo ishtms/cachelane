@@ -38,6 +38,7 @@ pub(crate) struct ServerState {
     reprocessing_enabled: bool,
     symbol_uploads: crate::symbol_upload::SymbolUploads,
     auth: crate::auth::Auth,
+    alerts: crate::alerts::Alerts,
 }
 
 impl ServerState {
@@ -84,6 +85,7 @@ impl ServerState {
         let symbol_uploads =
             crate::symbol_upload::SymbolUploads::postgres(pool.clone(), role, host)?;
         let auth = crate::auth::Auth::for_role(pool.clone(), host, role)?;
+        let alerts = crate::alerts::Alerts::for_role(role)?;
 
         Ok(Self {
             store: ProjectStore::Postgres(pool.clone()),
@@ -98,6 +100,7 @@ impl ServerState {
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             symbol_uploads,
             auth,
+            alerts,
         })
     }
 
@@ -116,6 +119,7 @@ impl ServerState {
             reprocessing_enabled: false,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::disabled(),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -136,6 +140,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -156,6 +161,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads,
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -172,6 +178,24 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_test(pool: PgPool, secret: &str, key: [u8; 32]) -> Self {
+        Self {
+            store: ProjectStore::Postgres(pool.clone()),
+            bootstrap: BootstrapAuthorization::new("127.0.0.1", true, Some(secret))
+                .unwrap_or_else(|error| panic!("test authorization must be valid: {error}")),
+            ingest_base_url: "http://127.0.0.1:8081".to_owned(),
+            crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
+            dashboard_enabled: true,
+            raw_artifact_download_enabled: false,
+            reprocessing_enabled: true,
+            symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
+            auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::test(key),
         }
     }
 
@@ -188,6 +212,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test_providers(pool, provider_base_url),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -211,6 +236,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -234,6 +260,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -250,6 +277,7 @@ impl ServerState {
             reprocessing_enabled: true,
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
+            alerts: crate::alerts::Alerts::disabled(),
         }
     }
 
@@ -271,6 +299,10 @@ impl ServerState {
 
     pub(crate) fn auth(&self) -> &crate::auth::Auth {
         &self.auth
+    }
+
+    pub(crate) fn alerts(&self) -> &crate::alerts::Alerts {
+        &self.alerts
     }
 
     pub(crate) fn crash_ingest(&self) -> &crate::crash_ingest::CrashIngest {
@@ -333,6 +365,7 @@ pub(crate) enum StartupError {
     IngestConfiguration,
     SymbolUploadConfiguration,
     AuthenticationConfiguration,
+    AlertsConfiguration,
 }
 
 impl fmt::Display for StartupError {
@@ -348,6 +381,7 @@ impl fmt::Display for StartupError {
             Self::AuthenticationConfiguration => {
                 formatter.write_str("authentication configuration is invalid")
             }
+            Self::AlertsConfiguration => formatter.write_str("alerts configuration is invalid"),
         }
     }
 }
@@ -424,6 +458,26 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
                 get(crate::usage::get_usage)
                     .put(crate::usage::update_usage)
                     .layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/alerts",
+                get(crate::alerts::get_alerts),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/alert-integrations",
+                post(crate::alerts::create_integration).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/alert-integrations/{integration_id}",
+                patch(crate::alerts::update_integration).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/alert-rules",
+                post(crate::alerts::create_rule).layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
+                "/api/v1/projects/{project_id}/alert-rules/{rule_id}",
+                patch(crate::alerts::update_rule).layer(DefaultBodyLimit::max(8 * 1024)),
             )
             .route(
                 "/api/v1/projects/{project_id}/issues/{issue_id}/events",

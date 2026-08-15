@@ -142,6 +142,12 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await expect(
     page.getByRole("heading", { name: "Project data rules" }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Crash and project alerts" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Alerts are not enabled for this deployment."),
+  ).toBeVisible();
   await page
     .getByLabel("Literal redaction patterns, one per line")
     .fill("browser-proof-secret");

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+cargo test -p faultlane-server alerts::tests --no-fail-fast
+
+bash ./scripts/with-test-database \
+  cargo test -p faultlane-server \
+  alert_conditions_dedupe_recover_retry_and_stay_scoped \
+  -- --ignored --nocapture
+
+echo "alert proof: seven conditions deduplicated, recovered, retried, and tenant scoped"

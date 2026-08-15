@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 
 import {
   FaultlaneApiError,
+  type ProjectAlerts,
   type ExistingSetup,
   type IssueList,
   type ProjectDataRules,
@@ -12,6 +13,7 @@ import {
   faultlaneApi,
 } from "../../../lib/faultlane";
 import { DataRulesForm } from "./data-rules-form";
+import { AlertsForm } from "./alerts-form";
 import { UsageForm } from "./usage-form";
 
 export const metadata: Metadata = {
@@ -173,8 +175,9 @@ export default async function ProjectPage({
   let setup: ExistingSetup;
   let dataRules: ProjectDataRules;
   let usage: ProjectUsage;
+  let alerts: ProjectAlerts | null;
   try {
-    [overview, issues, setup, dataRules, usage] = await Promise.all([
+    [overview, issues, setup, dataRules, usage, alerts] = await Promise.all([
       faultlaneApi<ProjectOverview>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/overview`,
       ),
@@ -190,6 +193,13 @@ export default async function ProjectPage({
       faultlaneApi<ProjectUsage>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/usage`,
       ),
+      faultlaneApi<ProjectAlerts>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/alerts`,
+      ).catch((error: unknown) => {
+        if (error instanceof FaultlaneApiError && error.status === 404)
+          return null;
+        throw error;
+      }),
     ]);
   } catch (error) {
     if (
@@ -531,6 +541,27 @@ export default async function ProjectPage({
           artifacts are unchanged and keep separate access controls.
         </p>
         <DataRulesForm projectId={projectId} rules={dataRules} />
+      </section>
+
+      <section className="dashboard-panel alerts-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="setup-kicker">Project notifications</p>
+            <h2>Crash and project alerts</h2>
+          </div>
+          <span>{alerts ? `${alerts.rules.length} rules` : "Disabled"}</span>
+        </div>
+        <p className="fine-print">
+          Send first-seen, regression, volume, symbol, processing, ingest, and
+          quota alerts to email, Discord, Slack, or a signed webhook.
+        </p>
+        {alerts ? (
+          <AlertsForm projectId={projectId} alerts={alerts} />
+        ) : (
+          <p className="empty-copy">
+            Alerts are not enabled for this deployment.
+          </p>
+        )}
       </section>
 
       <section className="dashboard-panel usage-panel">
