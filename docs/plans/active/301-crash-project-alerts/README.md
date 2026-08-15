@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/301
 
-Status: Approved for implementation on August 15, 2026
+Status: Locally verified on August 15, 2026
 
 ## Context
 
@@ -157,3 +157,7 @@ Restore the prior application build after alert claims have stopped. The prior b
 ## Approval
 
 Ishtmeet Singh approved this R3 plan and authorized implementation on August 15, 2026. The approval includes the outbound network controls, encrypted-secret design, UTC quiet hours, and delivery semantics for ambiguous provider timeouts.
+
+## Local verification
+
+`./scripts/prove-alerts`, `./scripts/check-fast`, and `./scripts/check` passed on August 15, 2026. The proof covered all seven conditions, concurrent deduplication, recovery, bounded retry, tenant isolation, API redaction and audit state, all four destination adapters, signed webhook payloads, and the browser settings flow. No pull request, remote CI run, merge, issue closure, or deployment was performed.

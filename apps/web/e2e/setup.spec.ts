@@ -65,4 +65,23 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
   expect(revokedResponse.status()).toBe(404);
   const activeResponse = await page.request.post(`${ingestUrl}/u/${secondKey}`);
   expect(activeResponse.status()).toBe(400);
+
+  await page.goto(`/projects/${projectId}`);
+  await expect(
+    page.getByRole("heading", { name: "Crash and project alerts" }),
+  ).toBeVisible();
+  await page.getByLabel("Name").fill("Browser proof email");
+  await page.getByRole("button", { name: "Add destination" }).click();
+  await expect(page.getByText("Browser proof email created.")).toBeVisible();
+  await page
+    .getByLabel("Destination")
+    .selectOption({ label: "Browser proof email" });
+  await page.getByRole("button", { name: "Add rule" }).click();
+  await expect(page.getByText("first seen rule created.")).toBeVisible();
+  const alertRows = page.locator(".alerts-settings table tbody tr");
+  await expect(alertRows).toHaveCount(2);
+  await alertRows.first().getByRole("button", { name: "Disable" }).click();
+  await expect(
+    alertRows.first().getByRole("button", { name: "Enable" }),
+  ).toBeVisible();
 });

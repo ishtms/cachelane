@@ -694,6 +694,187 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/alerts:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectAlerts
+      summary: Get project alert destinations, rules, condition state, and delivery state
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Current project alert configuration and state
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectAlerts"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/alert-integrations:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createProjectAlertIntegration
+      summary: Create a project alert destination
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAlertIntegration"
+      responses:
+        "201":
+          description: Alert destination created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertIntegration"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/alert-integrations/{integration_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: integration_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      operationId: updateProjectAlertIntegration
+      summary: Update a project alert destination
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAlertIntegration"
+      responses:
+        "200":
+          description: Alert destination updated
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertIntegration"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/alert-rules:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createProjectAlertRule
+      summary: Create a project alert rule
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAlertRule"
+      responses:
+        "201":
+          description: Alert rule created
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertRule"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/alert-rules/{rule_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+      - name: rule_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      operationId: updateProjectAlertRule
+      summary: Update a project alert rule
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAlertRule"
+      responses:
+        "200":
+          description: Alert rule updated
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertRule"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/projects/{project_id}/issues:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -2254,6 +2435,347 @@ components:
           type: integer
           minimum: 1
           maximum: 3650
+    AlertIntegrationKind:
+      type: string
+      enum:
+        - email
+        - discord
+        - slack
+        - webhook
+    AlertConditionKind:
+      type: string
+      enum:
+        - first_seen
+        - regression
+        - volume
+        - missing_symbols
+        - processing_failure
+        - ingest_silence
+        - quota
+    CreateAlertIntegration:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - name
+      properties:
+        kind:
+          $ref: "#/components/schemas/AlertIntegrationKind"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        recipient_user_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        url:
+          type:
+            - string
+            - "null"
+          format: uri
+          maxLength: 2048
+    UpdateAlertIntegration:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        enabled:
+          type: boolean
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        rotate_signing_secret:
+          type: boolean
+          default: false
+    AlertIntegration:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - kind
+        - name
+        - recipient_user_id
+        - endpoint_host
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: "#/components/schemas/AlertIntegrationKind"
+        name:
+          type: string
+        recipient_user_id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        endpoint_host:
+          type:
+            - string
+            - "null"
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        signing_secret:
+          type: string
+          readOnly: true
+          description: Returned only when a generic webhook is created or its secret is rotated.
+    CreateAlertRule:
+      type: object
+      additionalProperties: false
+      required:
+        - integration_id
+        - condition_kind
+        - environment
+      properties:
+        integration_id:
+          type: string
+          format: uuid
+        condition_kind:
+          $ref: "#/components/schemas/AlertConditionKind"
+        environment:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: ^[a-z0-9][a-z0-9_-]*$
+        threshold:
+          type:
+            - integer
+            - "null"
+        window_seconds:
+          type:
+            - integer
+            - "null"
+          minimum: 60
+          maximum: 604800
+        quiet_start_minute:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+          maximum: 1439
+        quiet_end_minute:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+          maximum: 1439
+    UpdateAlertRule:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        enabled:
+          type: boolean
+        threshold:
+          type: integer
+        window_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+        quiet_start_minute:
+          type: integer
+          minimum: 0
+          maximum: 1439
+        quiet_end_minute:
+          type: integer
+          minimum: 0
+          maximum: 1439
+        clear_quiet_hours:
+          type: boolean
+          default: false
+    AlertRule:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - integration_id
+        - condition_kind
+        - environment
+        - threshold
+        - window_seconds
+        - quiet_start_minute
+        - quiet_end_minute
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        integration_id:
+          type: string
+          format: uuid
+        condition_kind:
+          $ref: "#/components/schemas/AlertConditionKind"
+        environment:
+          type: string
+        threshold:
+          type:
+            - integer
+            - "null"
+        window_seconds:
+          type:
+            - integer
+            - "null"
+        quiet_start_minute:
+          type:
+            - integer
+            - "null"
+        quiet_end_minute:
+          type:
+            - integer
+            - "null"
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AlertConditionState:
+      type: object
+      additionalProperties: false
+      required:
+        - rule_id
+        - scope_key
+        - state
+        - generation
+        - payload
+        - transitioned_at
+      properties:
+        rule_id:
+          type: string
+          format: uuid
+        scope_key:
+          type: string
+          maxLength: 200
+        state:
+          type: string
+          enum:
+            - active
+            - inactive
+        generation:
+          type: integer
+          minimum: 1
+        payload:
+          type: object
+          additionalProperties: true
+        transitioned_at:
+          type: string
+          format: date-time
+    AlertDeliveryState:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - integration_id
+        - rule_id
+        - scope_key
+        - generation
+        - transition
+        - state
+        - attempt
+        - failure_code
+        - created_at
+        - delivered_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        integration_id:
+          type: string
+          format: uuid
+        rule_id:
+          type: string
+          format: uuid
+        scope_key:
+          type: string
+          maxLength: 200
+        generation:
+          type: integer
+          minimum: 1
+        transition:
+          type: string
+          enum:
+            - triggered
+            - recovered
+        state:
+          type: string
+          enum:
+            - pending
+            - leased
+            - delivered
+            - failed
+            - dead
+            - suppressed
+            - unknown
+        attempt:
+          type: integer
+          minimum: 0
+          maximum: 5
+        failure_code:
+          type:
+            - string
+            - "null"
+        created_at:
+          type: string
+          format: date-time
+        delivered_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+    ProjectAlerts:
+      type: object
+      additionalProperties: false
+      required:
+        - enabled
+        - can_edit
+        - integrations
+        - rules
+        - conditions
+        - deliveries
+      properties:
+        enabled:
+          type: boolean
+          const: true
+        can_edit:
+          type: boolean
+        integrations:
+          type: array
+          items:
+            $ref: "#/components/schemas/AlertIntegration"
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/AlertRule"
+        conditions:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AlertConditionState"
+        deliveries:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AlertDeliveryState"
     UsagePolicyOutcome:
       type: string
       enum:

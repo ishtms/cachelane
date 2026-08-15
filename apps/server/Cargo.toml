@@ -11,6 +11,7 @@ repository.workspace = true
 aws-sdk-s3.workspace = true
 axum.workspace = true
 base64.workspace = true
+chacha20poly1305.workspace = true
 faultlane-domain = { path = "../../crates/domain" }
 faultlane-grouping = { path = "../../crates/grouping" }
 faultlane-processing = { path = "../../crates/processing" }

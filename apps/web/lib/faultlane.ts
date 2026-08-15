@@ -152,6 +152,74 @@ export type ProjectUsage = {
   can_edit: boolean;
 };
 
+export type AlertIntegration = {
+  id: string;
+  kind: "email" | "discord" | "slack" | "webhook";
+  name: string;
+  recipient_user_id: string | null;
+  endpoint_host: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  signing_secret?: string;
+};
+
+export type AlertRule = {
+  id: string;
+  integration_id: string;
+  condition_kind:
+    | "first_seen"
+    | "regression"
+    | "volume"
+    | "missing_symbols"
+    | "processing_failure"
+    | "ingest_silence"
+    | "quota";
+  environment: string;
+  threshold: number | null;
+  window_seconds: number | null;
+  quiet_start_minute: number | null;
+  quiet_end_minute: number | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectAlerts = {
+  enabled: true;
+  can_edit: boolean;
+  integrations: AlertIntegration[];
+  rules: AlertRule[];
+  conditions: Array<{
+    rule_id: string;
+    scope_key: string;
+    state: "active" | "inactive";
+    generation: number;
+    payload: Record<string, unknown>;
+    transitioned_at: string;
+  }>;
+  deliveries: Array<{
+    id: string;
+    integration_id: string;
+    rule_id: string;
+    scope_key: string;
+    generation: number;
+    transition: "triggered" | "recovered";
+    state:
+      | "pending"
+      | "leased"
+      | "delivered"
+      | "failed"
+      | "dead"
+      | "suppressed"
+      | "unknown";
+    attempt: number;
+    failure_code: string | null;
+    created_at: string;
+    delivered_at: string | null;
+  }>;
+};
+
 export type Distribution = {
   key: string;
   label: string;
