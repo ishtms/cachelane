@@ -237,9 +237,9 @@ pub(crate) async fn list_issues(
         .as_deref()
         .map(|value| decode_issue_cursor(value, &scope.project_id, &filter_hash))
         .transpose()?;
-    let search = query.query.as_deref().map(search_pattern);
+    let search = query.query.as_deref();
     let rows = sqlx::query(
-        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND ($3::timestamptz IS NULL OR (i.last_seen_at, i.id) < ($3::timestamptz, $4::uuid)) AND ($5::text IS NULL OR i.status = $5) AND ($6::text IS NULL OR i.regression_state = $6) AND ($8::timestamptz IS NULL OR i.first_seen_at >= $8::timestamptz) AND ($9::timestamptz IS NULL OR i.first_seen_at < $9::timestamptz) AND ($10::timestamptz IS NULL OR i.last_seen_at >= $10::timestamptz) AND ($11::timestamptz IS NULL OR i.last_seen_at < $11::timestamptz) AND (($7::uuid IS NULL AND $12::text IS NULL AND $13::text IS NULL AND $14::text IS NULL AND $15::text IS NULL AND $16::text IS NULL AND $17::text IS NULL) OR EXISTS (SELECT 1 FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND ($7::uuid IS NULL OR e.release_id = $7::uuid) AND ($12::text IS NULL OR s.crash_type = $12) AND ($13::text IS NULL OR s.platform = $13) AND ($14::text IS NULL OR s.architecture = $14) AND ($15::text IS NULL OR s.engine_version = $15) AND ($16::text IS NULL OR CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END = $16) AND ($17::text IS NULL OR EXISTS (SELECT 1 FROM crash_event_context_facets f WHERE f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id AND f.key = $17 AND f.value = $18)))) AND ($19::text IS NULL OR i.title ILIKE $19 ESCAPE E'\\\\' OR EXISTS (SELECT 1 FROM crash_events e JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND s.search_text ILIKE $19 ESCAPE E'\\\\')) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $20",
+        "WITH search_query AS MATERIALIZED (SELECT value FROM (SELECT CASE WHEN $19::text IS NULL THEN NULL::tsquery ELSE plainto_tsquery('simple', $19) END AS value) parsed WHERE numnode(value) > 0), matched_issues AS MATERIALIZED (SELECT title.id AS issue_id FROM issues title CROSS JOIN search_query WHERE $19::text IS NOT NULL AND title.organization_id = $1::uuid AND title.project_id = $2::uuid AND title.search_vector @@ search_query.value UNION SELECT title.id AS issue_id FROM issues title CROSS JOIN search_query WHERE $19::text IS NOT NULL AND title.organization_id = $1::uuid AND title.project_id = $2::uuid AND title.search_vector IS NULL AND to_tsvector('simple', title.title) @@ search_query.value UNION SELECT event.issue_id FROM crash_event_search document JOIN crash_events event ON event.organization_id = document.organization_id AND event.project_id = document.project_id AND event.id = document.event_id AND event.current_result_id = document.result_id CROSS JOIN search_query WHERE $19::text IS NOT NULL AND document.organization_id = $1::uuid AND document.project_id = $2::uuid AND event.issue_id IS NOT NULL AND document.search_vector @@ search_query.value GROUP BY event.issue_id UNION SELECT event.issue_id FROM crash_event_search document JOIN crash_events event ON event.organization_id = document.organization_id AND event.project_id = document.project_id AND event.id = document.event_id AND event.current_result_id = document.result_id CROSS JOIN search_query WHERE $19::text IS NOT NULL AND document.organization_id = $1::uuid AND document.project_id = $2::uuid AND document.search_vector IS NULL AND event.issue_id IS NOT NULL AND to_tsvector('simple', document.search_text) @@ search_query.value GROUP BY event.issue_id) SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND ($3::timestamptz IS NULL OR (i.last_seen_at, i.id) < ($3::timestamptz, $4::uuid)) AND ($5::text IS NULL OR i.status = $5) AND ($6::text IS NULL OR i.regression_state = $6) AND ($8::timestamptz IS NULL OR i.first_seen_at >= $8::timestamptz) AND ($9::timestamptz IS NULL OR i.first_seen_at < $9::timestamptz) AND ($10::timestamptz IS NULL OR i.last_seen_at >= $10::timestamptz) AND ($11::timestamptz IS NULL OR i.last_seen_at < $11::timestamptz) AND (($7::uuid IS NULL AND $12::text IS NULL AND $13::text IS NULL AND $14::text IS NULL AND $15::text IS NULL AND $16::text IS NULL AND $17::text IS NULL) OR EXISTS (SELECT 1 FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND ($7::uuid IS NULL OR e.release_id = $7::uuid) AND ($12::text IS NULL OR s.crash_type = $12) AND ($13::text IS NULL OR s.platform = $13) AND ($14::text IS NULL OR s.architecture = $14) AND ($15::text IS NULL OR s.engine_version = $15) AND ($16::text IS NULL OR CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END = $16) AND ($17::text IS NULL OR EXISTS (SELECT 1 FROM crash_event_context_facets f WHERE f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id AND f.key = $17 AND f.value = $18)))) AND ($19::text IS NULL OR EXISTS (SELECT 1 FROM matched_issues matched WHERE matched.issue_id = i.id)) ORDER BY i.last_seen_at DESC, i.id DESC LIMIT $20",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -259,7 +259,7 @@ pub(crate) async fn list_issues(
     .bind(query.symbolication_state.as_deref())
     .bind(query.context_key.as_deref())
     .bind(query.context_value.as_deref())
-    .bind(search.as_deref())
+    .bind(search)
     .bind(i64::from(limit) + 1)
     .fetch_all(&mut *transaction)
     .await
@@ -622,19 +622,6 @@ fn decode_issue_cursor(
     Ok(cursor)
 }
 
-fn search_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() + 2);
-    pattern.push('%');
-    for character in value.chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            pattern.push('\\');
-        }
-        pattern.push(character);
-    }
-    pattern.push('%');
-    pattern
-}
-
 fn lower_hex(bytes: &[u8]) -> String {
     let mut value = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -911,7 +898,7 @@ mod tests {
 
     use super::{
         IssueCursor, IssueError, IssueListQuery, decode_issue_cursor, encode_issue_cursor,
-        issue_filter_hash, search_pattern, valid_uuid, validate_list_query,
+        issue_filter_hash, valid_uuid, validate_list_query,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
 
@@ -928,7 +915,6 @@ mod tests {
             }),
             Err(IssueError::InvalidRequest)
         ));
-        assert_eq!(search_pattern("100%_safe\\path"), "%100\\%\\_safe\\\\path%");
         let query = IssueListQuery::default();
         let filter_hash =
             issue_filter_hash(&query).unwrap_or_else(|_| panic!("default filters must hash"));
@@ -1068,6 +1054,8 @@ mod tests {
                 Some(second.issue_id.as_str()),
             ),
             ("query=second%20player", Some(second.issue_id.as_str())),
+            ("query=SECOND%20player", Some(second.issue_id.as_str())),
+            ("query=oot", None),
             ("query=%25", None),
             (
                 "last_seen_to=2026-01-03T00%3A00%3A00Z",
@@ -1102,6 +1090,54 @@ mod tests {
                 assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
             }
         }
+        sqlx::query(
+            "UPDATE issues SET search_vector = NULL WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+        )
+        .bind(&owned.organization)
+        .bind(&owned.project)
+        .bind(&second.issue_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE crash_event_search SET search_vector = NULL WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid",
+        )
+        .bind(&owned.organization)
+        .bind(&owned.project)
+        .bind(&second.event_id)
+        .execute(&pool)
+        .await?;
+        let pre_backfill_search = app
+            .clone()
+            .oneshot(
+                authorized(Request::builder().uri(format!(
+                    "/api/v1/projects/{}/issues?query=second%20player",
+                    owned.project
+                )))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(pre_backfill_search.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(pre_backfill_search).await?["items"][0]["issue_id"],
+            second.issue_id
+        );
+        let pre_backfill_punctuation = app
+            .clone()
+            .oneshot(
+                authorized(Request::builder().uri(format!(
+                    "/api/v1/projects/{}/issues?query=%25",
+                    owned.project
+                )))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(pre_backfill_punctuation.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(pre_backfill_punctuation).await?["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
         let cross_filter_cursor = app
             .clone()
             .oneshot(

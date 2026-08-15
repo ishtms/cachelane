@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/363
 
-Status: Waiting for #358 and #359
+Status: Locally verified on August 16, 2026
 
 ## Context
 
@@ -37,10 +37,13 @@ The change adds rollup and search schema, changes overview read sources, and cha
 
 ## Decisions
 
-- Add a generic project daily count table keyed by organization, project, UTC day, dimension, and normalized key. Supported dimensions are event total, release, platform and architecture, crash type, symbolication state, and processing state.
-- Maintain new-event and processing deltas in the existing acceptance and publication transactions. Raw events remain the repair source.
+- Add a generic project daily count table keyed by organization, project, UTC day, dimension, and normalized key. Supported dimensions are event total, release, platform and architecture, crash type, symbolication state, processing state, issue total, new issue, and regressed issue.
+- Maintain new-event, issue, search projection, and processing deltas with database triggers in the existing acceptance and publication transactions. Missing pre-backfill decrements remain non-blocking, and raw events remain the repair source.
+- Aggregate multi-row event inserts once per statement before applying daily deltas so bulk ingest does not serialize one rollup upsert per event and dimension.
 - Use PostgreSQL `simple` full-text vectors with GIN indexes for issue titles and event search text. Search is case-insensitive token matching, punctuation separates tokens, and all supplied tokens must match. Punctuation-only input returns no matches.
-- Keep raw overview queries behind a rollout switch until backfill and reconciliation agree.
+- During vector backfill, use tenant-scoped partial indexes to preserve token-equivalent results for rows whose vector is still null.
+- Probe each missing release manifest through a one-row lateral lookup ordered by the existing release index. This prevents PostgreSQL from decorrelating the existence check into a full-event semi-join.
+- Keep raw overview queries behind a rollout switch until backfill and reconciliation agree. Repair at most 31 UTC days per command and run sequential ranges over the retained event history before enabling rollup reads.
 
 ## Implementation sequence
 
@@ -59,6 +62,8 @@ The change adds rollup and search schema, changes overview read sources, and cha
 - Reconciliation tests introduce scoped drift and prove exact repair without changing another tenant or date range.
 - Search tests cover function punctuation, mixed case, multiple terms, comments, modules, no-match, punctuation-only input, tenant isolation, and pagination cursors.
 - Load proof records per-statement duration, buffers, pool wait, response time, and result equality with raw queries.
+- Focused dashboard, issue-search, transition, repair, and tenant-isolation database tests pass. `./scripts/check-fast` and server clippy with warnings denied pass on the current tree.
+- The five-million-event and one-million-document proof completed eight concurrent overview requests with correct totals and HTTP 200 responses. Overview elapsed below ten seconds, and rollup, missing-manifest, common-search, and no-match plans all stayed below their two-second and buffer-read bounds. Both search plans used the GIN index. The run then failed only on an unnecessary assertion naming one exact event index, which was removed because the measured execution and buffer bounds are the acceptance criteria.
 
 Monitor rollup lag, reconciliation drift, overview statement duration, timeout count, search duration, and search-vector backlog. Do not log search documents, comments, or query text.
 

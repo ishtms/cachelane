@@ -12,6 +12,7 @@ mod data_rules;
 mod identifiers;
 mod issues;
 mod processor_runner;
+mod project_rollups;
 mod project_setup;
 mod reprocessing;
 mod symbol_upload;
@@ -47,6 +48,16 @@ enum Command {
         organization_id: String,
         #[arg(long)]
         project_id: String,
+    },
+    RepairProjectRollups {
+        #[arg(long)]
+        organization_id: String,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        through: String,
     },
 }
 
@@ -106,6 +117,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &required_env("DATABASE_URL")?,
                 &organization_id,
                 &project_id,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Command::RepairProjectRollups {
+            organization_id,
+            project_id,
+            from,
+            through,
+        } => {
+            let report = project_rollups::repair_project_rollups(
+                &required_env("DATABASE_URL")?,
+                &organization_id,
+                &project_id,
+                &from,
+                &through,
             )
             .await?;
             println!("{}", serde_json::to_string(&report)?);

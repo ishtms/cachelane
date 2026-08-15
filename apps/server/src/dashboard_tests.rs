@@ -1,17 +1,23 @@
-use std::{env, error::Error, sync::Arc, time::Duration};
+use std::{
+    env,
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
 use base64::Engine as _;
+use futures_util::future::join_all;
 use object_store::{
     ClientOptions, ObjectStoreExt, PutPayload, RetryConfig, aws::AmazonS3Builder, memory::InMemory,
     path::Path as ObjectPath,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
 use tower::ServiceExt;
 
@@ -198,12 +204,20 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
     assert_eq!(overview["symbolication"]["denominator"], 2);
     assert_eq!(overview["missing_symbol_count"], 2);
     assert_eq!(overview["processing"]["pending_jobs"], 1);
-    assert_eq!(overview["observed_usage"]["authoritative"], false);
+    assert_eq!(overview["observed_usage"]["authoritative"], true);
     assert_eq!(
         overview["observed_usage"]["retained_raw_bytes"],
         i64::try_from(issue.raw_bytes.len() + issue.older_raw_bytes.len())?
     );
     assert_eq!(overview["observed_usage"]["organization_projects"], 2);
+    let rolled_events: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'event_total'",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rolled_events, 2);
 
     let empty_overview = app
         .clone()
@@ -617,6 +631,620 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+#[allow(clippy::expect_used)]
+#[allow(clippy::too_many_lines)]
+async fn rollups_track_transitions_repair_drift_and_stay_tenant_scoped()
+-> Result<(), Box<dyn Error>> {
+    let database_url =
+        env::var("FAULTLANE_TEST_DATABASE_URL").expect("FAULTLANE_TEST_DATABASE_URL is required");
+    let _guard = DATABASE_TEST_LOCK.lock().await;
+    assert_isolated_database(&database_url);
+    migrate(&database_url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    sqlx::query("TRUNCATE users, organizations CASCADE")
+        .execute(&pool)
+        .await?;
+    let objects = InMemory::new();
+    let owned = insert_scope(&pool, "local-bootstrap", "rollup-owned").await?;
+    let outside = insert_scope(&pool, "outside-rollup", "rollup-outside").await?;
+    let owned_issue = insert_issue(&pool, &objects, &owned, "rollup-owned", 'c').await?;
+    let _outside_issue = insert_issue(&pool, &objects, &outside, "rollup-outside", 'd').await?;
+    let batch_events: i64 = sqlx::query_scalar(
+        "WITH generated AS MATERIALIZED (SELECT gen_random_uuid() AS object_id, gen_random_uuid() AS event_id, n FROM generate_series(1, 25) values(n)), objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) SELECT object_id, $1::uuid, $2::uuid, 'rollup-batch/' || n::text, decode(lpad(to_hex(1000000 + n), 64, '0'), 'hex'), 1, 'application/octet-stream' FROM generated RETURNING id), events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment, processing_state, received_at, release_id, release_mapping_state, grouping_state) SELECT generated.event_id, $1::uuid, $2::uuid, $3::uuid, generated.object_id, 'production', 'received', now(), $4::uuid, 'matched', 'disabled' FROM generated JOIN objects ON objects.id = generated.object_id RETURNING 1) SELECT count(*)::bigint FROM events",
+    )
+    .bind(&outside.organization)
+    .bind(&outside.project)
+    .bind(&outside.ingest_key)
+    .bind(&outside.release)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(batch_events, 25);
+    let batch_rollup: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'processing_state' AND key = 'received'",
+    )
+    .bind(&outside.organization)
+    .bind(&outside.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(batch_rollup, 25);
+    sqlx::query(
+        "UPDATE crash_events SET received_at = (date_trunc('day', now() AT TIME ZONE 'UTC') + CASE WHEN id = $3::uuid THEN interval '2 hours' ELSE interval '3 hours' END) AT TIME ZONE 'UTC', updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id IN ($3::uuid, $4::uuid)",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.older_event_id)
+    .bind(&owned_issue.event_id)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "UPDATE crash_events SET processing_state = 'failed', state_reason = 'rollup_test_failure', updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .execute(&pool)
+    .await?;
+    let failed: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'symbolication_state' AND key = 'failed'",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(failed, 1);
+    sqlx::query(
+        "UPDATE crash_events SET processing_state = 'processed', state_reason = NULL, updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .execute(&pool)
+    .await?;
+
+    let replacement_result: String = sqlx::query_scalar(
+        "INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, 1, 3, '{}'::jsonb, $4) RETURNING id::text",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .bind(Sha256::digest(b"rollup-replacement-result").to_vec())
+    .fetch_one(&pool)
+    .await?;
+    let replacement_release: String = sqlx::query_scalar(
+        "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration, build_timestamp) VALUES ($1::uuid, $2::uuid, '2.0.0', 'linux', 'arm64', 'Shipping', now()) RETURNING id::text",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .fetch_one(&pool)
+    .await?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "UPDATE crash_event_search SET result_id = $4::uuid, search_text = 'RecoveredActor LinuxModule player comment', crash_type = 'ensure', platform = 'linux', architecture = 'arm64', symbolication_state = 'readable', updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .bind(&replacement_result)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE crash_events SET current_result_id = $4::uuid, release_id = $5::uuid, release_mapping_state = 'matched', processing_state = 'processed', state_reason = NULL, updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .bind(&replacement_result)
+    .bind(&replacement_release)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    sqlx::query(
+        "UPDATE crash_events SET received_at = (date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day' + interval '1 hour') AT TIME ZONE 'UTC', updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .execute(&pool)
+    .await?;
+    for dimension in [
+        "event_total",
+        "release",
+        "platform_architecture",
+        "crash_type",
+        "symbolication_state",
+        "processing_state",
+    ] {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = $3",
+        )
+        .bind(&owned.organization)
+        .bind(&owned.project)
+        .bind(dimension)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(total, 2, "dimension: {dimension}");
+    }
+    for (dimension, key, expected) in [
+        ("release", owned.release.as_str(), 1_i64),
+        ("release", replacement_release.as_str(), 1_i64),
+        ("platform_architecture", "windows/x86_64", 1_i64),
+        ("platform_architecture", "linux/arm64", 1_i64),
+        ("crash_type", "crash", 1_i64),
+        ("crash_type", "ensure", 1_i64),
+        ("symbolication_state", "readable", 2_i64),
+        ("processing_state", "processed", 2_i64),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = $3 AND key = $4",
+        )
+        .bind(&owned.organization)
+        .bind(&owned.project)
+        .bind(dimension)
+        .bind(key)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, expected, "dimension: {dimension}, key: {key}");
+    }
+    let day_counts = sqlx::query(
+        "SELECT COALESCE(sum(count) FILTER (WHERE day = (now() AT TIME ZONE 'UTC')::date), 0)::bigint AS today, COALESCE(sum(count) FILTER (WHERE day = (now() AT TIME ZONE 'UTC')::date - 1), 0)::bigint AS yesterday FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'event_total'",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(day_counts.get::<i64, _>("today"), 1);
+    assert_eq!(day_counts.get::<i64, _>("yesterday"), 1);
+
+    let repair_day: String = sqlx::query_scalar(
+        "SELECT to_char((received_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&owned_issue.event_id)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE project_daily_rollups SET count = count + 9 WHERE organization_id = $1::uuid AND project_id = $2::uuid AND day = $3::date AND dimension = 'event_total'",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&repair_day)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE issues SET search_vector = NULL WHERE organization_id IN ($1::uuid, $2::uuid)",
+    )
+    .bind(&owned.organization)
+    .bind(&outside.organization)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE crash_event_search SET search_vector = NULL WHERE organization_id IN ($1::uuid, $2::uuid)",
+    )
+    .bind(&owned.organization)
+    .bind(&outside.organization)
+    .execute(&pool)
+    .await?;
+    let outside_before: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&outside.organization)
+    .bind(&outside.project)
+    .fetch_one(&pool)
+    .await?;
+    let report = crate::project_rollups::repair_project_rollups(
+        &database_url,
+        &owned.organization,
+        &owned.project,
+        &repair_day,
+        &repair_day,
+    )
+    .await?;
+    let report = serde_json::to_value(report)?;
+    assert_eq!(report["repaired_days"], 1);
+    assert!(
+        report["drifted_rows"]
+            .as_i64()
+            .is_some_and(|value| value >= 1)
+    );
+    assert_eq!(report["issue_vectors_backfilled"], 1);
+    assert_eq!(report["event_vectors_backfilled"], 2);
+    let repaired_total: i64 = sqlx::query_scalar(
+        "SELECT count FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND day = $3::date AND dimension = 'event_total' AND key = 'all'",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&repair_day)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(repaired_total, 1);
+    let vector_state = sqlx::query(
+        "SELECT (SELECT count(*) FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid AND search_vector IS NOT NULL) AS owned_issues, (SELECT count(*) FROM crash_event_search WHERE organization_id = $1::uuid AND project_id = $2::uuid AND search_vector IS NOT NULL) AS owned_events, (SELECT count(*) FROM issues WHERE organization_id = $3::uuid AND project_id = $4::uuid AND search_vector IS NOT NULL) AS outside_issues, (SELECT count(*) FROM crash_event_search WHERE organization_id = $3::uuid AND project_id = $4::uuid AND search_vector IS NOT NULL) AS outside_events",
+    )
+    .bind(&owned.organization)
+    .bind(&owned.project)
+    .bind(&outside.organization)
+    .bind(&outside.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(vector_state.get::<i64, _>("owned_issues"), 1);
+    assert_eq!(vector_state.get::<i64, _>("owned_events"), 2);
+    assert_eq!(vector_state.get::<i64, _>("outside_issues"), 0);
+    assert_eq!(vector_state.get::<i64, _>("outside_events"), 0);
+    let outside_after: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&outside.organization)
+    .bind(&outside.project)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(outside_after, outside_before);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires FAULTLANE_TEST_DATABASE_URL and creates the documented scale fixture"]
+#[allow(clippy::expect_used)]
+#[allow(clippy::too_many_lines)]
+async fn dashboard_and_search_stay_bounded_at_documented_scale() -> Result<(), Box<dyn Error>> {
+    const EVENT_COUNT: i64 = 5_000_000;
+    const SEARCH_COUNT: i64 = 1_000_000;
+    const ISSUE_COUNT: i64 = 20;
+    const INSERT_BATCH: i64 = 250_000;
+
+    let database_url =
+        env::var("FAULTLANE_TEST_DATABASE_URL").expect("FAULTLANE_TEST_DATABASE_URL is required");
+    let _guard = DATABASE_TEST_LOCK.lock().await;
+    assert_isolated_database(&database_url);
+    migrate(&database_url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url)
+        .await?;
+    sqlx::query("TRUNCATE users, organizations CASCADE")
+        .execute(&pool)
+        .await?;
+    let scope = insert_scope(&pool, "local-bootstrap", "dashboard-scale").await?;
+    let issue_ids = sqlx::query_scalar::<_, String>(
+        "INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, regression_state, first_seen_at, last_seen_at, event_count, first_release_id, last_release_id) SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'stack', 1, md5('scale-issue:' || n::text) || md5('scale-fingerprint:' || n::text), 'Scale issue ' || n::text, 'new', date_trunc('day', now() AT TIME ZONE 'UTC') - interval '29 days', now(), $3, $4::uuid, $4::uuid FROM generate_series(1, $5) values(n) RETURNING id::text",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(EVENT_COUNT / ISSUE_COUNT)
+    .bind(&scope.release)
+    .bind(ISSUE_COUNT)
+    .fetch_all(&pool)
+    .await?;
+    let artifact_token: String = sqlx::query_scalar(
+        "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'scale') RETURNING id::text",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(&scope.user)
+    .bind(Sha256::digest(b"dashboard-scale-artifact-token").to_vec())
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 1, 'pdb', 'ScaleMissing.dll', 'x86_64', 'SCALE-MISSING', 'ScaleMissing.pdb', '0.1.0')",
+    )
+    .bind(&scope.release)
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(&scope.user)
+    .bind(&artifact_token)
+    .bind(Sha256::digest(b"dashboard-scale-missing-artifact").to_vec())
+    .execute(&pool)
+    .await?;
+    let mut bulk = pool.acquire().await?;
+    sqlx::query("SET session_replication_role = 'replica'")
+        .execute(&mut *bulk)
+        .await?;
+    sqlx::query("SET synchronous_commit = off")
+        .execute(&mut *bulk)
+        .await?;
+    sqlx::query("SET statement_timeout = '10min'")
+        .execute(&mut *bulk)
+        .await?;
+    sqlx::query("SET wal_compression = on")
+        .execute(&mut *bulk)
+        .await?;
+    sqlx::query("SET maintenance_work_mem = '1GB'")
+        .execute(&mut *bulk)
+        .await?;
+    let fixture_started = Instant::now();
+    let fixture_indexes = sqlx::query(
+        "SELECT format('%I.%I', namespace.nspname, index_class.relname) AS qualified_name, pg_get_indexdef(index_class.oid) AS definition FROM pg_class table_class JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace JOIN pg_index table_index ON table_index.indrelid = table_class.oid JOIN pg_class index_class ON index_class.oid = table_index.indexrelid LEFT JOIN pg_constraint table_constraint ON table_constraint.conindid = index_class.oid WHERE namespace.nspname = 'public' AND table_class.relname = ANY($1::text[]) AND table_constraint.oid IS NULL ORDER BY table_class.relname, index_class.relname",
+    )
+    .bind([
+        "crash_events",
+        "crash_processing_results",
+        "crash_event_search",
+    ])
+    .fetch_all(&mut *bulk)
+    .await?;
+    for index in &fixture_indexes {
+        let qualified_name: String = index.get("qualified_name");
+        sqlx::query(AssertSqlSafe(format!("DROP INDEX {qualified_name}")))
+            .execute(&mut *bulk)
+            .await?;
+    }
+    for table in [
+        "crash_events",
+        "crash_processing_results",
+        "crash_event_search",
+    ] {
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE {table} SET (autovacuum_enabled = false)"
+        )))
+        .execute(&mut *bulk)
+        .await?;
+    }
+    let indexes_suspended = fixture_started.elapsed();
+    let mut offset = 0_i64;
+    while offset < EVENT_COUNT {
+        sqlx::query(
+            "WITH generated AS MATERIALIZED (SELECT n, ('10000000-0000-4000-8000-' || lpad(to_hex(n), 12, '0'))::uuid AS event_id, ('20000000-0000-4000-8000-' || lpad(to_hex(n), 12, '0'))::uuid AS raw_object_id, CASE WHEN n <= $8 THEN ('30000000-0000-4000-8000-' || lpad(to_hex(n), 12, '0'))::uuid END AS result_id, ($5::text[])[(mod(n - 1, array_length($5::text[], 1)) + 1)::integer]::uuid AS issue_id, (date_trunc('day', clock_timestamp() AT TIME ZONE 'UTC') - mod(n - 1, 30) * interval '1 day' + mod(n - 1, 86400) * interval '1 second') AT TIME ZONE 'UTC' AS received_at FROM generate_series($6 + 1, $6 + $7) values(n)), inserted_events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment, processing_state, received_at, release_id, release_mapping_state, grouping_state, fingerprint_algorithm, fingerprint_version, fingerprint, variant_fingerprint, grouping_quality, grouped_at, issue_id, current_result_id) SELECT generated.event_id, $1::uuid, $2::uuid, $3::uuid, generated.raw_object_id, 'production', 'processed', generated.received_at, $4::uuid, 'matched', 'grouped', 'stack', 1, md5('scale-issue:' || generated.issue_id::text) || md5('scale-fingerprint:' || generated.issue_id::text), md5('scale-variant:' || generated.issue_id::text) || md5('scale-member:' || generated.issue_id::text), 100, generated.received_at, generated.issue_id, generated.result_id FROM generated RETURNING id) INSERT INTO crash_processing_results (id, organization_id, project_id, event_id, schema_version, processing_version, result, checksum) SELECT generated.result_id, $1::uuid, $2::uuid, generated.event_id, 1, 99, '{}'::jsonb, decode(md5('scale-result:' || generated.event_id::text) || md5(generated.event_id::text || ':scale-result'), 'hex') FROM generated WHERE generated.result_id IS NOT NULL",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(&scope.ingest_key)
+        .bind(&scope.release)
+        .bind(&issue_ids)
+        .bind(offset)
+        .bind(INSERT_BATCH)
+        .bind(SEARCH_COUNT)
+        .execute(&mut *bulk)
+        .await?;
+        offset += INSERT_BATCH;
+    }
+    let events_loaded = fixture_started.elapsed();
+    eprintln!("scale fixture: events loaded");
+    sqlx::query(
+        "UPDATE issues SET representative_event_id = (SELECT id FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY id LIMIT 1) WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .execute(&mut *bulk)
+    .await?;
+    let representatives_loaded = fixture_started.elapsed();
+    eprintln!("scale fixture: representatives loaded");
+    sqlx::query(
+        "WITH documents AS MATERIALIZED (SELECT id AS result_id, event_id, row_number() OVER (ORDER BY event_id) AS n FROM crash_processing_results WHERE organization_id = $1::uuid AND project_id = $2::uuid AND processing_version = 99) INSERT INTO crash_event_search (organization_id, project_id, event_id, result_id, search_text, search_vector, user_comment, crash_type, platform, architecture, engine_version, symbolication_state) SELECT $1::uuid, $2::uuid, event_id, result_id, text.value, to_tsvector('simple', text.value), 'player report', 'crash', 'windows', 'x86_64', '5.8.1', 'readable' FROM documents CROSS JOIN LATERAL (SELECT CASE WHEN mod(documents.n, 100) = 0 THEN 'CommonActor CrashModule player report' ELSE 'BackgroundActor CrashModule player report' END AS value) text",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .execute(&mut *bulk)
+    .await?;
+    let documents_loaded = fixture_started.elapsed();
+    eprintln!("scale fixture: documents loaded");
+    for index in &fixture_indexes {
+        let definition: String = index.get("definition");
+        sqlx::query(AssertSqlSafe(definition))
+            .execute(&mut *bulk)
+            .await?;
+    }
+    let indexes_built = fixture_started.elapsed();
+    eprintln!("scale fixture: indexes rebuilt");
+    for table in [
+        "crash_events",
+        "crash_processing_results",
+        "crash_event_search",
+    ] {
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE {table} RESET (autovacuum_enabled)"
+        )))
+        .execute(&mut *bulk)
+        .await?;
+    }
+    sqlx::query("ANALYZE crash_events, crash_processing_results, crash_event_search, issues")
+        .execute(&mut *bulk)
+        .await?;
+    let fixture_analyzed = fixture_started.elapsed();
+    sqlx::query("SET session_replication_role = 'origin'")
+        .execute(&mut *bulk)
+        .await?;
+    drop(bulk);
+    let search_loaded = fixture_started.elapsed();
+    eprintln!("scale fixture: bulk connection released");
+    sqlx::query(
+        "INSERT INTO usage_cycle_counters (organization_id, project_id, cycle_start, accepted_events, accepted_raw_bytes) VALUES ($1::uuid, $2::uuid, date_trunc('month', now() AT TIME ZONE 'UTC')::date, $3, $3) ON CONFLICT (organization_id, project_id, cycle_start) DO UPDATE SET accepted_events = EXCLUDED.accepted_events, accepted_raw_bytes = EXCLUDED.accepted_raw_bytes, updated_at = now()",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(EVENT_COUNT)
+    .execute(&pool)
+    .await?;
+    eprintln!("scale fixture: usage counters loaded");
+    sqlx::query(
+        "UPDATE project_storage_counters SET retained_raw_bytes = $3, reconciled_at = now(), updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(EVENT_COUNT)
+    .execute(&pool)
+    .await?;
+    eprintln!("scale fixture: storage counters loaded");
+    let bounds = sqlx::query(
+        "SELECT to_char((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '29 days')::date, 'YYYY-MM-DD') AS first, to_char((date_trunc('day', now() AT TIME ZONE 'UTC'))::date, 'YYYY-MM-DD') AS last",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let first: String = bounds.get("first");
+    let last: String = bounds.get("last");
+    eprintln!("scale fixture: repair bounds loaded");
+    let repair_started = Instant::now();
+    let repair = crate::project_rollups::repair_project_rollups(
+        &database_url,
+        &scope.organization,
+        &scope.project,
+        &first,
+        &last,
+    )
+    .await?;
+    let repair_elapsed = repair_started.elapsed();
+    eprintln!("scale fixture: rollups repaired");
+    let repair = serde_json::to_value(repair)?;
+    assert_eq!(repair["repaired_days"], 30);
+    sqlx::query("ANALYZE project_daily_rollups")
+        .execute(&pool)
+        .await?;
+
+    let app = router(
+        "api",
+        ServerState::dashboard_test(pool.clone(), Arc::new(InMemory::new()), SECRET),
+    );
+    let overview_uri = format!("/api/v1/projects/{}/overview", scope.project);
+    let requests = (0..8)
+        .map(|_| authorized(Request::builder().uri(&overview_uri)).body(Body::empty()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let overview_started = Instant::now();
+    let responses = join_all(
+        requests
+            .into_iter()
+            .map(|request| app.clone().oneshot(request)),
+    )
+    .await;
+    for response in responses {
+        let response = response?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let overview = json_body(response).await?;
+        assert_eq!(overview["totals"]["events"], EVENT_COUNT);
+        assert_eq!(overview["totals"]["issues"], ISSUE_COUNT);
+        assert_eq!(overview["observed_usage"]["accepted_events"], EVENT_COUNT);
+        assert_eq!(overview["observed_usage"]["authoritative"], true);
+        assert_eq!(overview["missing_symbol_count"], 1);
+    }
+    let overview_elapsed = overview_started.elapsed();
+    assert!(overview_elapsed < Duration::from_secs(10));
+
+    let common = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder().uri(format!(
+                "/api/v1/projects/{}/issues?query=commonactor%20crashmodule&limit=100",
+                scope.project
+            )))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(common.status(), StatusCode::OK);
+    assert!(
+        json_body(common).await?["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    let no_match = app
+        .oneshot(
+            authorized(Request::builder().uri(format!(
+                "/api/v1/projects/{}/issues?query=dashboardscalenomatch&limit=100",
+                scope.project
+            )))
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(no_match.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(no_match).await?["items"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let rollup_plan: Value = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT key, max(label), sum(count)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'release' AND day >= $3::date AND day <= $4::date GROUP BY key",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(&first)
+    .bind(&last)
+    .fetch_one(&pool)
+    .await?;
+    let missing_manifest_plan: Value = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT count(*) FROM release_manifest_artifacts manifest JOIN LATERAL (SELECT 1 FROM crash_events event WHERE event.organization_id = manifest.organization_id AND event.project_id = manifest.project_id AND event.release_id = manifest.release_id AND event.current_result_id IS NOT NULL ORDER BY event.received_at DESC, event.id DESC LIMIT 1) referenced ON true WHERE manifest.organization_id = $1::uuid AND manifest.project_id = $2::uuid AND manifest.state IN ('missing', 'mismatch')",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .fetch_one(&pool)
+    .await?;
+    let common_plan = search_plan(&pool, &scope, "commonactor crashmodule").await?;
+    let no_match_plan = search_plan(&pool, &scope, "dashboardscalenomatch").await?;
+    let rollup_metrics = explain_metrics(&rollup_plan).ok_or("rollup explain metrics")?;
+    let missing_manifest_metrics =
+        explain_metrics(&missing_manifest_plan).ok_or("missing manifest explain metrics")?;
+    let common_metrics = explain_metrics(&common_plan).ok_or("common search explain metrics")?;
+    let no_match_metrics = explain_metrics(&no_match_plan).ok_or("no-match explain metrics")?;
+    assert!(rollup_metrics.0 < 2_000.0);
+    assert!(rollup_metrics.1 < 5_000);
+    assert!(missing_manifest_metrics.0 < 2_000.0);
+    assert!(missing_manifest_metrics.1 < 10_000);
+    assert!(common_metrics.0 < 2_000.0);
+    assert!(common_metrics.1 < 250_000);
+    assert!(no_match_metrics.0 < 2_000.0);
+    assert!(no_match_metrics.1 < 10_000);
+    for plan in [&common_plan, &no_match_plan] {
+        let text = serde_json::to_string(plan)?;
+        assert!(text.contains("crash_event_search_vector_gin"));
+    }
+    println!(
+        "events={EVENT_COUNT} search_documents={SEARCH_COUNT} index_suspend_ms={} events_load_ms={} representatives_ms={} documents_load_ms={} index_rebuild_ms={} analyze_ms={} search_load_ms={} repair_ms={} fixture_ms={} overview_requests=8 overview_ms={} rollup_ms={:.3} rollup_blocks={} missing_manifest_ms={:.3} missing_manifest_blocks={} common_search_ms={:.3} common_search_blocks={} no_match_ms={:.3} no_match_blocks={}",
+        indexes_suspended.as_millis(),
+        events_loaded.saturating_sub(indexes_suspended).as_millis(),
+        representatives_loaded
+            .saturating_sub(events_loaded)
+            .as_millis(),
+        documents_loaded
+            .saturating_sub(representatives_loaded)
+            .as_millis(),
+        indexes_built.saturating_sub(documents_loaded).as_millis(),
+        fixture_analyzed.saturating_sub(indexes_built).as_millis(),
+        search_loaded.saturating_sub(events_loaded).as_millis(),
+        repair_elapsed.as_millis(),
+        fixture_started.elapsed().as_millis(),
+        overview_elapsed.as_millis(),
+        rollup_metrics.0,
+        rollup_metrics.1,
+        missing_manifest_metrics.0,
+        missing_manifest_metrics.1,
+        common_metrics.0,
+        common_metrics.1,
+        no_match_metrics.0,
+        no_match_metrics.1,
+    );
+    Ok(())
+}
+
+async fn search_plan(pool: &PgPool, scope: &Scope, query: &str) -> Result<Value, sqlx::Error> {
+    sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT DISTINCT event.issue_id FROM crash_event_search document JOIN crash_events event ON event.organization_id = document.organization_id AND event.project_id = document.project_id AND event.id = document.event_id AND event.current_result_id = document.result_id WHERE document.organization_id = $1::uuid AND document.project_id = $2::uuid AND document.search_vector @@ plainto_tsquery('simple', $3)",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(query)
+    .fetch_one(pool)
+    .await
+}
+
+fn explain_metrics(explain: &Value) -> Option<(f64, i64)> {
+    let root = explain.as_array()?.first()?;
+    let execution_ms = root.get("Execution Time")?.as_f64()?;
+    let plan = root.get("Plan")?;
+    let blocks = plan
+        .get("Shared Hit Blocks")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+        + plan
+            .get("Shared Read Blocks")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+    Some((execution_ms, blocks))
+}
+
 struct Scope {
     user: String,
     organization: String,
@@ -917,6 +1545,23 @@ async fn insert_issue(
     .bind(request_id)
     .bind(&latest.event_id)
     .bind(&latest.result_id)
+    .execute(pool)
+    .await?;
+    let retained_raw_bytes = i64::try_from(latest.raw_bytes.len() + older.raw_bytes.len())?;
+    sqlx::query(
+        "INSERT INTO usage_cycle_counters (organization_id, project_id, cycle_start, accepted_events, accepted_raw_bytes) VALUES ($1::uuid, $2::uuid, date_trunc('month', now() AT TIME ZONE 'UTC')::date, 2, $3) ON CONFLICT (organization_id, project_id, cycle_start) DO UPDATE SET accepted_events = EXCLUDED.accepted_events, accepted_raw_bytes = EXCLUDED.accepted_raw_bytes, updated_at = now()",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(retained_raw_bytes)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE project_storage_counters SET retained_raw_bytes = $3, reconciled_at = now(), updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(&scope.organization)
+    .bind(&scope.project)
+    .bind(retained_raw_bytes)
     .execute(pool)
     .await?;
     Ok(SeededIssue {
