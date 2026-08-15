@@ -637,6 +637,63 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/Unavailable"
+  /api/v1/projects/{project_id}/usage:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectUsage
+      summary: Get authoritative project usage and quota policy
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Current billing-cycle usage and policy
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectUsage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      operationId: updateProjectUsage
+      summary: Update owner-controlled usage and retention settings
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectUsage"
+      responses:
+        "200":
+          description: Current billing-cycle usage and updated policy
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectUsage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/projects/{project_id}/issues:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -2172,6 +2229,211 @@ components:
             - string
             - "null"
           format: uuid
+    UpdateProjectUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - spend_cap_cents
+        - retain_all_raw
+        - normalized_retention_days
+        - raw_retention_days
+      properties:
+        spend_cap_cents:
+          type:
+            - integer
+            - "null"
+          minimum: 1500
+          maximum: 10000000
+        retain_all_raw:
+          type: boolean
+        normalized_retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        raw_retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+    UsagePolicyOutcome:
+      type: string
+      enum:
+        - standard
+        - courtesy
+        - overage
+        - sampling
+    UsageThreshold:
+      type:
+        - string
+        - "null"
+      enum:
+        - "70"
+        - "90"
+        - "100"
+        - courtesy_exhausted
+        - null
+    UsageAdmission:
+      type: object
+      additionalProperties: false
+      required:
+        - cycle_start
+        - policy_version
+        - outcome
+        - threshold
+        - accepted_events
+        - event_limit
+        - courtesy_limit
+        - usage_counted
+        - estimated
+      properties:
+        cycle_start:
+          type: string
+          format: date
+        policy_version:
+          type: integer
+          minimum: 1
+        outcome:
+          $ref: "#/components/schemas/UsagePolicyOutcome"
+        threshold:
+          $ref: "#/components/schemas/UsageThreshold"
+        accepted_events:
+          type: integer
+          minimum: 1
+        event_limit:
+          type: integer
+          minimum: 1
+        courtesy_limit:
+          type: integer
+          minimum: 1
+        usage_counted:
+          type: boolean
+        estimated:
+          type: boolean
+    ProjectUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - authoritative
+        - enforcement_enabled
+        - policy_version
+        - policy_state
+        - threshold
+        - cycle_start
+        - cycle_end
+        - accepted_events
+        - event_limit
+        - courtesy_limit
+        - accepted_raw_bytes
+        - accepted_symbol_bytes
+        - deleted_raw_bytes
+        - sampled_raw_events
+        - estimated_represented_events
+        - estimates_present
+        - retained_raw_bytes
+        - symbol_storage_bytes
+        - artifact_storage_bytes
+        - artifact_storage_limit_bytes
+        - organization_projects
+        - project_limit
+        - normalized_retention_days
+        - normalized_retention_limit_days
+        - raw_retention_days
+        - raw_retention_limit_days
+        - courtesy_percent
+        - paid_overages_enabled
+        - spend_cap_cents
+        - retain_all_raw
+        - can_edit
+      properties:
+        authoritative:
+          type: boolean
+          const: true
+        enforcement_enabled:
+          type: boolean
+        policy_version:
+          type: integer
+          minimum: 1
+        policy_state:
+          $ref: "#/components/schemas/UsagePolicyOutcome"
+        threshold:
+          $ref: "#/components/schemas/UsageThreshold"
+        cycle_start:
+          type: string
+          format: date
+        cycle_end:
+          type: string
+          format: date
+        accepted_events:
+          type: integer
+          minimum: 0
+        event_limit:
+          type: integer
+          minimum: 1
+        courtesy_limit:
+          type: integer
+          minimum: 1
+        accepted_raw_bytes:
+          type: integer
+          minimum: 0
+        accepted_symbol_bytes:
+          type: integer
+          minimum: 0
+        deleted_raw_bytes:
+          type: integer
+          minimum: 0
+        sampled_raw_events:
+          type: integer
+          minimum: 0
+        estimated_represented_events:
+          type: integer
+          minimum: 0
+        estimates_present:
+          type: boolean
+        retained_raw_bytes:
+          type: integer
+          minimum: 0
+        symbol_storage_bytes:
+          type: integer
+          minimum: 0
+        artifact_storage_bytes:
+          type: integer
+          minimum: 0
+        artifact_storage_limit_bytes:
+          type: integer
+          minimum: 1
+        organization_projects:
+          type: integer
+          minimum: 1
+        project_limit:
+          type: integer
+          minimum: 1
+        normalized_retention_days:
+          type: integer
+          minimum: 1
+        normalized_retention_limit_days:
+          type: integer
+          minimum: 1
+        raw_retention_days:
+          type: integer
+          minimum: 1
+        raw_retention_limit_days:
+          type: integer
+          minimum: 1
+        courtesy_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        paid_overages_enabled:
+          type: boolean
+        spend_cap_cents:
+          type:
+            - integer
+            - "null"
+          minimum: 1500
+          maximum: 10000000
+        retain_all_raw:
+          type: boolean
+        can_edit:
+          type: boolean
     SecretIngestKey:
       type: object
       additionalProperties: false
@@ -2235,6 +2497,7 @@ components:
         - deduplicated
         - received_at
         - status_path
+        - usage
       properties:
         event_id:
           type: string
@@ -2248,6 +2511,8 @@ components:
           format: date-time
         status_path:
           type: string
+        usage:
+          $ref: "#/components/schemas/UsageAdmission"
     ProcessingState:
       type: string
       enum:
@@ -2556,6 +2821,14 @@ components:
         - release_id
         - candidate_release_ids
         - candidate_release_ids_truncated
+        - usage_cycle_start
+        - usage_policy_version
+        - usage_outcome
+        - usage_counted
+        - usage_estimated
+        - usage_accepted_events
+        - raw_retention_class
+        - raw_sampling_rate
         - received_at
         - updated_at
       properties:
@@ -2630,6 +2903,38 @@ components:
             format: uuid
         candidate_release_ids_truncated:
           type: boolean
+        usage_cycle_start:
+          type: string
+          format: date
+        usage_policy_version:
+          type: integer
+          minimum: 1
+        usage_outcome:
+          $ref: "#/components/schemas/UsagePolicyOutcome"
+        usage_counted:
+          type: boolean
+        usage_estimated:
+          type: boolean
+        usage_accepted_events:
+          type: integer
+          minimum: 0
+        raw_retention_class:
+          type: string
+          enum:
+            - pending
+            - standard
+            - novel
+            - representative
+            - recent
+            - variant
+            - reservoir
+            - deleting
+            - discarded
+            - expired
+        raw_sampling_rate:
+          type: integer
+          minimum: 1
+          maximum: 10000
         received_at:
           type: string
           format: date-time

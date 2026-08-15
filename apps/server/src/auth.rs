@@ -265,7 +265,7 @@ impl Role {
             Permission::ManageProject | Permission::ManageMembers | Permission::ReadAudit => {
                 matches!(self, Self::Owner | Self::Admin)
             }
-            Permission::ManageDataRules => matches!(self, Self::Owner),
+            Permission::ManageDataRules | Permission::ManageUsage => matches!(self, Self::Owner),
         }
     }
 }
@@ -276,6 +276,7 @@ pub(crate) enum Permission {
     ManageIssue,
     ManageProject,
     ManageDataRules,
+    ManageUsage,
     ManageMembers,
     ReadRaw,
     ReadAudit,
@@ -1926,6 +1927,8 @@ mod tests {
         assert!(!Role::Viewer.allows(Permission::ReadRaw));
         assert!(Role::Owner.allows(Permission::ManageDataRules));
         assert!(!Role::Admin.allows(Permission::ManageDataRules));
+        assert!(Role::Owner.allows(Permission::ManageUsage));
+        assert!(!Role::Admin.allows(Permission::ManageUsage));
         assert!(!Role::Developer.allows(Permission::ManageMembers));
         assert!(!Role::Viewer.allows(Permission::ReadAudit));
     }

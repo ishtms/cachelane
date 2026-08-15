@@ -541,22 +541,32 @@ impl ArtifactObjects {
     }
 
     pub(crate) async fn delete_object(&self, key: &str) {
+        let _ = self.delete_object_checked(key).await;
+    }
+
+    pub(crate) async fn delete_object_checked(&self, key: &str) -> Result<(), ObjectError> {
         #[cfg(test)]
         if let Self::Memory(objects) = self {
-            if let Ok(mut objects) = objects.lock() {
-                objects.objects.remove(key);
-            }
-            return;
+            objects
+                .lock()
+                .map_err(|_| ObjectError::Unavailable)?
+                .objects
+                .remove(key);
+            return Ok(());
         }
         let Self::S3 { client, bucket } = self else {
-            return;
+            return Err(ObjectError::Unavailable);
         };
         let request = client
             .delete_object()
             .bucket(bucket.as_ref())
             .key(key)
             .send();
-        let _ = tokio::time::timeout(Duration::from_secs(STORAGE_SECONDS), request).await;
+        tokio::time::timeout(Duration::from_secs(STORAGE_SECONDS), request)
+            .await
+            .map_err(|_| ObjectError::Unavailable)?
+            .map_err(|_| ObjectError::Unavailable)?;
+        Ok(())
     }
 
     pub(crate) async fn put_from_path(

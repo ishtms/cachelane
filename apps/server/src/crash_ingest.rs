@@ -52,6 +52,7 @@ pub(crate) struct CrashIngest {
     trusted_proxies: Arc<Vec<IpNet>>,
     project_limit: u32,
     ip_limit: u32,
+    usage_enforcement_enabled: bool,
     enabled: bool,
 }
 
@@ -95,6 +96,7 @@ impl CrashIngest {
             trusted_proxies: Arc::new(trusted_proxies),
             project_limit,
             ip_limit,
+            usage_enforcement_enabled: crate::usage::enforcement_enabled(),
             enabled: true,
         })
     }
@@ -108,6 +110,7 @@ impl CrashIngest {
             trusted_proxies: Arc::new(Vec::new()),
             project_limit: DEFAULT_PROJECT_LIMIT,
             ip_limit: DEFAULT_IP_LIMIT,
+            usage_enforcement_enabled: false,
             enabled: false,
         }
     }
@@ -146,6 +149,7 @@ impl CrashIngest {
             trusted_proxies: Arc::new(Vec::new()),
             project_limit: DEFAULT_PROJECT_LIMIT,
             ip_limit: DEFAULT_IP_LIMIT,
+            usage_enforcement_enabled: true,
             enabled: true,
         }
     }
@@ -284,9 +288,11 @@ struct AcceptedCrash {
     deduplicated: bool,
     received_at: String,
     status_path: String,
+    usage: crate::usage::Admission,
 }
 
 #[derive(Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct EventState {
     event_id: String,
     project_id: String,
@@ -308,6 +314,14 @@ struct EventState {
     release_id: Option<String>,
     candidate_release_ids: Vec<String>,
     candidate_release_ids_truncated: bool,
+    usage_cycle_start: String,
+    usage_policy_version: i64,
+    usage_outcome: String,
+    usage_counted: bool,
+    usage_estimated: bool,
+    usage_accepted_events: i64,
+    raw_retention_class: String,
+    raw_sampling_rate: i32,
     received_at: String,
     updated_at: String,
 }
@@ -493,7 +507,7 @@ pub(crate) async fn get_event_state(
     })?;
     let pool = state.crash_ingest().pool()?;
     let row = sqlx::query(
-        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.id::text = $3",
+        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.usage_cycle_start, 'YYYY-MM-DD') AS usage_cycle_start, e.usage_policy_version, e.usage_outcome, e.usage_counted, e.usage_estimated, e.usage_accepted_events, e.raw_retention_class, e.raw_sampling_rate, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.id::text = $3",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -528,6 +542,14 @@ pub(crate) async fn get_event_state(
         release_id: row.get("release_id"),
         candidate_release_ids,
         candidate_release_ids_truncated,
+        usage_cycle_start: row.get("usage_cycle_start"),
+        usage_policy_version: row.get("usage_policy_version"),
+        usage_outcome: row.get("usage_outcome"),
+        usage_counted: row.get("usage_counted"),
+        usage_estimated: row.get("usage_estimated"),
+        usage_accepted_events: row.get("usage_accepted_events"),
+        raw_retention_class: row.get("raw_retention_class"),
+        raw_sampling_rate: row.get("raw_sampling_rate"),
         received_at: row.get("received_at"),
         updated_at: row.get("updated_at"),
     };
@@ -728,6 +750,7 @@ async fn reconcile_orphans(ingest: &CrashIngest) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_event(
     ingest: &CrashIngest,
     scope: &KeyScope,
@@ -749,18 +772,36 @@ async fn persist_event(
         .await
         .map_err(|_| IngestError::Unavailable)?
     {
+        let event_id: String = row.get("event_id");
+        let usage = crate::usage::admission_for_event(
+            &mut transaction,
+            &scope.organization_id,
+            &scope.project_id,
+            &event_id,
+            false,
+        )
+        .await
+        .map_err(map_usage_error)?;
         transaction
             .rollback()
             .await
             .map_err(|_| IngestError::Unavailable)?;
         return Ok(accepted_response(
-            row.get("event_id"),
+            event_id,
             processing_state(&row.get::<String, _>("processing_state"))?,
             row.get("received_at"),
             true,
             &scope.project_id,
+            usage,
         ));
     }
+    crate::usage::ensure_policy_snapshot(
+        &mut transaction,
+        &scope.organization_id,
+        &scope.project_id,
+    )
+    .await
+    .map_err(map_usage_error)?;
     sqlx::query(
         "INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 'application/octet-stream')",
     )
@@ -799,14 +840,41 @@ async fn persist_event(
         .fetch_one(pool)
         .await
         .map_err(|_| IngestError::Unavailable)?;
+        let mut usage_transaction = pool.begin().await.map_err(|_| IngestError::Unavailable)?;
+        let existing_event_id: String = existing.get("event_id");
+        let usage = crate::usage::admission_for_event(
+            &mut usage_transaction,
+            &scope.organization_id,
+            &scope.project_id,
+            &existing_event_id,
+            false,
+        )
+        .await
+        .map_err(map_usage_error)?;
+        usage_transaction
+            .commit()
+            .await
+            .map_err(|_| IngestError::Unavailable)?;
         return Ok(accepted_response(
-            existing.get("event_id"),
+            existing_event_id,
             processing_state(&existing.get::<String, _>("processing_state"))?,
             existing.get("received_at"),
             true,
             &scope.project_id,
+            usage,
         ));
     };
+    let usage = crate::usage::record_acceptance(
+        &mut transaction,
+        &scope.organization_id,
+        &scope.project_id,
+        event_id,
+        object_id,
+        i64::try_from(stored.byte_size).map_err(|_| IngestError::RequestTooLarge)?,
+        ingest.usage_enforcement_enabled,
+    )
+    .await
+    .map_err(map_usage_error)?;
     sqlx::query(
         "INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, idempotency_key) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'process_crash', jsonb_build_object('event_id', $4::text), $5)",
     )
@@ -833,6 +901,7 @@ async fn persist_event(
         row.get("received_at"),
         false,
         &scope.project_id,
+        usage,
     ))
 }
 
@@ -1011,6 +1080,7 @@ fn accepted_response(
     received_at: String,
     deduplicated: bool,
     project_id: &str,
+    usage: crate::usage::Admission,
 ) -> AcceptedCrash {
     AcceptedCrash {
         status_path: format!("/api/v1/projects/{project_id}/events/{event_id}"),
@@ -1018,6 +1088,14 @@ fn accepted_response(
         state,
         deduplicated,
         received_at,
+        usage,
+    }
+}
+
+fn map_usage_error(error: crate::usage::UsageError) -> IngestError {
+    match error {
+        crate::usage::UsageError::Internal => IngestError::Internal,
+        _ => IngestError::Unavailable,
     }
 }
 
@@ -1159,6 +1237,7 @@ impl fmt::Debug for CrashIngest {
             .field("trusted_proxies", &self.trusted_proxies)
             .field("project_limit", &self.project_limit)
             .field("ip_limit", &self.ip_limit)
+            .field("usage_enforcement_enabled", &self.usage_enforcement_enabled)
             .finish_non_exhaustive()
     }
 }
@@ -1319,6 +1398,11 @@ mod tests {
         let first = json_body(first).await?;
         assert_eq!(first["deduplicated"], false);
         assert_eq!(first["state"], "stored");
+        assert_eq!(first["usage"]["outcome"], "standard");
+        assert_eq!(first["usage"]["threshold"], "100");
+        assert_eq!(first["usage"]["accepted_events"], 1);
+        assert_eq!(first["usage"]["usage_counted"], true);
+        assert_eq!(first["usage"]["estimated"], false);
         let event_id = first["event_id"]
             .as_str()
             .ok_or("event id must exist")?
@@ -1329,6 +1413,8 @@ mod tests {
         let second = json_body(second).await?;
         assert_eq!(second["deduplicated"], true);
         assert_eq!(second["event_id"], event_id);
+        assert_eq!(second["usage"]["accepted_events"], 1);
+        assert_eq!(second["usage"]["usage_counted"], false);
         assert_eq!(count(&pool, "crash_events").await?, 1);
         assert_eq!(count(&pool, "crash_event_objects").await?, 1);
         assert_eq!(count(&pool, "jobs").await?, 1);
@@ -1367,10 +1453,20 @@ mod tests {
         let right = json_body(right?).await?;
         assert_eq!(left["event_id"], right["event_id"]);
         assert_ne!(left["deduplicated"], right["deduplicated"]);
+        assert_eq!(left["usage"]["outcome"], "courtesy");
+        assert_eq!(right["usage"]["outcome"], "courtesy");
+        assert_eq!(left["usage"]["accepted_events"], 2);
+        assert_eq!(right["usage"]["accepted_events"], 2);
+        assert_ne!(
+            left["usage"]["usage_counted"],
+            right["usage"]["usage_counted"]
+        );
         assert_eq!(count(&pool, "crash_events").await?, 2);
         assert_eq!(count(&pool, "crash_event_objects").await?, 2);
         assert_eq!(count(&pool, "jobs").await?, 2);
         assert_eq!(objects.list(None).try_collect::<Vec<_>>().await?.len(), 2);
+        assert_eq!(current_accepted_events(&pool, &project_id).await?, 2);
+        assert_eq!(count(&pool, "usage_ledger").await?, 4);
 
         let state_response = router("api", state.clone())
             .oneshot(
@@ -1385,6 +1481,10 @@ mod tests {
         assert_eq!(state_body["event_id"], event_id);
         assert_eq!(state_body["project_id"], project_id);
         assert_eq!(state_body["state"], "stored");
+        assert_eq!(state_body["usage_policy_version"], 1);
+        assert_eq!(state_body["usage_outcome"], "standard");
+        assert_eq!(state_body["usage_accepted_events"], 1);
+        assert_eq!(state_body["raw_retention_class"], "standard");
         assert!(!state_body.to_string().contains("object_key"));
 
         for processing_state in [
@@ -1450,6 +1550,10 @@ mod tests {
         .await?;
         assert_eq!(fallback.status(), StatusCode::ACCEPTED);
         let fallback = json_body(fallback).await?;
+        assert_eq!(fallback["usage"]["outcome"], "sampling");
+        assert_eq!(fallback["usage"]["threshold"], "courtesy_exhausted");
+        assert_eq!(fallback["usage"]["accepted_events"], 3);
+        assert_eq!(fallback["usage"]["estimated"], true);
         let fallback_id = fallback["event_id"]
             .as_str()
             .ok_or("fallback event id must exist")?;
@@ -1545,7 +1649,49 @@ mod tests {
         assert_eq!(count(&pool, "crash_event_objects").await?, 3);
         assert_eq!(count(&pool, "jobs").await?, 3);
         assert_eq!(count(&pool, "ingest_orphan_objects").await?, 0);
+        assert_eq!(current_accepted_events(&pool, &project_id).await?, 3);
+        assert_eq!(count(&pool, "usage_ledger").await?, 6);
         assert_eq!(objects.list(None).try_collect::<Vec<_>>().await?.len(), 3);
+
+        let organization_id: String =
+            sqlx::query_scalar("SELECT organization_id::text FROM projects WHERE id = $1::uuid")
+                .bind(&project_id)
+                .fetch_one(&pool)
+                .await?;
+        let direct_project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Direct Windows Game', 'direct-windows-game') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await?;
+        let direct_policy_versions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM project_usage_policy_versions WHERE project_id = $1::uuid",
+        )
+        .bind(&direct_project_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(direct_policy_versions, 1);
+        let direct_key = format!("clpk_{}", "2".repeat(64));
+        sqlx::query(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix, environment, allowed_cidrs) VALUES ($1::uuid, $2::uuid, $3, '22222222', 'playtest', ARRAY['127.0.0.0/8'])",
+        )
+        .bind(&organization_id)
+        .bind(&direct_project_id)
+        .bind(Sha256::digest(direct_key.as_bytes()).to_vec())
+        .execute(&pool)
+        .await?;
+        let direct_objects = Arc::new(InMemory::new());
+        let direct_spool = test_spool_directory()?;
+        let direct_ingest = CrashIngest::test(pool.clone(), direct_objects, direct_spool.clone());
+        let direct_state = ServerState::ingest_test(pool.clone(), direct_ingest, SECRET);
+        let direct_response = submit(
+            &direct_state,
+            &direct_key,
+            crash_request("UECC-Windows-Direct", b"<FGenericCrashContext />")?,
+        )
+        .await?;
+        assert_eq!(direct_response.status(), StatusCode::ACCEPTED);
+        std::fs::remove_dir(&direct_spool)?;
 
         let blocked_spool = test_spool_directory()?;
         let unavailable = CrashIngest::test(pool.clone(), objects.clone(), blocked_spool.clone());
@@ -1559,7 +1705,7 @@ mod tests {
         )
         .await?;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(count(&pool, "crash_events").await?, 3);
+        assert_eq!(count(&pool, "crash_events").await?, 4);
         assert_eq!(count(&pool, "ingest_orphan_objects").await?, 0);
         std::fs::remove_file(&blocked_spool)?;
 
@@ -1599,6 +1745,22 @@ mod tests {
         )
         .bind(&organization_id)
         .fetch_one(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE project_usage_policies SET updated_by_user_id = $3::uuid, event_limit = 1, courtesy_percent = 100, updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&owner_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE project_usage_policy_versions SET event_limit = 1, courtesy_percent = 100, updated_by_user_id = $3::uuid, created_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND version = 1",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&owner_id)
+        .execute(pool)
         .await?;
         let key = format!("clpk_{}", "1".repeat(64));
         sqlx::query(
@@ -1660,9 +1822,22 @@ mod tests {
             "crash_event_objects" => "SELECT count(*) FROM crash_event_objects",
             "jobs" => "SELECT count(*) FROM jobs",
             "ingest_orphan_objects" => "SELECT count(*) FROM ingest_orphan_objects",
+            "usage_ledger" => "SELECT count(*) FROM usage_ledger",
             _ => return Err("unsupported test table".into()),
         };
         Ok(sqlx::query_scalar(query).fetch_one(pool).await?)
+    }
+
+    async fn current_accepted_events(
+        pool: &PgPool,
+        project_id: &str,
+    ) -> Result<i64, Box<dyn Error>> {
+        Ok(sqlx::query_scalar(
+            "SELECT accepted_events FROM usage_cycle_counters WHERE project_id::text = $1 AND cycle_start = date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?)
     }
 
     fn test_spool_directory() -> Result<PathBuf, Box<dyn Error>> {

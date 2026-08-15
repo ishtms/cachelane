@@ -8,9 +8,11 @@ import {
   type IssueList,
   type ProjectDataRules,
   type ProjectOverview,
+  type ProjectUsage,
   faultlaneApi,
 } from "../../../lib/faultlane";
 import { DataRulesForm } from "./data-rules-form";
+import { UsageForm } from "./usage-form";
 
 export const metadata: Metadata = {
   title: "Project overview | FaultLane",
@@ -170,8 +172,9 @@ export default async function ProjectPage({
   let issues: IssueList;
   let setup: ExistingSetup;
   let dataRules: ProjectDataRules;
+  let usage: ProjectUsage;
   try {
-    [overview, issues, setup, dataRules] = await Promise.all([
+    [overview, issues, setup, dataRules, usage] = await Promise.all([
       faultlaneApi<ProjectOverview>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/overview`,
       ),
@@ -183,6 +186,9 @@ export default async function ProjectPage({
       ),
       faultlaneApi<ProjectDataRules>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/data-rules`,
+      ),
+      faultlaneApi<ProjectUsage>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/usage`,
       ),
     ]);
   } catch (error) {
@@ -530,37 +536,104 @@ export default async function ProjectPage({
       <section className="dashboard-panel usage-panel">
         <div className="panel-heading">
           <div>
-            <p className="setup-kicker">Observed, not billable</p>
-            <h2>Current month usage</h2>
+            <p className="setup-kicker">Authoritative billing cycle</p>
+            <h2>Usage and quota policy</h2>
           </div>
-          <span>Since {overview.observed_usage.cycle_start.slice(0, 10)}</span>
+          <span>
+            {usage.cycle_start} to {usage.cycle_end}
+          </span>
         </div>
         <dl className="usage-grid">
           <div>
             <dt>Accepted events</dt>
-            <dd>{formatNumber(overview.observed_usage.accepted_events)}</dd>
-          </div>
-          <div>
-            <dt>Retained crash bytes</dt>
-            <dd>{formatBytes(overview.observed_usage.retained_raw_bytes)}</dd>
-          </div>
-          <div>
-            <dt>Project symbol bytes</dt>
             <dd>
-              {formatBytes(overview.observed_usage.project_artifact_bytes)}
+              {formatNumber(usage.accepted_events)} /{" "}
+              {formatNumber(usage.event_limit)}
+            </dd>
+          </div>
+          <div>
+            <dt>Policy state</dt>
+            <dd>{usage.policy_state}</dd>
+          </div>
+          <div>
+            <dt>Quota enforcement</dt>
+            <dd>{usage.enforcement_enabled ? "active" : "paused"}</dd>
+          </div>
+          <div>
+            <dt>Retained raw storage</dt>
+            <dd>{formatBytes(usage.retained_raw_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Symbol storage</dt>
+            <dd>{formatBytes(usage.symbol_storage_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Total artifact storage</dt>
+            <dd>
+              {formatBytes(usage.artifact_storage_bytes)} /{" "}
+              {formatBytes(usage.artifact_storage_limit_bytes)}
             </dd>
           </div>
           <div>
             <dt>Organization projects</dt>
             <dd>
-              {formatNumber(overview.observed_usage.organization_projects)}
+              {formatNumber(usage.organization_projects)} /{" "}
+              {formatNumber(usage.project_limit)}
             </dd>
+          </div>
+          <div>
+            <dt>Accepted raw data</dt>
+            <dd>{formatBytes(usage.accepted_raw_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Accepted symbol data</dt>
+            <dd>{formatBytes(usage.accepted_symbol_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Raw data deleted</dt>
+            <dd>{formatBytes(usage.deleted_raw_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Sampled repeated events</dt>
+            <dd>{formatNumber(usage.sampled_raw_events)}</dd>
+          </div>
+          <div>
+            <dt>Estimated represented events</dt>
+            <dd>
+              {formatNumber(usage.estimated_represented_events)} estimated
+            </dd>
+          </div>
+          <div>
+            <dt>Normalized retention</dt>
+            <dd>
+              {usage.normalized_retention_days} /{" "}
+              {usage.normalized_retention_limit_days} days
+            </dd>
+          </div>
+          <div>
+            <dt>Raw retention</dt>
+            <dd>
+              {usage.raw_retention_days} / {usage.raw_retention_limit_days} days
+            </dd>
+          </div>
+          <div>
+            <dt>Retain all raw</dt>
+            <dd>{usage.retain_all_raw ? "enabled" : "disabled"}</dd>
           </div>
         </dl>
         <p className="fine-print">
-          This snapshot is operational evidence only. Billing and quota meters
-          are implemented separately.
+          {usage.threshold
+            ? `Usage has reached the ${usage.threshold.replace("courtesy_exhausted", "courtesy buffer exhaustion")} threshold. `
+            : "No usage threshold is active. "}
+          Paid overages are{" "}
+          {usage.paid_overages_enabled
+            ? `limited to ${formatNumber(usage.spend_cap_cents ?? 0)} cents for this policy.`
+            : "disabled."}
+          {usage.estimates_present
+            ? " Sampling totals are estimates and are labeled above."
+            : " All current totals are exact."}
         </p>
+        <UsageForm projectId={projectId} usage={usage} />
       </section>
     </main>
   );
