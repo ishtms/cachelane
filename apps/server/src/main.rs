@@ -13,6 +13,7 @@ mod processor_runner;
 mod project_setup;
 mod reprocessing;
 mod symbol_upload;
+mod usage;
 mod worker;
 
 use project_setup::{ServerState, migrate, router};
@@ -52,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wait_for_shutdown("worker").await?;
             }
         }
-        Command::Scheduler => wait_for_shutdown("scheduler").await?,
+        Command::Scheduler => usage::run_scheduler().await?,
         Command::Migrate => migrate(&required_env("DATABASE_URL")?).await?,
     }
 

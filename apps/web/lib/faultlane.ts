@@ -118,6 +118,40 @@ export type ProjectDataRules = {
   reprocessing_request_id: string | null;
 };
 
+export type ProjectUsage = {
+  authoritative: true;
+  enforcement_enabled: boolean;
+  policy_version: number;
+  policy_state: "standard" | "courtesy" | "overage" | "sampling";
+  threshold: "70" | "90" | "100" | "courtesy_exhausted" | null;
+  cycle_start: string;
+  cycle_end: string;
+  accepted_events: number;
+  event_limit: number;
+  courtesy_limit: number;
+  accepted_raw_bytes: number;
+  accepted_symbol_bytes: number;
+  deleted_raw_bytes: number;
+  sampled_raw_events: number;
+  estimated_represented_events: number;
+  estimates_present: boolean;
+  retained_raw_bytes: number;
+  symbol_storage_bytes: number;
+  artifact_storage_bytes: number;
+  artifact_storage_limit_bytes: number;
+  organization_projects: number;
+  project_limit: number;
+  normalized_retention_days: number;
+  normalized_retention_limit_days: number;
+  raw_retention_days: number;
+  raw_retention_limit_days: number;
+  courtesy_percent: number;
+  paid_overages_enabled: boolean;
+  spend_cap_cents: number | null;
+  retain_all_raw: boolean;
+  can_edit: boolean;
+};
+
 export type Distribution = {
   key: string;
   label: string;

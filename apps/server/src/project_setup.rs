@@ -420,6 +420,12 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
                     .layer(DefaultBodyLimit::max(16 * 1024)),
             )
             .route(
+                "/api/v1/projects/{project_id}/usage",
+                get(crate::usage::get_usage)
+                    .put(crate::usage::update_usage)
+                    .layer(DefaultBodyLimit::max(8 * 1024)),
+            )
+            .route(
                 "/api/v1/projects/{project_id}/issues/{issue_id}/events",
                 get(crate::dashboard::list_issue_events),
             )

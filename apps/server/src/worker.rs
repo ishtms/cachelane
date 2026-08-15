@@ -340,6 +340,7 @@ impl Worker {
                 "index_artifact" => self.index_artifact(&job).await,
                 "generate_symcache" => self.generate_symcache(&job).await,
                 "process_crash" => self.process_crash(&job).await,
+                "delete_raw" => self.delete_raw(&job).await,
                 _ => Err(JobError::Deterministic("unknown_job_type")),
             }
         };
@@ -647,6 +648,109 @@ impl Worker {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn delete_raw(&self, job: &Job) -> Result<(), JobError> {
+        let event_id = job
+            .event_id
+            .as_deref()
+            .ok_or(JobError::Deterministic("missing_event"))?;
+        let raw = sqlx::query(
+            "SELECT o.id::text AS object_id, o.object_key, o.byte_size, o.lifecycle_state, e.raw_retention_class FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
+        )
+        .bind(event_id)
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?
+        .ok_or(JobError::Deterministic("raw_object_missing"))?;
+        if raw.get::<String, _>("lifecycle_state") == "deleting"
+            && raw.get::<String, _>("raw_retention_class") != "expired"
+            && !crate::usage::enforcement_enabled()
+        {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| JobError::Transient("database_unavailable"))?;
+            lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
+            let restored = sqlx::query(
+                "UPDATE crash_event_objects o SET lifecycle_state = 'stored' FROM crash_events e WHERE o.id::text = $1 AND o.organization_id::text = $2 AND o.project_id::text = $3 AND o.lifecycle_state = 'deleting' AND e.raw_object_id = o.id AND e.organization_id = o.organization_id AND e.project_id = o.project_id AND e.raw_retention_class = 'deleting'",
+            )
+            .bind(raw.get::<String, _>("object_id"))
+            .bind(&job.organization_id)
+            .bind(&job.project_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+            if restored.rows_affected() == 1 {
+                sqlx::query(
+                    "UPDATE crash_events SET raw_retention_class = 'standard' WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND raw_retention_class = 'deleting'",
+                )
+                .bind(event_id)
+                .bind(&job.organization_id)
+                .bind(&job.project_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| JobError::Transient("database_unavailable"))?;
+                complete_job(&mut transaction, job, self.instance_id.as_ref(), None).await?;
+                return transaction
+                    .commit()
+                    .await
+                    .map_err(|_| JobError::Transient("database_unavailable"));
+            }
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| JobError::Transient("database_unavailable"))?;
+        }
+        if raw.get::<String, _>("lifecycle_state") == "deleting" {
+            match self
+                .objects
+                .delete_object_checked(&raw.get::<String, _>("object_key"))
+                .await
+            {
+                Ok(()) | Err(ObjectError::Missing) => {}
+                Err(ObjectError::Unavailable | ObjectError::Invalid) => {
+                    return Err(JobError::Transient("object_store_unavailable"));
+                }
+            }
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))?;
+        lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
+        let current = sqlx::query(
+            "SELECT o.id::text AS object_id, o.byte_size, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3 FOR UPDATE OF e, o",
+        )
+        .bind(event_id)
+        .bind(&job.organization_id)
+        .bind(&job.project_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| JobError::Transient("database_unavailable"))?
+        .ok_or(JobError::Deterministic("raw_object_missing"))?;
+        if current.get::<String, _>("lifecycle_state") == "deleting" {
+            crate::usage::record_raw_deleted(
+                &mut transaction,
+                &job.organization_id,
+                &job.project_id,
+                event_id,
+                &current.get::<String, _>("object_id"),
+                current.get("byte_size"),
+            )
+            .await
+            .map_err(map_usage_error)?;
+        }
+        complete_job(&mut transaction, job, self.instance_id.as_ref(), None).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| JobError::Transient("database_unavailable"))
+    }
+
     async fn resolve_release(
         &self,
         job: &Job,
@@ -943,6 +1047,15 @@ impl Worker {
         if session.rows_affected() != 1 {
             return Err(JobError::LostLease);
         }
+        crate::usage::record_symbol_stored(
+            &mut transaction,
+            &job.organization_id,
+            &job.project_id,
+            &object_id,
+            artifact.byte_size,
+        )
+        .await
+        .map_err(map_usage_error)?;
         crate::reprocessing::enqueue_artifact_request(
             &mut transaction,
             &job.organization_id,
@@ -1238,6 +1351,14 @@ impl Worker {
         .map_err(|_| JobError::Transient("database_unavailable"))?
         .ok_or(JobError::LostLease)?;
         let requested_generation: i64 = updated.get("requested_reprocessing_generation");
+        crate::usage::schedule_raw_retention(
+            &mut transaction,
+            &job.organization_id,
+            &job.project_id,
+            event_id,
+        )
+        .await
+        .map_err(map_usage_error)?;
         complete_reprocessing_request_events(&mut transaction, job, event_id, &stored_id).await?;
         if requested_generation > job.target_generation {
             requeue_job_for_new_generation(&mut transaction, job, self.instance_id.as_ref())
@@ -1444,6 +1565,7 @@ impl Worker {
                     return Err(JobError::LostLease);
                 }
             }
+            "delete_raw" => {}
             _ => return Err(JobError::Deterministic("unknown_job_type")),
         }
         if requeue_newer_generation {
@@ -3057,6 +3179,18 @@ fn map_crash_object_error(error: ObjectError) -> JobError {
         ObjectError::Unavailable => JobError::Transient("object_store_unavailable"),
         ObjectError::Missing => JobError::Transient("raw_object_missing"),
         ObjectError::Invalid => JobError::Deterministic("raw_object_invalid"),
+    }
+}
+
+fn map_usage_error(error: crate::usage::UsageError) -> JobError {
+    match error {
+        crate::usage::UsageError::NotFound => JobError::Deterministic("usage_state_missing"),
+        crate::usage::UsageError::InvalidRequest
+        | crate::usage::UsageError::Unauthorized
+        | crate::usage::UsageError::Forbidden => JobError::Deterministic("usage_policy_invalid"),
+        crate::usage::UsageError::Unavailable | crate::usage::UsageError::Internal => {
+            JobError::Transient("database_unavailable")
+        }
     }
 }
 

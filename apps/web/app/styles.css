@@ -722,6 +722,33 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.usage-settings-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.usage-settings-form label {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.usage-settings-form .checkbox-row {
+  display: flex;
+  align-items: center;
+}
+
+.usage-settings-form .checkbox-row input {
+  width: auto;
+}
+
+.usage-settings-form .filter-actions {
+  grid-column: 1 / -1;
+}
+
 .issue-link {
   color: var(--text);
   font-weight: 700;
@@ -1336,6 +1363,7 @@ button:disabled {
 
   .filter-form,
   .data-rules-form,
+  .usage-settings-form,
   .advanced-filters > div {
     grid-template-columns: 1fr;
   }

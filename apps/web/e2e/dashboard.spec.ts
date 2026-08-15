@@ -35,7 +35,7 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await expect(
     page.getByRole("heading", { name: "Windows Game", exact: true }),
   ).toBeVisible();
-  await expect(page.getByText("Observed, not billable")).toBeVisible();
+  await expect(page.getByText("Authoritative billing cycle")).toBeVisible();
   await expect(page.getByRole("link", { name: "Next page" })).toBeVisible();
   await page.getByRole("link", { name: "Next page" }).click();
   await expect(page).toHaveURL(/cursor=/);
@@ -148,9 +148,14 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await page.getByLabel("Indexed GameData keys, one per line").fill("MapName");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Save data rules" }).click();
-  await expect(page.locator(".action-status")).toContainText(
+  await expect(page.locator(".data-rules-form .action-status")).toContainText(
     "Existing events are queued for reprocessing.",
   );
+  await page.getByLabel("Raw retention days").fill("6");
+  await page.getByRole("button", { name: "Save usage settings" }).click();
+  await expect(
+    page.locator(".usage-settings-form .action-status"),
+  ).toContainText("Policy version 2 saved.");
 
   await page.goto(`/projects/${outsideProjectId}`);
   await expect(
