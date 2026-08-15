@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/361
 
-Status: Waiting for approval, #358, and #359
+Status: Approved, waiting for #358 and #359
 
 ## Context
 
@@ -73,4 +73,4 @@ Rollback sets both bounds to one or restores the prior worker. Existing jobs, at
 
 ## Approval
 
-Approval is required for the concurrency defaults and hard bounds, pool sizing, host-capacity staging criteria, rollout sequence, and rollback.
+Ishtmeet Singh approved this plan on August 15, 2026, including the concurrency defaults and hard bounds, pool sizing, host-capacity staging criteria, rollout sequence, and rollback.
