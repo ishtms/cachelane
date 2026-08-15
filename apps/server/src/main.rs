@@ -34,6 +34,14 @@ enum Command {
     Worker,
     Scheduler,
     Migrate,
+    RepairIssue {
+        #[arg(long)]
+        organization_id: String,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        issue_id: String,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +78,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Migrate => migrate(&required_env("DATABASE_URL")?).await?,
+        Command::RepairIssue {
+            organization_id,
+            project_id,
+            issue_id,
+        } => {
+            let report = worker::repair_issue(
+                &required_env("DATABASE_URL")?,
+                &organization_id,
+                &project_id,
+                &issue_id,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
     }
 
     Ok(())
