@@ -1122,11 +1122,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     async fn owners_version_usage_settings_without_cross_tenant_access()
     -> Result<(), Box<dyn Error>> {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return Ok(());
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url).await?;
         let pool = PgPoolOptions::new()
@@ -1232,12 +1233,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn quota_pressure_retains_representatives_and_samples_repeated_raw()
     -> Result<(), Box<dyn Error>> {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return Ok(());
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url).await?;
         let pool = PgPoolOptions::new()

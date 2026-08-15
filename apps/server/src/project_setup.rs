@@ -2213,10 +2213,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     async fn postgres_persists_hashes_and_enforces_tenant_scope_when_configured() {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         assert_isolated_database(&database_url);
 

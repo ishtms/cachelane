@@ -3783,10 +3783,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     async fn reconciliation_removes_stale_scratch_without_touching_unknown_entries() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -4302,11 +4303,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn rule_changes_redact_current_results_and_reindex_only_approved_context() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -4453,11 +4455,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn publication_groups_repeats_maps_releases_and_flags_regressions_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -4709,11 +4712,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn publication_converges_concurrently_and_honors_leases_and_the_kill_switch() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -4989,11 +4993,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn publication_does_not_guess_regressions_from_late_or_tied_releases() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -5144,11 +5149,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn claims_are_fair_and_stale_leases_cannot_publish_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -5251,11 +5257,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn resource_failures_retry_once_quarantine_and_do_not_block_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -5476,11 +5483,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn exact_symbol_waiters_reprocess_one_event_without_losing_history_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -5827,12 +5835,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn concurrent_reprocessing_coalesces_and_failure_keeps_the_current_result_when_configured()
      {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -6190,11 +6199,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn manual_reprocessing_selectors_use_a_stable_tenant_scoped_cursor_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -6378,11 +6388,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn automatic_reprocessing_pages_past_the_request_attempt_limit_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await

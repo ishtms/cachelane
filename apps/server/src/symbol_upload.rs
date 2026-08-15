@@ -2365,11 +2365,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn uploads_only_missing_artifacts_and_keeps_tenants_isolated() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await

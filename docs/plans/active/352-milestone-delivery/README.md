@@ -38,7 +38,7 @@ The change affects repository verification, GitHub Project state, merge configur
 
 ## Current behavior and evidence
 
-- The repository remote is `https://github.com/ishtms/faultlane.git`, while the local `next-task` preflight expects `ishtms/cachelane` and fails before selection.
+- The repository remote is `https://github.com/ishtms/faultlane.git`, while the local `next-task` preflight expects the former repository name and fails before selection.
 - The root worktree is on `main` at `f6ab596` and is clean apart from the existing untracked `FaultLane_Pricing.docx`.
 - There are 14 existing secondary worktrees. `feature/delivery-guards` and `feature/m1-delivery-proof` contain uncommitted work and must not be changed or removed by this plan.
 - GitHub Project 4 currently has Backlog, Ready, In Progress, In review, and Done statuses. It has no `Locally verified` status.

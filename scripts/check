@@ -4,7 +4,39 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+baseline_status="$(git status --porcelain=v1 --untracked-files=all)"
+next_env_backup="$(mktemp -t faultlane-next-env.XXXXXX)"
+cp apps/web/next-env.d.ts "$next_env_backup"
+
+finish() {
+  local status="$?"
+  local final_status
+  trap - EXIT INT TERM
+
+  cp "$next_env_backup" apps/web/next-env.d.ts || status=1
+  rm -f -- "$next_env_backup" || status=1
+
+  final_status="$(git status --porcelain=v1 --untracked-files=all)"
+  if [[ "$final_status" != "$baseline_status" ]]; then
+    echo "complete check changed the worktree" >&2
+    git status --short >&2
+    status=1
+  fi
+
+  exit "$status"
+}
+
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 ./scripts/check-fast
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+./scripts/with-test-database cargo test --workspace --all-targets -- --ignored
 cargo build --workspace --release
 corepack pnpm --filter @faultlane/web build
+./scripts/check-fuzz
 ./scripts/check-repository
+FAULTLANE_BROWSER_USE_RELEASE=true \
+  FAULTLANE_BROWSER_SKIP_BUILD=true \
+  ./scripts/prove-browser

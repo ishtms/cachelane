@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+nightly="${FAULTLANE_FUZZ_NIGHTLY:-nightly-2026-08-14}"
+seconds="${FAULTLANE_FUZZ_SECONDS:-3}"
+fuzz_directory="$(mktemp -d -t faultlane-fuzz.XXXXXX)"
+fuzz_directory="$(cd "$fuzz_directory" && pwd -P)"
+fuzz_temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+fuzz_name="$(basename "$fuzz_directory")"
+
+cleanup() {
+  local status="$?"
+  trap - EXIT INT TERM
+  if [[ "$fuzz_name" =~ ^faultlane-fuzz\.[A-Za-z0-9]+$ \
+    && "$(dirname "$fuzz_directory")" == "$fuzz_temp_root" \
+    && "$fuzz_directory" == "$fuzz_temp_root/$fuzz_name" ]]; then
+    rm -rf -- "$fuzz_directory"
+  else
+    echo "fuzz proof temporary directory was not removed" >&2
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FAULTLANE_FUZZ_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+
+if ! command -v cargo-fuzz >/dev/null 2>&1; then
+  echo "missing: cargo-fuzz (run cargo install cargo-fuzz --version 0.13.2 --locked)" >&2
+  exit 1
+fi
+
+if ! rustup run "$nightly" rustc --version >/dev/null 2>&1; then
+  echo "missing: Rust $nightly (run rustup toolchain install $nightly --profile minimal)" >&2
+  exit 1
+fi
+
+if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+  vswhere='/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
+  if [[ ! -x "$vswhere" ]]; then
+    echo "missing: Visual Studio Installer vswhere.exe" >&2
+    exit 1
+  fi
+
+  installation="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.ASAN -property installationPath | tr -d '\r')"
+  if [[ -z "$installation" ]]; then
+    echo "missing: MSVC AddressSanitizer component" >&2
+    exit 1
+  fi
+
+  installation="$(cygpath -u "$installation")"
+  asan_runtime="$(find "$installation/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/clang_rt.asan_dynamic-x86_64.dll' -print | sort -r | head -n 1)"
+  if [[ -z "$asan_runtime" ]]; then
+    echo "missing: clang_rt.asan_dynamic-x86_64.dll" >&2
+    exit 1
+  fi
+  export PATH="$(dirname "$asan_runtime"):$PATH"
+fi
+
+cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+
+for target in windows_artifact crash_request minidump; do
+  corpus="$fuzz_directory/corpus/$target"
+  artifacts="$fuzz_directory/artifacts/$target"
+  mkdir -p "$corpus" "$artifacts"
+  if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+    corpus="$(cygpath -w "$corpus")"
+    artifacts="$(cygpath -w "$artifacts")\\"
+  else
+    artifacts="$artifacts/"
+  fi
+  echo "fuzz proof: $target for $seconds seconds"
+  cargo +"$nightly" fuzz run "$target" "$corpus" -- \
+    -artifact_prefix="$artifacts" \
+    -max_total_time="$seconds" \
+    -print_final_stats=1 \
+    -verbosity=0
+done
+
+echo "fuzz proof passed"

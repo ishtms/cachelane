@@ -630,11 +630,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn owners_update_rules_idempotently_without_cross_tenant_visibility() {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: ./scripts/with-test-database <command> [args...]" >&2
+  exit 2
+fi
+
+if [[ -n "${FAULTLANE_TEST_DATABASE_URL:-}" ]]; then
+  echo "test database: using configured FAULTLANE_TEST_DATABASE_URL"
+  exec "$@"
+fi
+
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  echo "test database: Docker is required when FAULTLANE_TEST_DATABASE_URL is unset" >&2
+  exit 1
+fi
+
+database_name="faultlane_test"
+database_user="faultlane_test"
+database_password="faultlane_test_dev"
+container="faultlane-test-postgres-$$"
+started=false
+
+cleanup() {
+  local status="$?"
+  trap - EXIT INT TERM
+  if [[ "$started" == true ]]; then
+    docker rm --force "$container" >/dev/null 2>&1 || status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+docker run \
+  --detach \
+  --rm \
+  --name "$container" \
+  --env "POSTGRES_DB=$database_name" \
+  --env "POSTGRES_PASSWORD=$database_password" \
+  --env "POSTGRES_USER=$database_user" \
+  --publish 127.0.0.1::5432 \
+  postgres:17.6-alpine >/dev/null
+started=true
+
+mapping=""
+for _ in $(seq 1 30); do
+  mapping="$(docker port "$container" 5432/tcp 2>/dev/null | head -n 1 | tr -d '\r')"
+  if [[ -n "$mapping" ]]; then
+    break
+  fi
+  sleep 0.2
+done
+
+port="${mapping##*:}"
+if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+  echo "test database: failed to discover the PostgreSQL port" >&2
+  exit 1
+fi
+
+for _ in $(seq 1 60); do
+  if docker exec "$container" pg_isready -U "$database_user" -d "$database_name" >/dev/null 2>&1; then
+    export FAULTLANE_TEST_DATABASE_URL="postgres://$database_user:$database_password@127.0.0.1:$port/$database_name"
+    echo "test database: ready on port $port"
+    "$@"
+    exit
+  fi
+  sleep 0.5
+done
+
+echo "test database: PostgreSQL did not become ready" >&2
+exit 1

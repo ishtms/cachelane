@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ ! -f .env ]]; then
+  echo "missing .env; run ./scripts/setup" >&2
+  exit 1
+fi
+
+set -a
+source .env
+set +a
+
+proof_id="${FAULTLANE_BROWSER_PROOF_ID:-local-$$}"
+if [[ ! "$proof_id" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then
+  echo "invalid browser proof identifier" >&2
+  exit 2
+fi
+
+compose_project="faultlane-browser-$proof_id"
+proof_directory="$(mktemp -d -t faultlane-browser.XXXXXX)"
+proof_directory="$(cd "$proof_directory" && pwd -P)"
+proof_temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+proof_name="$(basename "$proof_directory")"
+next_env_backup="$proof_directory/next-env.d.ts"
+cp apps/web/next-env.d.ts "$next_env_backup"
+
+use_compose=true
+if [[ -n "${FAULTLANE_BROWSER_EXTERNAL_DATABASE_URL:-}" \
+  && -n "${FAULTLANE_BROWSER_EXTERNAL_OBJECT_STORE_ENDPOINT:-}" ]]; then
+  use_compose=false
+  export DATABASE_URL="$FAULTLANE_BROWSER_EXTERNAL_DATABASE_URL"
+  export OBJECT_STORE_ENDPOINT="$FAULTLANE_BROWSER_EXTERNAL_OBJECT_STORE_ENDPOINT"
+  export OBJECT_STORE_BUCKET="${FAULTLANE_BROWSER_EXTERNAL_OBJECT_STORE_BUCKET:-faultlane-browser}"
+else
+  export POSTGRES_DB="faultlane_browser_${proof_id//-/_}"
+  export FAULTLANE_POSTGRES_PORT="${FAULTLANE_BROWSER_POSTGRES_PORT:-55434}"
+  export FAULTLANE_MINIO_PORT="${FAULTLANE_BROWSER_MINIO_PORT:-59020}"
+  export FAULTLANE_MINIO_CONSOLE_PORT="${FAULTLANE_BROWSER_MINIO_CONSOLE_PORT:-59021}"
+  export OBJECT_STORE_BUCKET="faultlane-browser-$proof_id"
+  export OBJECT_STORE_ENDPOINT="http://127.0.0.1:$FAULTLANE_MINIO_PORT"
+  export DATABASE_URL="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$FAULTLANE_POSTGRES_PORT/$POSTGRES_DB"
+fi
+
+export FAULTLANE_API_PORT="${FAULTLANE_BROWSER_API_PORT:-58092}"
+export FAULTLANE_INGEST_PORT="${FAULTLANE_BROWSER_INGEST_PORT:-58093}"
+export FAULTLANE_WEB_PORT="${FAULTLANE_BROWSER_WEB_PORT:-53092}"
+export FAULTLANE_API_URL="http://127.0.0.1:$FAULTLANE_API_PORT"
+export FAULTLANE_INGEST_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
+export INGEST_BASE_URL="$FAULTLANE_INGEST_URL"
+export FAULTLANE_WEB_URL="http://127.0.0.1:$FAULTLANE_WEB_PORT"
+export PUBLIC_BASE_URL="$FAULTLANE_WEB_URL"
+export FAULTLANE_INGEST_SPOOL_DIR="$proof_directory/ingest-spool"
+export FAULTLANE_BOOTSTRAP_ENABLED=true
+export FAULTLANE_BOOTSTRAP_SECRET="faultlane-browser-bootstrap-$proof_id"
+export FAULTLANE_RATE_LIMIT_SECRET="faultlane-browser-rate-limit-$proof_id"
+export FAULTLANE_TRUSTED_PROXY_CIDRS=""
+export FAULTLANE_SYMBOL_UPLOAD_ENABLED=false
+export FAULTLANE_ISOLATED_PROCESSING_ENABLED=false
+export FAULTLANE_GROUPING_ENABLED=false
+export FAULTLANE_REPROCESSING_ENABLED=false
+export FAULTLANE_DASHBOARD_ENABLED=false
+export FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED=false
+export FAULTLANE_PLAYWRIGHT_OUTPUT_DIR="$proof_directory/playwright"
+
+profile="debug"
+if [[ "${FAULTLANE_BROWSER_USE_RELEASE:-false}" == true ]]; then
+  profile="release"
+fi
+
+server_executable="$repo_root/target/$profile/faultlane-server"
+node_executable="$(command -v node)"
+next_executable="$repo_root/apps/web/node_modules/next/dist/bin/next"
+windows=false
+if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+  windows=true
+  server_executable="$server_executable.exe"
+  node_executable="$(command -v node.exe || command -v node)"
+fi
+
+api_pid=""
+ingest_pid=""
+web_pid=""
+started_pid=""
+
+start_role() {
+  local role="$1"
+  local stdout_log="$proof_directory/$role.log"
+  local stderr_log="$proof_directory/$role-error.log"
+
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    local stdout_path
+    local stderr_path
+    local pid_path
+    executable_path="$(cygpath -w "$server_executable")"
+    stdout_path="$(cygpath -w "$stdout_log")"
+    stderr_path="$(cygpath -w "$stderr_log")"
+    pid_path="$(cygpath -w "$proof_directory/$role.pid")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Start-Process -FilePath '$executable_path' -ArgumentList '$role' -RedirectStandardOutput '$stdout_path' -RedirectStandardError '$stderr_path' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_path', \$process.Id.ToString())" \
+      >/dev/null
+    started_pid="$(tr -d '\r\n' <"$proof_directory/$role.pid")"
+  else
+    "$server_executable" "$role" >"$stdout_log" 2>"$stderr_log" &
+    started_pid="$!"
+  fi
+
+  if [[ ! "$started_pid" =~ ^[0-9]+$ ]]; then
+    echo "failed to start $role role" >&2
+    exit 1
+  fi
+}
+
+start_web() {
+  local stdout_log="$proof_directory/web.log"
+  local stderr_log="$proof_directory/web-error.log"
+
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    local next_path
+    local work_path
+    local stdout_path
+    local stderr_path
+    local pid_path
+    executable_path="$(cygpath -w "$node_executable")"
+    next_path="$(cygpath -w "$next_executable")"
+    work_path="$(cygpath -w "$repo_root/apps/web")"
+    stdout_path="$(cygpath -w "$stdout_log")"
+    stderr_path="$(cygpath -w "$stderr_log")"
+    pid_path="$(cygpath -w "$proof_directory/web.pid")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Start-Process -FilePath '$executable_path' -ArgumentList '$next_path', 'start', '--hostname', '127.0.0.1', '--port', '$FAULTLANE_WEB_PORT' -WorkingDirectory '$work_path' -RedirectStandardOutput '$stdout_path' -RedirectStandardError '$stderr_path' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_path', \$process.Id.ToString())" \
+      >/dev/null
+    web_pid="$(tr -d '\r\n' <"$proof_directory/web.pid")"
+  else
+    "$node_executable" "$next_executable" start \
+      --hostname 127.0.0.1 \
+      --port "$FAULTLANE_WEB_PORT" \
+      >"$stdout_log" 2>"$stderr_log" &
+    web_pid="$!"
+  fi
+
+  if [[ ! "$web_pid" =~ ^[0-9]+$ ]]; then
+    echo "failed to start the production web server" >&2
+    exit 1
+  fi
+}
+
+stop_process() {
+  local pid="$1"
+  local executable="$2"
+  if [[ -z "$pid" ]]; then
+    return
+  fi
+
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    executable_path="$(cygpath -w "$executable")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Get-Process -Id $pid -ErrorAction SilentlyContinue; if (\$null -ne \$process) { if ([IO.Path]::GetFullPath(\$process.Path) -ne [IO.Path]::GetFullPath('$executable_path')) { exit 1 }; Stop-Process -Id $pid -Force; Wait-Process -Id $pid -Timeout 10 -ErrorAction SilentlyContinue }" \
+      >/dev/null
+    return
+  fi
+
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    wait "$pid" >/dev/null 2>&1 || true
+    return
+  fi
+
+  local actual
+  local expected
+  actual="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  expected="$(readlink -f "$executable")"
+  if [[ "$actual" != "$expected" ]]; then
+    return 1
+  fi
+
+  kill "$pid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      wait "$pid" >/dev/null 2>&1 || true
+      return
+    fi
+    sleep 0.1
+  done
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+}
+
+wait_for_url() {
+  local name="$1"
+  local url="$2"
+  for _ in $(seq 1 120); do
+    if curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.5
+  done
+  echo "$name did not become ready" >&2
+  return 1
+}
+
+cleanup() {
+  local status="$?"
+  local cleanup_failed=0
+  trap - EXIT INT TERM
+
+  stop_process "$api_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$ingest_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$web_pid" "$node_executable" || cleanup_failed=1
+
+  if [[ "$use_compose" == true ]]; then
+    docker compose \
+      --project-name "$compose_project" \
+      --env-file .env \
+      -f deploy/docker-compose/compose.yml \
+      down --volumes --remove-orphans >/dev/null 2>&1 || cleanup_failed=1
+
+    if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$compose_project")" \
+      || -n "$(docker network ls -q --filter "label=com.docker.compose.project=$compose_project")" \
+      || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$compose_project")" ]]; then
+      echo "browser proof cleanup left Docker resources" >&2
+      cleanup_failed=1
+    fi
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    for log in "$proof_directory"/*.log; do
+      if [[ -f "$log" ]]; then
+        echo "==> $(basename "$log")" >&2
+        tail -n 200 "$log" >&2
+      fi
+    done
+  fi
+
+  if [[ -f "$next_env_backup" ]]; then
+    cp "$next_env_backup" apps/web/next-env.d.ts
+  fi
+
+  if [[ "$proof_name" =~ ^faultlane-browser\.[A-Za-z0-9]+$ \
+    && "$(dirname "$proof_directory")" == "$proof_temp_root" \
+    && "$proof_directory" == "$proof_temp_root/$proof_name" ]]; then
+    rm -rf -- "$proof_directory"
+  else
+    echo "browser proof temporary directory was not removed" >&2
+    cleanup_failed=1
+  fi
+
+  if [[ "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ "$use_compose" == true ]]; then
+  echo "browser proof: starting isolated PostgreSQL and MinIO"
+  docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    up -d --wait postgres minio
+  docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    run --rm minio-init >/dev/null
+else
+  echo "browser proof: using configured external services"
+fi
+
+if [[ "${FAULTLANE_BROWSER_SKIP_BUILD:-false}" != true ]]; then
+  echo "browser proof: building API and production web"
+  if [[ "$profile" == release ]]; then
+    cargo build --package faultlane-server --release
+  else
+    cargo build --package faultlane-server
+  fi
+  corepack pnpm --filter @faultlane/web build
+fi
+
+"$server_executable" migrate
+start_role api
+api_pid="$started_pid"
+start_role ingest
+ingest_pid="$started_pid"
+start_web
+
+wait_for_url API "$FAULTLANE_API_URL/health/ready"
+wait_for_url ingest "$FAULTLANE_INGEST_URL/health/ready"
+wait_for_url web "$FAULTLANE_WEB_URL/setup"
+
+if [[ "${FAULTLANE_BROWSER_PROOF_FORCE_FAILURE:-false}" == true ]]; then
+  echo "forced browser proof failure" >&2
+  exit 97
+fi
+
+echo "browser proof: running smoke and setup flow"
+FAULTLANE_SMOKE_API_URL="$FAULTLANE_API_URL" \
+  FAULTLANE_SMOKE_INGEST_URL="$FAULTLANE_INGEST_URL" \
+  FAULTLANE_SMOKE_WEB_URL="$FAULTLANE_WEB_URL" \
+  bash scripts/smoke
+corepack pnpm --filter @faultlane/web exec playwright test e2e/setup.spec.ts --workers=1
+
+echo "browser proof passed"

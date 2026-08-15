@@ -1941,11 +1941,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn hosted_sign_in_roles_invitations_sessions_and_audit_work_when_configured() {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         let database_name = database_url
             .rsplit('/')
