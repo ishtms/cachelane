@@ -4,7 +4,19 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-baseline_status="$(git status --porcelain=v1 --untracked-files=all)"
+repository_status() {
+  git status --porcelain=v1 --untracked-files=all -- . \
+    ':(top,exclude).env' \
+    ':(top,exclude)apps/web/.next' \
+    ':(top,exclude)apps/web/node_modules' \
+    ':(top,exclude)apps/web/tsconfig.tsbuildinfo' \
+    ':(top,exclude)fuzz/artifacts' \
+    ':(top,exclude)fuzz/target' \
+    ':(top,exclude)node_modules' \
+    ':(top,exclude)target'
+}
+
+baseline_status="$(repository_status)"
 next_env_backup="$(mktemp -t faultlane-next-env.XXXXXX)"
 cp apps/web/next-env.d.ts "$next_env_backup"
 
@@ -16,10 +28,10 @@ finish() {
   cp "$next_env_backup" apps/web/next-env.d.ts || status=1
   rm -f -- "$next_env_backup" || status=1
 
-  final_status="$(git status --porcelain=v1 --untracked-files=all)"
+  final_status="$(repository_status)"
   if [[ "$final_status" != "$baseline_status" ]]; then
     echo "complete check changed the worktree" >&2
-    git status --short >&2
+    repository_status >&2
     status=1
   fi
 

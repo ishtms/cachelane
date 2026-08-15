@@ -136,10 +136,12 @@ start_web() {
       >/dev/null
     web_pid="$(tr -d '\r\n' <"$proof_directory/web.pid")"
   else
-    "$node_executable" "$next_executable" start \
-      --hostname 127.0.0.1 \
-      --port "$FAULTLANE_WEB_PORT" \
-      >"$stdout_log" 2>"$stderr_log" &
+    (
+      cd "$repo_root/apps/web"
+      exec "$node_executable" "$next_executable" start \
+        --hostname 127.0.0.1 \
+        --port "$FAULTLANE_WEB_PORT"
+    ) >"$stdout_log" 2>"$stderr_log" &
     web_pid="$!"
   fi
 
