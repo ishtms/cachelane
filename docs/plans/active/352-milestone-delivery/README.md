@@ -46,20 +46,23 @@ The change affects repository verification, GitHub Project state, merge configur
 - Repository settings allow only squash merges. The active main ruleset allows only squash and requires `check`, `dependency audit`, and `dependency review`.
 - Pull request #353 is closed and its plan was not merged to `main`.
 - The local `AGENTS.md`, `.agents/`, `PRD.md`, `ARCHITECTURE.md`, and most Markdown files are ignored. `docs/workflow/README.md` can be tracked under the existing `README.md` exception without changing `.gitignore` or force-adding files.
+- Ignored `AGENTS.md` and `.agents/` files exist only in the root worktree. Their local updates must be made there, kept out of the workflow branch index, and validated separately from the tracked diff.
+- The installed GitHub CLI has no Project field-edit command. GitHub's `updateProjectV2Field` GraphQL input accepts existing option IDs, so the status mutation can preserve all five current options and their item assignments while adding the new option.
+- The skill validator is available locally, but the current Python environment lacks PyYAML. Skill validation must use a disposable tool environment and must not add a repository dependency.
 - Five plans remain active after their linked pull requests were merged.
 
 ## Implementation sequence
 
 1. Add the tracked workflow contract with the milestone and issue state machine, proof requirements, exception policy, review boundary, and rollback rules.
-2. Update local `AGENTS.md` only as needed to point at the tracked contract while preserving its safety, testing, writing, identity, and GitHub rules. Do not stage it.
-3. Rewrite the local `next-task` skill as the issue-level milestone loop, fix its FaultLane preflight, and validate it.
-4. Add the local `finish-milestone` skill for final certification, review, pull request creation, CI follow-up, and human merge handoff. Validate it.
-5. Narrow the local `ship` skill to explicit single-issue exceptions and remove lifecycle overlap between the three delivery skills.
+2. Update root-local `AGENTS.md` only as needed to point at the tracked contract while preserving its safety, testing, writing, identity, and GitHub rules. Do not stage it.
+3. Rewrite the root-local `next-task` skill as the issue-level milestone loop, fix its FaultLane preflight, and validate it.
+4. Initialize the root-local `finish-milestone` skill with the skill-creator tooling, then implement final certification, review, pull request creation, CI follow-up, and human merge handoff. Validate it.
+5. Narrow the root-local `ship` skill to explicit single-issue exceptions and remove lifecycle overlap between the three delivery skills.
 6. Split focused issue verification from milestone certification. Make PostgreSQL test execution explicit, make the full command clean-tree stable, and include the required runtime, browser, behavior-proof, and fuzz surfaces through repository scripts.
 7. Replace the `lsof`-only port check with a cross-platform probe that works from Git Bash on Windows.
 8. Run focused script tests, then run the complete local certification from a clean worktree with Docker services available. Record the exact head and prove the tree remains clean.
 9. Open a draft workflow pull request as staging evidence. Confirm Linux, Windows, browser/runtime, dependency audit, and dependency review behavior on the exact verified head without making new checks required.
-10. Add `Locally verified` to Project 4 and exercise the full status transition on the workflow issue.
+10. Add `Locally verified` to Project 4 through the documented GraphQL mutation, passing every existing option ID, name, color, and description unchanged. Requery the field and exercise the full status transition on the workflow issue.
 11. Enable repository rebase merge and update the main ruleset to allow rebase while preserving every existing protection and required check.
 12. Requery the repository settings and Project fields, perform a fresh review, and leave the workflow pull request for human rebase merge.
 13. After merge, archive this plan, reconcile the already merged active plans without touching the dirty worktrees, and start the remaining M1 work from current `main` in one milestone worktree.
