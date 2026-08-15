@@ -527,7 +527,7 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
     }
 
     sqlx::query(
-        "UPDATE crash_processing_results SET result = '{\"unexpected\":true}'::jsonb WHERE id::text = $1",
+        "UPDATE crash_processing_results SET result = '{\"unexpected\":true}'::jsonb WHERE id = $1::uuid",
     )
     .bind(&issue.older_result_id)
     .execute(&pool)
@@ -545,7 +545,7 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
     assert_eq!(corrupt.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(corrupt).await?["code"], "result_unavailable");
     let mismatched_result = processing_result("UECC-Windows-wrong-identity", false);
-    sqlx::query("UPDATE crash_processing_results SET result = $2 WHERE id::text = $1")
+    sqlx::query("UPDATE crash_processing_results SET result = $2 WHERE id = $1::uuid")
         .bind(&issue.older_result_id)
         .bind(mismatched_result)
         .execute(&pool)
@@ -562,7 +562,7 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
         .await?;
     assert_eq!(mismatched_identity.status(), StatusCode::CONFLICT);
 
-    sqlx::query("UPDATE crash_event_objects SET byte_size = byte_size + 1 WHERE id::text = $1")
+    sqlx::query("UPDATE crash_event_objects SET byte_size = byte_size + 1 WHERE id = $1::uuid")
         .bind(&issue.object_id)
         .execute(&pool)
         .await?;
@@ -765,7 +765,7 @@ async fn insert_distribution_issue(
     .fetch_one(pool)
     .await?;
     sqlx::query(
-        "UPDATE crash_events SET issue_id = $1::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $2, variant_fingerprint = $2, grouping_quality = 100, grouped_at = received_at WHERE project_id::text = $3 AND crash_guid LIKE 'UECC-Distribution-%'",
+        "UPDATE crash_events SET issue_id = $1::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $2, variant_fingerprint = $2, grouping_quality = 100, grouped_at = received_at WHERE project_id = $3::uuid AND crash_guid LIKE 'UECC-Distribution-%'",
     )
     .bind(&issue_id)
     .bind(&fingerprint)
@@ -820,7 +820,7 @@ async fn insert_issue(
     .await?;
     for event in [&older, &latest] {
         sqlx::query(
-            "UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $3, variant_fingerprint = $4, grouping_quality = 100, grouped_at = received_at WHERE id::text = $1",
+            "UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $3, variant_fingerprint = $4, grouping_quality = 100, grouped_at = received_at WHERE id = $1::uuid",
         )
         .bind(&event.event_id)
         .bind(&issue_id)
@@ -1008,7 +1008,7 @@ async fn insert_event(
     .bind(if partial { "partial" } else { "readable" })
     .execute(pool)
     .await?;
-    sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id::text = $1")
+    sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id = $1::uuid")
         .bind(&event_id)
         .bind(&result_id)
         .execute(pool)

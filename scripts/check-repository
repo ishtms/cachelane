@@ -127,6 +127,50 @@ if ! grep -Fq './scripts/with-test-database cargo test --workspace --all-targets
   exit 1
 fi
 
+node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const predicate = /\b[a-z_][a-z0-9_.]*::text\s*(?:=|<>|<=|>=|<|>|IS\s+(?:NOT\s+)?DISTINCT\s+FROM|IN\b)/i;
+const forbiddenFixtures = [
+  "WHERE id::text = $1",
+  "WHERE event_id::text IN ($1, $2)",
+  "WHERE release_id::text IS NOT DISTINCT FROM $3",
+];
+const allowedFixtures = [
+  "SELECT id::text AS id FROM projects WHERE id = $1::uuid",
+  "SELECT count(*)::text AS count FROM projects",
+];
+
+if (
+  forbiddenFixtures.some((fixture) => !predicate.test(fixture)) ||
+  allowedFixtures.some((fixture) => predicate.test(fixture))
+) {
+  throw new Error("UUID predicate guard fixtures failed");
+}
+
+const sourceDirectory = path.join("apps", "server", "src");
+let found = false;
+for (const name of fs.readdirSync(sourceDirectory).sort()) {
+  if (!name.endsWith(".rs")) {
+    continue;
+  }
+  const file = path.join(sourceDirectory, name);
+  const source = fs.readFileSync(file, "utf8");
+  const lines = source.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (predicate.test(lines[index])) {
+      console.error(`UUID column-side text cast found: ${file}:${index + 1}`);
+      found = true;
+    }
+  }
+}
+
+if (found) {
+  process.exit(1);
+}
+NODE
+
 forbidden_dash=$'\xE2\x80\x94'
 found_dash=0
 

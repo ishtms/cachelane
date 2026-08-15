@@ -29,7 +29,10 @@ use sqlx::{PgPool, Row};
 use tokio::{fs, io::AsyncWriteExt, time::Instant};
 use url::Url;
 
-use crate::project_setup::{KeyScope, ServerState, StartupError};
+use crate::{
+    identifiers::valid_uuid,
+    project_setup::{KeyScope, ServerState, StartupError},
+};
 
 const MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -505,9 +508,12 @@ pub(crate) async fn get_event_state(
         crate::auth::AuthorizationError::Unavailable => IngestError::Unavailable,
         _ => IngestError::NotFound,
     })?;
+    if !valid_uuid(&event_id) {
+        return Err(IngestError::NotFound);
+    }
     let pool = state.crash_ingest().pool()?;
     let row = sqlx::query(
-        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.usage_cycle_start, 'YYYY-MM-DD') AS usage_cycle_start, e.usage_policy_version, e.usage_outcome, e.usage_counted, e.usage_estimated, e.usage_accepted_events, e.raw_retention_class, e.raw_sampling_rate, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.id::text = $3",
+        "SELECT e.id::text AS event_id, e.project_id::text AS project_id, e.environment, e.crash_guid, e.processing_state, e.state_reason, e.retryable, CASE WHEN e.retry_at IS NULL THEN NULL ELSE to_char(e.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS retry_at, e.grouping_state, e.fingerprint_algorithm, e.fingerprint_version, e.fingerprint, e.variant_fingerprint, e.grouping_quality, e.issue_id::text AS issue_id, e.release_mapping_state, e.release_id::text AS release_id, ARRAY(SELECT c.release_id::text FROM crash_event_release_candidates c WHERE c.organization_id = e.organization_id AND c.project_id = e.project_id AND c.event_id = e.id ORDER BY c.release_id LIMIT 101) AS candidate_release_ids, to_char(e.usage_cycle_start, 'YYYY-MM-DD') AS usage_cycle_start, e.usage_policy_version, e.usage_outcome, e.usage_counted, e.usage_estimated, e.usage_accepted_events, e.raw_retention_class, e.raw_sampling_rate, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, to_char(e.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.id = $3::uuid",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -1488,6 +1494,17 @@ mod tests {
         assert_eq!(state_body["raw_retention_class"], "standard");
         assert!(!state_body.to_string().contains("object_key"));
 
+        let malformed_id = router("api", state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/events/not-a-uuid"))
+                    .header(header::AUTHORIZATION, format!("Bootstrap {SECRET}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(malformed_id.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(malformed_id).await?["code"], "not_found");
+
         for processing_state in [
             "received",
             "stored",
@@ -1834,7 +1851,7 @@ mod tests {
         project_id: &str,
     ) -> Result<i64, Box<dyn Error>> {
         Ok(sqlx::query_scalar(
-            "SELECT accepted_events FROM usage_cycle_counters WHERE project_id::text = $1 AND cycle_start = date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC')::date",
+            "SELECT accepted_events FROM usage_cycle_counters WHERE project_id = $1::uuid AND cycle_start = date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC')::date",
         )
         .bind(project_id)
         .fetch_one(pool)

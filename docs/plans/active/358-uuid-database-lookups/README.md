@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/358
 
-Status: Waiting for implementation
+Status: Locally verified
 
 ## Context
 
@@ -58,6 +58,13 @@ No new logs are required. Existing fixed API errors remain the observable failur
 Stored data and schema do not change. Tenant filters remain in the same statements. Validation accepts the existing 36-character hexadecimal UUID shape, including upper-case input already accepted by current route helpers.
 
 Land this before the other database audit work so later queries start from the indexable form. Rollback is a code revert. There is no data migration or destructive action.
+
+## Verification
+
+- The source guard reduced 501 production and 652 total server predicate casts to zero.
+- All 23 PostgreSQL-backed server tests passed, including malformed public identifier responses and scoped reads, writes, locks, deletes, cursors, and UUID lists.
+- On one million migrated project rows with parallelism disabled, the prior predicate used a sequential scan, touched 12,345 buffers, and took 204.816 ms. The native UUID predicate used the existing index, touched four buffers, and took 0.059 ms.
+- `./scripts/check-fast` passed.
 
 ## Out of scope
 

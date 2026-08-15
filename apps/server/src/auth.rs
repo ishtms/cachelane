@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use url::Url;
 
-use crate::project_setup::{ServerState, StartupError};
+use crate::{
+    identifiers::valid_uuid,
+    project_setup::{ServerState, StartupError},
+};
 
 const LOGIN_TOKEN_BYTES: usize = 32;
 const SESSION_PREFIX: &str = "fls_";
@@ -351,8 +354,11 @@ pub(crate) async fn authorize_project(
             role: Role::Owner,
         });
     };
+    if !valid_uuid(project_id) {
+        return Err(AuthorizationError::NotFound);
+    }
     let row = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id, m.role FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id WHERE p.id::text = $1 AND m.user_id::text = $2",
+        "SELECT p.organization_id::text AS organization_id, m.role FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id WHERE p.id = $1::uuid AND m.user_id = $2::uuid",
     )
     .bind(project_id)
     .bind(&actor.user_id)
@@ -380,11 +386,14 @@ pub(crate) async fn authorize_organization(
     permission: Permission,
 ) -> Result<OrganizationActor, AuthorizationError> {
     let actor = authenticate(state, headers).await?;
+    if !valid_uuid(organization_id) {
+        return Err(AuthorizationError::NotFound);
+    }
     let pool = state
         .control_pool()
         .ok_or(AuthorizationError::Unavailable)?;
     let role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text = $2",
+        "SELECT role FROM organization_memberships WHERE organization_id = $1::uuid AND user_id = $2::uuid",
     )
     .bind(organization_id)
     .bind(&actor.user_id)
@@ -621,7 +630,7 @@ async fn start_email(
         .send()
         .await;
     if !response.is_ok_and(|response| response.status().is_success()) {
-        let _ = sqlx::query("DELETE FROM auth_login_attempts WHERE id::text = $1")
+        let _ = sqlx::query("DELETE FROM auth_login_attempts WHERE id = $1::uuid")
             .bind(attempt_id)
             .execute(auth.pool()?)
             .await;
@@ -853,7 +862,7 @@ async fn list_sessions(
         .map_err(ApiError::from)?;
     let current = actor.session_id.as_ref().ok_or(ApiError::NotFound)?;
     let rows = sqlx::query(
-        "SELECT id::text AS id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at FROM auth_sessions WHERE user_id::text = $1 AND revoked_at IS NULL AND expires_at > now() ORDER BY created_at DESC, id DESC LIMIT 100",
+        "SELECT id::text AS id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at FROM auth_sessions WHERE user_id = $1::uuid AND revoked_at IS NULL AND expires_at > now() ORDER BY created_at DESC, id DESC LIMIT 100",
     )
     .bind(&actor.user_id)
     .fetch_all(state.auth().pool()?)
@@ -883,8 +892,11 @@ async fn revoke_session(
     let actor = authenticate(&state, &headers)
         .await
         .map_err(ApiError::from)?;
+    if !valid_uuid(&session_id) {
+        return Err(ApiError::NotFound);
+    }
     let result = sqlx::query(
-        "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE id::text = $1 AND user_id::text = $2 AND revoked_at IS NULL",
+        "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL",
     )
     .bind(&session_id)
     .bind(&actor.user_id)
@@ -913,7 +925,7 @@ async fn session_view(
     current_id: &str,
 ) -> Result<SessionView, ApiError> {
     let row = sqlx::query(
-        "SELECT id::text AS id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at FROM auth_sessions WHERE id::text = $1 AND user_id::text = $2 AND revoked_at IS NULL AND expires_at > now()",
+        "SELECT id::text AS id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at FROM auth_sessions WHERE id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(session_id)
     .bind(user_id)
@@ -933,7 +945,7 @@ async fn session_view(
 
 async fn user_view(pool: &PgPool, user_id: &str) -> Result<UserView, ApiError> {
     let row =
-        sqlx::query("SELECT id::text AS id, lower(email) AS email FROM users WHERE id::text = $1")
+        sqlx::query("SELECT id::text AS id, lower(email) AS email FROM users WHERE id = $1::uuid")
             .bind(user_id)
             .fetch_optional(pool)
             .await
@@ -947,7 +959,7 @@ async fn user_view(pool: &PgPool, user_id: &str) -> Result<UserView, ApiError> {
 
 async fn memberships(pool: &PgPool, user_id: &str) -> Result<Vec<MembershipView>, ApiError> {
     let rows = sqlx::query(
-        "SELECT o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, m.role FROM organization_memberships m JOIN organizations o ON o.id = m.organization_id WHERE m.user_id::text = $1 ORDER BY o.name, o.id",
+        "SELECT o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, m.role FROM organization_memberships m JOIN organizations o ON o.id = m.organization_id WHERE m.user_id = $1::uuid ORDER BY o.name, o.id",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -1000,7 +1012,7 @@ async fn list_members(
             .map_err(ApiError::from)?;
     let pool = state.auth().pool()?;
     let rows = sqlx::query(
-        "SELECT u.id::text AS user_id, lower(u.email) AS email, m.role, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS joined_at FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id::text = $1 ORDER BY lower(u.email), u.id",
+        "SELECT u.id::text AS user_id, lower(u.email) AS email, m.role, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS joined_at FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = $1::uuid ORDER BY lower(u.email), u.id",
     )
     .bind(&organization_id)
     .fetch_all(pool)
@@ -1019,7 +1031,7 @@ async fn list_members(
         .collect::<Result<Vec<_>, ApiError>>()?;
     let invitations = if caller.role.allows(Permission::ManageMembers) {
         let rows = sqlx::query(
-            "SELECT id::text AS id, lower(email) AS email, role, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM organization_invitations WHERE organization_id::text = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now() ORDER BY created_at, id",
+            "SELECT id::text AS id, lower(email) AS email, role, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM organization_invitations WHERE organization_id = $1::uuid AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now() ORDER BY created_at, id",
         )
         .bind(&organization_id)
         .fetch_all(pool)
@@ -1077,7 +1089,7 @@ async fn create_invitation(
     let delivery = state.auth().email.as_ref().ok_or(ApiError::NotFound)?;
     let token = generated_secret(INVITATION_TOKEN_PREFIX)?;
     let row = sqlx::query(
-        "INSERT INTO organization_invitations (organization_id, email, role, secret_hash, invited_by_user_id, expires_at) SELECT $1::uuid, $2, $3, $4, $5::uuid, now() + interval '7 days' WHERE NOT EXISTS (SELECT 1 FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id::text = $1 AND lower(u.email) = $2) RETURNING id::text AS id, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at",
+        "INSERT INTO organization_invitations (organization_id, email, role, secret_hash, invited_by_user_id, expires_at) SELECT $1::uuid, $2, $3, $4, $5::uuid, now() + interval '7 days' WHERE NOT EXISTS (SELECT 1 FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = $1::uuid AND lower(u.email) = $2) RETURNING id::text AS id, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at",
     )
     .bind(&organization_id)
     .bind(&email)
@@ -1122,7 +1134,7 @@ async fn create_invitation(
         .is_ok_and(|response| response.status().is_success());
     if !delivered {
         let _ = sqlx::query(
-            "UPDATE organization_invitations SET revoked_at = now() WHERE id::text = $1",
+            "UPDATE organization_invitations SET revoked_at = now() WHERE id = $1::uuid",
         )
         .bind(&invitation.id)
         .execute(state.auth().pool()?)
@@ -1165,8 +1177,11 @@ async fn revoke_invitation(
     )
     .await
     .map_err(ApiError::from)?;
+    if !valid_uuid(&invitation_id) {
+        return Err(ApiError::NotFound);
+    }
     let result = sqlx::query(
-        "UPDATE organization_invitations SET revoked_at = COALESCE(revoked_at, now()) WHERE organization_id::text = $1 AND id::text = $2 AND accepted_at IS NULL",
+        "UPDATE organization_invitations SET revoked_at = COALESCE(revoked_at, now()) WHERE organization_id = $1::uuid AND id = $2::uuid AND accepted_at IS NULL",
     )
     .bind(&organization_id)
     .bind(&invitation_id)
@@ -1223,7 +1238,7 @@ async fn accept_invitation(
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::Unavailable)?;
-    sqlx::query("UPDATE organization_invitations SET accepted_at = now() WHERE id::text = $1")
+    sqlx::query("UPDATE organization_invitations SET accepted_at = now() WHERE id = $1::uuid")
         .bind(&invitation_id)
         .execute(&mut *transaction)
         .await
@@ -1270,6 +1285,9 @@ async fn update_member(
     .await
     .map_err(ApiError::from)?;
     let Json(request) = payload.map_err(|_| ApiError::InvalidRequest)?;
+    if !valid_uuid(&user_id) {
+        return Err(ApiError::NotFound);
+    }
     let mut transaction = state
         .auth()
         .pool()?
@@ -1293,7 +1311,7 @@ async fn update_member(
         require_another_owner(&mut transaction, &organization_id, &user_id).await?;
     }
     let result = sqlx::query(
-        "UPDATE organization_memberships SET role = $3 WHERE organization_id::text = $1 AND user_id::text = $2",
+        "UPDATE organization_memberships SET role = $3 WHERE organization_id = $1::uuid AND user_id = $2::uuid",
     )
     .bind(&organization_id)
     .bind(&user_id)
@@ -1335,6 +1353,9 @@ async fn remove_member(
     )
     .await
     .map_err(ApiError::from)?;
+    if !valid_uuid(&user_id) {
+        return Err(ApiError::NotFound);
+    }
     let mut transaction = state
         .auth()
         .pool()?
@@ -1355,7 +1376,7 @@ async fn remove_member(
         require_another_owner(&mut transaction, &organization_id, &user_id).await?;
     }
     let result = sqlx::query(
-        "DELETE FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text = $2",
+        "DELETE FROM organization_memberships WHERE organization_id = $1::uuid AND user_id = $2::uuid",
     )
     .bind(&organization_id)
     .bind(&user_id)
@@ -1400,7 +1421,7 @@ async fn member_role(
     user_id: &str,
 ) -> Result<Role, ApiError> {
     let role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text = $2",
+        "SELECT role FROM organization_memberships WHERE organization_id = $1::uuid AND user_id = $2::uuid",
     )
     .bind(organization_id)
     .bind(user_id)
@@ -1417,7 +1438,7 @@ async fn require_another_owner(
     user_id: &str,
 ) -> Result<(), ApiError> {
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text <> $2 AND role = 'owner'",
+        "SELECT count(*) FROM organization_memberships WHERE organization_id = $1::uuid AND user_id <> $2::uuid AND role = 'owner'",
     )
     .bind(organization_id)
     .bind(user_id)
@@ -1437,7 +1458,7 @@ async fn member_view(
     user_id: &str,
 ) -> Result<MemberView, ApiError> {
     let row = sqlx::query(
-        "SELECT u.id::text AS user_id, lower(u.email) AS email, m.role, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS joined_at FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id::text = $1 AND u.id::text = $2",
+        "SELECT u.id::text AS user_id, lower(u.email) AS email, m.role, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS joined_at FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = $1::uuid AND u.id = $2::uuid",
     )
     .bind(organization_id)
     .bind(user_id)
@@ -1478,7 +1499,7 @@ async fn list_audit(
         .await
         .map_err(ApiError::from)?;
     let rows = sqlx::query(
-        "SELECT id::text AS id, actor_user_id::text AS actor_user_id, action, target_type, target_id, result, to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS occurred_at FROM audit_log WHERE organization_id::text = $1 ORDER BY occurred_at DESC, id DESC LIMIT $2",
+        "SELECT id::text AS id, actor_user_id::text AS actor_user_id, action, target_type, target_id, result, to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS occurred_at FROM audit_log WHERE organization_id = $1::uuid ORDER BY occurred_at DESC, id DESC LIMIT $2",
     )
     .bind(&organization_id)
     .bind(MAX_AUDIT_RESULTS)
@@ -1555,7 +1576,7 @@ async fn audit_all_organizations(
     result: &str,
 ) {
     let _ = sqlx::query(
-        "INSERT INTO audit_log (organization_id, actor_user_id, action, target_type, target_id, result) SELECT organization_id, user_id, $2, $3, $4, $5 FROM organization_memberships WHERE user_id::text = $1",
+        "INSERT INTO audit_log (organization_id, actor_user_id, action, target_type, target_id, result) SELECT organization_id, user_id, $2, $3, $4, $5 FROM organization_memberships WHERE user_id = $1::uuid",
     )
     .bind(user_id)
     .bind(action)
@@ -2004,6 +2025,47 @@ mod tests {
             .unwrap_or_else(|| panic!("owner id must exist"))
             .to_owned();
         assert_eq!(owner["memberships"][0]["role"], "owner");
+
+        for (method, path, body) in [
+            ("GET", "/api/v1/projects/not-a-uuid/setup".to_owned(), None),
+            (
+                "GET",
+                "/api/v1/organizations/not-a-uuid/members".to_owned(),
+                None,
+            ),
+            (
+                "DELETE",
+                "/api/v1/auth/sessions/not-a-uuid".to_owned(),
+                None,
+            ),
+            (
+                "PATCH",
+                format!("/api/v1/organizations/{organization_id}/members/not-a-uuid"),
+                Some(json!({"role": "viewer"})),
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/organizations/{organization_id}/invitations/not-a-uuid"),
+                None,
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/projects/{project_id}/ingest-keys/not-a-uuid"),
+                None,
+            ),
+        ] {
+            let response = api_request(
+                &state,
+                method,
+                &path,
+                Some(&format!("Session {owner_token}")),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(response_json(response).await["code"], "not_found");
+        }
+
         let last_owner = api_request(
             &state,
             "DELETE",
@@ -2339,7 +2401,7 @@ mod tests {
         assert_eq!(no_longer_visible.status(), StatusCode::NOT_FOUND);
 
         let audit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM audit_log WHERE organization_id::text = $1 AND actor_user_id::text = $2",
+            "SELECT count(*) FROM audit_log WHERE organization_id = $1::uuid AND actor_user_id = $2::uuid",
         )
         .bind(&organization_id)
         .bind(&owner_user_id)

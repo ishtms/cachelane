@@ -220,7 +220,7 @@ pub(crate) async fn update_usage(
         || policy.raw_retention_days != body.raw_retention_days;
     if changed {
         let updated = sqlx::query(
-            "UPDATE project_usage_policies SET version = version + 1, spend_cap_cents = $4, retain_all_raw = $5, normalized_retention_days = $6, raw_retention_days = $7, updated_by_user_id = $8::uuid, updated_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND version = $3",
+            "UPDATE project_usage_policies SET version = version + 1, spend_cap_cents = $4, retain_all_raw = $5, normalized_retention_days = $6, raw_retention_days = $7, updated_by_user_id = $8::uuid, updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND version = $3",
         )
         .bind(&actor.organization_id)
         .bind(&actor.project_id)
@@ -288,7 +288,7 @@ pub(crate) async fn record_acceptance(
     .await
     .map_err(|_| UsageError::Unavailable)?;
     let accepted: i64 = sqlx::query_scalar(
-        "SELECT accepted_events FROM usage_cycle_counters WHERE organization_id::text = $1 AND project_id::text = $2 AND cycle_start = $3::date FOR UPDATE",
+        "SELECT accepted_events FROM usage_cycle_counters WHERE organization_id = $1::uuid AND project_id = $2::uuid AND cycle_start = $3::date FOR UPDATE",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -301,7 +301,7 @@ pub(crate) async fn record_acceptance(
     let courtesy_limit = courtesy_limit(&policy);
     let threshold = threshold(next, &policy, outcome);
     sqlx::query(
-        "UPDATE usage_cycle_counters SET accepted_events = accepted_events + 1, accepted_raw_bytes = accepted_raw_bytes + $4, updated_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND cycle_start = $3::date",
+        "UPDATE usage_cycle_counters SET accepted_events = accepted_events + 1, accepted_raw_bytes = accepted_raw_bytes + $4, updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND cycle_start = $3::date",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -328,7 +328,7 @@ pub(crate) async fn record_acceptance(
         .map_err(|_| UsageError::Unavailable)?;
     }
     sqlx::query(
-        "UPDATE crash_events SET usage_cycle_start = $4::date, usage_policy_version = $5, usage_outcome = $6, usage_counted = true, usage_estimated = $7, usage_accepted_events = $8, raw_retention_class = CASE WHEN $6 = 'sampling' THEN 'pending' ELSE 'standard' END, raw_sampling_rate = CASE WHEN $6 = 'sampling' THEN $9 ELSE 1 END WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE crash_events SET usage_cycle_start = $4::date, usage_policy_version = $5, usage_outcome = $6, usage_counted = true, usage_estimated = $7, usage_accepted_events = $8, raw_retention_class = CASE WHEN $6 = 'sampling' THEN 'pending' ELSE 'standard' END, raw_sampling_rate = CASE WHEN $6 = 'sampling' THEN $9 ELSE 1 END WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -373,7 +373,7 @@ pub(crate) async fn admission_for_event(
     counted: bool,
 ) -> Result<Admission, UsageError> {
     let row = sqlx::query(
-        "SELECT to_char(e.usage_cycle_start, 'YYYY-MM-DD') AS cycle_start, e.usage_policy_version, e.usage_outcome, e.usage_estimated, e.usage_accepted_events, p.event_limit, p.courtesy_percent, p.spend_cap_cents FROM crash_events e JOIN project_usage_policy_versions p ON p.organization_id = e.organization_id AND p.project_id = e.project_id AND p.version = e.usage_policy_version WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
+        "SELECT to_char(e.usage_cycle_start, 'YYYY-MM-DD') AS cycle_start, e.usage_policy_version, e.usage_outcome, e.usage_estimated, e.usage_accepted_events, p.event_limit, p.courtesy_percent, p.spend_cap_cents FROM crash_events e JOIN project_usage_policy_versions p ON p.organization_id = e.organization_id AND p.project_id = e.project_id AND p.version = e.usage_policy_version WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -475,7 +475,7 @@ async fn schedule_raw_retention_with_enforcement(
     enforce: bool,
 ) -> Result<(), UsageError> {
     let row = sqlx::query(
-        "SELECT e.usage_outcome, e.raw_retention_class, e.issue_id::text AS issue_id, e.release_id::text AS release_id, e.variant_fingerprint, e.raw_object_id::text AS object_id, raw.lifecycle_state AS raw_lifecycle_state, p.retain_all_raw, p.artifact_storage_limit_bytes, (SELECT COALESCE(sum(o.byte_size), 0)::bigint FROM crash_event_objects o WHERE o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = e.organization_id AND m.project_id = e.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS symbol_storage_bytes FROM crash_events e JOIN crash_event_objects raw ON raw.id = e.raw_object_id AND raw.organization_id = e.organization_id AND raw.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3 FOR UPDATE OF e, raw",
+        "SELECT e.usage_outcome, e.raw_retention_class, e.issue_id::text AS issue_id, e.release_id::text AS release_id, e.variant_fingerprint, e.raw_object_id::text AS object_id, raw.lifecycle_state AS raw_lifecycle_state, p.retain_all_raw, p.artifact_storage_limit_bytes, (SELECT COALESCE(sum(o.byte_size), 0)::bigint FROM crash_event_objects o WHERE o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = e.organization_id AND m.project_id = e.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS symbol_storage_bytes FROM crash_events e JOIN crash_event_objects raw ON raw.id = e.raw_object_id AND raw.organization_id = e.organization_id AND raw.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid FOR UPDATE OF e, raw",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -512,7 +512,7 @@ async fn schedule_raw_retention_with_enforcement(
             .await;
     };
     let issue = sqlx::query(
-        "SELECT event_count, representative_event_id::text AS representative_event_id FROM issues WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "SELECT event_count, representative_event_id::text AS representative_event_id FROM issues WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(&issue_id)
     .bind(organization_id)
@@ -539,7 +539,7 @@ async fn schedule_raw_retention_with_enforcement(
         .await;
     }
     let variant_first: bool = sqlx::query_scalar(
-        "SELECT NOT EXISTS (SELECT 1 FROM crash_events prior WHERE prior.organization_id::text = $1 AND prior.project_id::text = $2 AND prior.issue_id::text = $3 AND prior.variant_fingerprint = $4 AND (prior.received_at, prior.id) < (current.received_at, current.id)) FROM crash_events current WHERE current.id::text = $5 AND current.organization_id::text = $1 AND current.project_id::text = $2",
+        "SELECT NOT EXISTS (SELECT 1 FROM crash_events prior WHERE prior.organization_id = $1::uuid AND prior.project_id = $2::uuid AND prior.issue_id = $3::uuid AND prior.variant_fingerprint = $4 AND (prior.received_at, prior.id) < (current.received_at, current.id)) FROM crash_events current WHERE current.id = $5::uuid AND current.organization_id = $1::uuid AND current.project_id = $2::uuid",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -560,7 +560,7 @@ async fn schedule_raw_retention_with_enforcement(
         .await;
     }
     let recent = sqlx::query(
-        "SELECT e.id::text AS event_id, e.raw_object_id::text AS object_id FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.release_id::text IS NOT DISTINCT FROM $4 AND e.raw_retention_class = 'recent' AND o.lifecycle_state = 'stored' ORDER BY e.received_at DESC, e.id DESC LIMIT 3 FOR UPDATE OF e, o",
+        "SELECT e.id::text AS event_id, e.raw_object_id::text AS object_id FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND e.release_id IS NOT DISTINCT FROM $4::uuid AND e.raw_retention_class = 'recent' AND o.lifecycle_state = 'stored' ORDER BY e.received_at DESC, e.id DESC LIMIT 3 FOR UPDATE OF e, o",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -575,7 +575,7 @@ async fn schedule_raw_retention_with_enforcement(
     }
     let oldest = recent.last().ok_or(UsageError::Internal)?;
     let current_is_newer: bool = sqlx::query_scalar(
-        "SELECT (current.received_at, current.id) > (oldest.received_at, oldest.id) FROM crash_events current JOIN crash_events oldest ON oldest.id::text = $4 AND oldest.organization_id = current.organization_id AND oldest.project_id = current.project_id WHERE current.id::text = $1 AND current.organization_id::text = $2 AND current.project_id::text = $3",
+        "SELECT (current.received_at, current.id) > (oldest.received_at, oldest.id) FROM crash_events current JOIN crash_events oldest ON oldest.id = $4::uuid AND oldest.organization_id = current.organization_id AND oldest.project_id = current.project_id WHERE current.id = $1::uuid AND current.organization_id = $2::uuid AND current.project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -628,7 +628,7 @@ pub(crate) async fn record_raw_deleted(
     byte_size: i64,
 ) -> Result<(), UsageError> {
     let event = sqlx::query(
-        "SELECT usage_outcome, raw_retention_class, raw_sampling_rate FROM crash_events WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+        "SELECT usage_outcome, raw_retention_class, raw_sampling_rate FROM crash_events WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid FOR UPDATE",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -676,7 +676,7 @@ pub(crate) async fn record_raw_deleted(
         .map_err(|_| UsageError::Unavailable)?;
     }
     sqlx::query(
-        "UPDATE crash_event_objects SET lifecycle_state = 'discarded', deleted_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lifecycle_state IN ('deleting', 'discarded')",
+        "UPDATE crash_event_objects SET lifecycle_state = 'discarded', deleted_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lifecycle_state IN ('deleting', 'discarded')",
     )
     .bind(object_id)
     .bind(organization_id)
@@ -685,7 +685,7 @@ pub(crate) async fn record_raw_deleted(
     .await
     .map_err(|_| UsageError::Unavailable)?;
     sqlx::query(
-        "UPDATE crash_events SET raw_retention_class = CASE WHEN raw_retention_class = 'expired' THEN 'expired' ELSE 'discarded' END WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE crash_events SET raw_retention_class = CASE WHEN raw_retention_class = 'expired' THEN 'expired' ELSE 'discarded' END WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -767,7 +767,7 @@ async fn load_usage_view(
     can_edit: bool,
 ) -> Result<UsageView, UsageError> {
     let row = sqlx::query(
-        "SELECT p.version, p.event_limit, p.artifact_storage_limit_bytes, p.project_limit, p.normalized_retention_limit_days, p.raw_retention_limit_days, p.normalized_retention_days, p.raw_retention_days, p.courtesy_percent, p.spend_cap_cents, p.retain_all_raw, to_char(current.cycle_start, 'YYYY-MM-DD') AS cycle_start, to_char((current.cycle_start + interval '1 month')::date, 'YYYY-MM-DD') AS cycle_end, COALESCE(c.accepted_events, 0)::bigint AS accepted_events, COALESCE(c.accepted_raw_bytes, 0)::bigint AS accepted_raw_bytes, COALESCE(c.accepted_symbol_bytes, 0)::bigint AS accepted_symbol_bytes, COALESCE(c.deleted_raw_bytes, 0)::bigint AS deleted_raw_bytes, COALESCE(c.sampled_raw_events, 0)::bigint AS sampled_raw_events, COALESCE(c.estimated_represented_events, 0)::bigint AS estimated_represented_events, (SELECT COALESCE(sum(o.byte_size), 0)::bigint FROM crash_event_objects o WHERE o.organization_id = p.organization_id AND o.project_id = p.project_id AND o.lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = p.organization_id AND m.project_id = p.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS symbol_storage_bytes, (SELECT count(*) FROM projects projects WHERE projects.organization_id = p.organization_id) AS organization_projects FROM project_usage_policies p CROSS JOIN LATERAL (SELECT date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC')::date AS cycle_start) current LEFT JOIN usage_cycle_counters c ON c.organization_id = p.organization_id AND c.project_id = p.project_id AND c.cycle_start = current.cycle_start WHERE p.organization_id::text = $1 AND p.project_id::text = $2",
+        "SELECT p.version, p.event_limit, p.artifact_storage_limit_bytes, p.project_limit, p.normalized_retention_limit_days, p.raw_retention_limit_days, p.normalized_retention_days, p.raw_retention_days, p.courtesy_percent, p.spend_cap_cents, p.retain_all_raw, to_char(current.cycle_start, 'YYYY-MM-DD') AS cycle_start, to_char((current.cycle_start + interval '1 month')::date, 'YYYY-MM-DD') AS cycle_end, COALESCE(c.accepted_events, 0)::bigint AS accepted_events, COALESCE(c.accepted_raw_bytes, 0)::bigint AS accepted_raw_bytes, COALESCE(c.accepted_symbol_bytes, 0)::bigint AS accepted_symbol_bytes, COALESCE(c.deleted_raw_bytes, 0)::bigint AS deleted_raw_bytes, COALESCE(c.sampled_raw_events, 0)::bigint AS sampled_raw_events, COALESCE(c.estimated_represented_events, 0)::bigint AS estimated_represented_events, (SELECT COALESCE(sum(o.byte_size), 0)::bigint FROM crash_event_objects o WHERE o.organization_id = p.organization_id AND o.project_id = p.project_id AND o.lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = p.organization_id AND m.project_id = p.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS symbol_storage_bytes, (SELECT count(*) FROM projects projects WHERE projects.organization_id = p.organization_id) AS organization_projects FROM project_usage_policies p CROSS JOIN LATERAL (SELECT date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC')::date AS cycle_start) current LEFT JOIN usage_cycle_counters c ON c.organization_id = p.organization_id AND c.project_id = p.project_id AND c.cycle_start = current.cycle_start WHERE p.organization_id = $1::uuid AND p.project_id = $2::uuid",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -822,7 +822,7 @@ async fn lock_policy(
     project_id: &str,
 ) -> Result<UsagePolicy, UsageError> {
     sqlx::query(
-        "INSERT INTO project_usage_policies (organization_id, project_id) SELECT organization_id, id FROM projects WHERE organization_id::text = $1 AND id::text = $2 ON CONFLICT DO NOTHING",
+        "INSERT INTO project_usage_policies (organization_id, project_id) SELECT organization_id, id FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid ON CONFLICT DO NOTHING",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -831,7 +831,7 @@ async fn lock_policy(
     .map_err(|_| UsageError::Unavailable)?;
     insert_current_policy_version(transaction, organization_id, project_id).await?;
     let row = sqlx::query(
-        "SELECT version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw FROM project_usage_policies WHERE organization_id::text = $1 AND project_id::text = $2 FOR UPDATE",
+        "SELECT version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw FROM project_usage_policies WHERE organization_id = $1::uuid AND project_id = $2::uuid FOR UPDATE",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -848,7 +848,7 @@ async fn insert_current_policy_version(
     project_id: &str,
 ) -> Result<(), UsageError> {
     sqlx::query(
-        "INSERT INTO project_usage_policy_versions (organization_id, project_id, version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw, updated_by_user_id, created_at) SELECT organization_id, project_id, version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw, updated_by_user_id, updated_at FROM project_usage_policies WHERE organization_id::text = $1 AND project_id::text = $2 ON CONFLICT DO NOTHING",
+        "INSERT INTO project_usage_policy_versions (organization_id, project_id, version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw, updated_by_user_id, created_at) SELECT organization_id, project_id, version, event_limit, artifact_storage_limit_bytes, project_limit, normalized_retention_limit_days, raw_retention_limit_days, normalized_retention_days, raw_retention_days, courtesy_percent, spend_cap_cents, retain_all_raw, updated_by_user_id, updated_at FROM project_usage_policies WHERE organization_id = $1::uuid AND project_id = $2::uuid ON CONFLICT DO NOTHING",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -960,7 +960,7 @@ async fn set_retention_class(
     class: &str,
 ) -> Result<(), UsageError> {
     sqlx::query(
-        "UPDATE crash_events SET raw_retention_class = $4 WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE crash_events SET raw_retention_class = $4 WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(organization_id)
@@ -981,7 +981,7 @@ async fn enqueue_raw_deletion(
     class: &str,
 ) -> Result<(), UsageError> {
     let updated = sqlx::query(
-        "UPDATE crash_event_objects SET lifecycle_state = 'deleting' WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lifecycle_state = 'stored'",
+        "UPDATE crash_event_objects SET lifecycle_state = 'deleting' WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lifecycle_state = 'stored'",
     )
     .bind(object_id)
     .bind(organization_id)
@@ -1012,7 +1012,7 @@ async fn retained_artifact_bytes(
     project_id: &str,
 ) -> Result<i64, UsageError> {
     sqlx::query_scalar(
-        "SELECT (SELECT COALESCE(sum(byte_size), 0)::bigint FROM crash_event_objects WHERE organization_id::text = $1 AND project_id::text = $2 AND lifecycle_state IN ('stored', 'deleting')) + (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id::text = $1 AND m.project_id::text = $2 AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects)",
+        "SELECT (SELECT COALESCE(sum(byte_size), 0)::bigint FROM crash_event_objects WHERE organization_id = $1::uuid AND project_id = $2::uuid AND lifecycle_state IN ('stored', 'deleting')) + (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects)",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -1193,7 +1193,7 @@ mod tests {
         assert_eq!(unchanged.status(), StatusCode::OK);
         assert_eq!(response_json(unchanged).await?["policy_version"], 2);
         let versions: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM project_usage_policy_versions WHERE organization_id::text = $1 AND project_id::text = $2",
+            "SELECT count(*) FROM project_usage_policy_versions WHERE organization_id = $1::uuid AND project_id = $2::uuid",
         )
         .bind(&organization_id)
         .bind(&project_id)
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(versions, 2);
 
         sqlx::query(
-            "UPDATE organization_memberships SET role = 'admin' WHERE organization_id::text = $1 AND user_id::text = $2",
+            "UPDATE organization_memberships SET role = 'admin' WHERE organization_id = $1::uuid AND user_id = $2::uuid",
         )
         .bind(&organization_id)
         .bind(&user_id)
@@ -1319,7 +1319,7 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         sqlx::query(
-            "UPDATE crash_events SET grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $4, variant_fingerprint = $5, grouping_quality = 100, grouped_at = now(), issue_id = $6::uuid WHERE organization_id::text = $1 AND project_id::text = $2 AND id::text = ANY($3::text[])",
+            "UPDATE crash_events SET grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $4, variant_fingerprint = $5, grouping_quality = 100, grouped_at = now(), issue_id = $6::uuid WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = ANY(ARRAY(SELECT value::uuid FROM unnest($3::text[]) AS values(value)))",
         )
         .bind(&organization_id)
         .bind(&project_id)
@@ -1353,7 +1353,7 @@ mod tests {
         transaction.commit().await?;
 
         let rows = sqlx::query(
-            "SELECT e.id::text AS event_id, e.raw_retention_class, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id WHERE e.project_id::text = $1 ORDER BY e.received_at, e.id",
+            "SELECT e.id::text AS event_id, e.raw_retention_class, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id WHERE e.project_id = $1::uuid ORDER BY e.received_at, e.id",
         )
         .bind(&project_id)
         .fetch_all(&pool)
@@ -1368,7 +1368,7 @@ mod tests {
         assert_eq!(rows[4].get::<String, _>("raw_retention_class"), "recent");
         assert_eq!(rows[1].get::<String, _>("lifecycle_state"), "deleting");
         let deletion_jobs: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM jobs WHERE project_id::text = $1 AND job_type = 'delete_raw' AND priority = 50",
+            "SELECT count(*) FROM jobs WHERE project_id = $1::uuid AND job_type = 'delete_raw' AND priority = 50",
         )
         .bind(&project_id)
         .fetch_one(&pool)
@@ -1377,7 +1377,7 @@ mod tests {
 
         let repeated_event_id = rows[1].get::<String, _>("event_id");
         let repeated_object_id: String =
-            sqlx::query_scalar("SELECT raw_object_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT raw_object_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&repeated_event_id)
                 .fetch_one(&pool)
                 .await?;
@@ -1398,7 +1398,7 @@ mod tests {
 
         let expired_event_id = &event_ids[2];
         let expired_object_id: String = sqlx::query_scalar(
-            "WITH event AS (UPDATE crash_events SET raw_retention_class = 'expired' WHERE id::text = $1 RETURNING raw_object_id) UPDATE crash_event_objects o SET lifecycle_state = 'deleting' FROM event WHERE o.id = event.raw_object_id RETURNING o.id::text",
+            "WITH event AS (UPDATE crash_events SET raw_retention_class = 'expired' WHERE id = $1::uuid RETURNING raw_object_id) UPDATE crash_event_objects o SET lifecycle_state = 'deleting' FROM event WHERE o.id = event.raw_object_id RETURNING o.id::text",
         )
         .bind(expired_event_id)
         .fetch_one(&pool)
@@ -1417,7 +1417,7 @@ mod tests {
         transaction.commit().await?;
 
         let counters = sqlx::query(
-            "SELECT accepted_symbol_bytes, deleted_raw_bytes, sampled_raw_events, estimated_represented_events FROM usage_cycle_counters WHERE project_id::text = $1",
+            "SELECT accepted_symbol_bytes, deleted_raw_bytes, sampled_raw_events, estimated_represented_events FROM usage_cycle_counters WHERE project_id = $1::uuid",
         )
         .bind(&project_id)
         .fetch_one(&pool)
@@ -1427,7 +1427,7 @@ mod tests {
         assert_eq!(counters.get::<i64, _>("sampled_raw_events"), 1);
         assert_eq!(counters.get::<i64, _>("estimated_represented_events"), 100);
         let classes = sqlx::query(
-            "SELECT e.id::text AS event_id, e.raw_retention_class, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id WHERE e.id::text = ANY($1::text[])",
+            "SELECT e.id::text AS event_id, e.raw_retention_class, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id WHERE e.id = ANY(ARRAY(SELECT value::uuid FROM unnest($1::text[]) AS values(value)))",
         )
         .bind(vec![expired_event_id.clone(), repeated_event_id.clone()])
         .fetch_all(&pool)

@@ -28,7 +28,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::net::lookup_host;
 use tracing::{info, warn};
 
-use crate::project_setup::{ServerState, StartupError};
+use crate::{
+    identifiers::valid_uuid,
+    project_setup::{ServerState, StartupError},
+};
 
 const MAX_NAME_BYTES: usize = 80;
 const MAX_ENVIRONMENT_BYTES: usize = 32;
@@ -344,7 +347,7 @@ pub(crate) async fn get_alerts(
     .await?;
     let pool = state.control_pool().ok_or(AlertError::Unavailable)?;
     let integration_rows = sqlx::query(
-        "SELECT id::text AS id, kind, name, recipient_user_id::text AS recipient_user_id, endpoint_host, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM alert_integrations WHERE organization_id::text = $1 AND project_id::text = $2 ORDER BY created_at, id",
+        "SELECT id::text AS id, kind, name, recipient_user_id::text AS recipient_user_id, endpoint_host, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM alert_integrations WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY created_at, id",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -352,7 +355,7 @@ pub(crate) async fn get_alerts(
     .await
     .map_err(|_| AlertError::Unavailable)?;
     let rule_rows = sqlx::query(
-        "SELECT id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM alert_rules WHERE organization_id::text = $1 AND project_id::text = $2 ORDER BY created_at, id",
+        "SELECT id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY created_at, id",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -360,7 +363,7 @@ pub(crate) async fn get_alerts(
     .await
     .map_err(|_| AlertError::Unavailable)?;
     let condition_rows = sqlx::query(
-        "SELECT rule_id::text AS rule_id, scope_key, state, generation, payload, to_char(transitioned_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS transitioned_at FROM alert_condition_states WHERE organization_id::text = $1 AND project_id::text = $2 ORDER BY transitioned_at DESC LIMIT 100",
+        "SELECT rule_id::text AS rule_id, scope_key, state, generation, payload, to_char(transitioned_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS transitioned_at FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY transitioned_at DESC LIMIT 100",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -368,7 +371,7 @@ pub(crate) async fn get_alerts(
     .await
     .map_err(|_| AlertError::Unavailable)?;
     let delivery_rows = sqlx::query(
-        "SELECT id::text AS id, integration_id::text AS integration_id, rule_id::text AS rule_id, scope_key, generation, transition, state, attempt, failure_code, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN delivered_at IS NULL THEN NULL ELSE to_char(delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS delivered_at FROM alert_deliveries WHERE organization_id::text = $1 AND project_id::text = $2 ORDER BY created_at DESC, id DESC LIMIT 100",
+        "SELECT id::text AS id, integration_id::text AS integration_id, rule_id::text AS rule_id, scope_key, generation, transition, state, attempt, failure_code, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN delivered_at IS NULL THEN NULL ELSE to_char(delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS delivered_at FROM alert_deliveries WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY created_at DESC, id DESC LIMIT 100",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -550,7 +553,7 @@ pub(crate) async fn update_integration(
     }
     let pool = state.control_pool().ok_or(AlertError::Unavailable)?;
     let current = sqlx::query(
-        "SELECT kind, name, encrypted_config, config_nonce FROM alert_integrations WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "SELECT kind, name, encrypted_config, config_nonce FROM alert_integrations WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(&integration_id)
     .bind(&actor.organization_id)
@@ -612,7 +615,7 @@ pub(crate) async fn update_integration(
     }
     let mut transaction = pool.begin().await.map_err(|_| AlertError::Unavailable)?;
     let row = sqlx::query(
-        "UPDATE alert_integrations SET name = $4, enabled = COALESCE($5, enabled), endpoint_host = COALESCE($6, endpoint_host), encrypted_config = $7, config_nonce = $8, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING id::text AS id, kind, name, recipient_user_id::text AS recipient_user_id, endpoint_host, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        "UPDATE alert_integrations SET name = $4, enabled = COALESCE($5, enabled), endpoint_host = COALESCE($6, endpoint_host), encrypted_config = $7, config_nonce = $8, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS id, kind, name, recipient_user_id::text AS recipient_user_id, endpoint_host, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
     )
     .bind(&integration_id)
     .bind(&actor.organization_id)
@@ -675,7 +678,7 @@ pub(crate) async fn create_rule(
     let pool = state.control_pool().ok_or(AlertError::Unavailable)?;
     let mut transaction = pool.begin().await.map_err(|_| AlertError::Unavailable)?;
     let row = sqlx::query(
-        "INSERT INTO alert_rules (organization_id, project_id, integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, created_by_user_id) SELECT $1::uuid, $2::uuid, i.id, $4, $5, $6, $7, $8, $9, $10::uuid FROM alert_integrations i WHERE i.id::text = $3 AND i.organization_id::text = $1 AND i.project_id::text = $2 RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        "INSERT INTO alert_rules (organization_id, project_id, integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, created_by_user_id) SELECT $1::uuid, $2::uuid, i.id, $4, $5, $6, $7, $8, $9, $10::uuid FROM alert_integrations i WHERE i.id = $3::uuid AND i.organization_id = $1::uuid AND i.project_id = $2::uuid RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -737,7 +740,7 @@ pub(crate) async fn update_rule(
     }
     let pool = state.control_pool().ok_or(AlertError::Unavailable)?;
     let current = sqlx::query(
-        "SELECT condition_kind, threshold, window_seconds, quiet_start_minute, quiet_end_minute FROM alert_rules WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "SELECT condition_kind, threshold, window_seconds, quiet_start_minute, quiet_end_minute FROM alert_rules WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(&rule_id)
     .bind(&actor.organization_id)
@@ -774,7 +777,7 @@ pub(crate) async fn update_rule(
     )?;
     let mut transaction = pool.begin().await.map_err(|_| AlertError::Unavailable)?;
     let row = sqlx::query(
-        "UPDATE alert_rules SET enabled = COALESCE($4, enabled), threshold = $5, window_seconds = $6, quiet_start_minute = $7, quiet_end_minute = $8, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        "UPDATE alert_rules SET enabled = COALESCE($4, enabled), threshold = $5, window_seconds = $6, quiet_start_minute = $7, quiet_end_minute = $8, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
     )
     .bind(&rule_id)
     .bind(&actor.organization_id)
@@ -867,7 +870,7 @@ async fn ensure_member(
     user_id: &str,
 ) -> Result<(), AlertError> {
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text = $2)",
+        "SELECT EXISTS(SELECT 1 FROM organization_memberships WHERE organization_id = $1::uuid AND user_id = $2::uuid)",
     )
     .bind(organization_id)
     .bind(user_id)
@@ -1028,17 +1031,6 @@ fn random_uuid() -> Result<String, getrandom::Error> {
         bytes[14],
         bytes[15]
     ))
-}
-
-fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn no_store(status: StatusCode, value: &impl Serialize) -> Response {
@@ -1292,7 +1284,7 @@ async fn evaluate_rule(pool: &PgPool, rule: &RuleEvaluation) -> Result<(), Alert
         .await?;
     }
     let rows = sqlx::query(
-        "SELECT scope_key, payload FROM alert_condition_states WHERE organization_id::text = $1 AND project_id::text = $2 AND rule_id::text = $3 AND state = 'active'",
+        "SELECT scope_key, payload FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND state = 'active'",
     )
     .bind(&rule.organization_id)
     .bind(&rule.project_id)
@@ -1323,7 +1315,7 @@ async fn issue_observations(
 ) -> Result<Vec<Observation>, AlertSchedulerError> {
     let rows = if regression {
         sqlx::query(
-            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i WHERE i.organization_id::text = $1 AND i.project_id::text = $2 AND i.status = 'open' AND i.regression_state = 'regressed' AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.updated_at, i.id LIMIT 1000",
+            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.regression_state = 'regressed' AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.updated_at, i.id LIMIT 1000",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1332,7 +1324,7 @@ async fn issue_observations(
         .await
     } else {
         sqlx::query(
-            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i JOIN alert_rules r ON r.id::text = $4 AND r.organization_id = i.organization_id AND r.project_id = i.project_id WHERE i.organization_id::text = $1 AND i.project_id::text = $2 AND i.status = 'open' AND i.first_seen_at >= r.created_at AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.first_seen_at, i.id LIMIT 1000",
+            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i JOIN alert_rules r ON r.id = $4::uuid AND r.organization_id = i.organization_id AND r.project_id = i.project_id WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.first_seen_at >= r.created_at AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.first_seen_at, i.id LIMIT 1000",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1361,7 +1353,7 @@ async fn volume_observation(
 ) -> Result<Vec<Observation>, AlertSchedulerError> {
     let window = rule.window_seconds.ok_or(AlertSchedulerError::Database)?;
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND environment = $3 AND received_at >= now() - ($4 * interval '1 second')",
+        "SELECT count(*) FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND environment = $3 AND received_at >= now() - ($4 * interval '1 second')",
     )
     .bind(&rule.organization_id)
     .bind(&rule.project_id)
@@ -1387,7 +1379,7 @@ async fn processing_observation(
 ) -> Result<Vec<Observation>, AlertSchedulerError> {
     let count: i64 = if missing_symbols {
         sqlx::query_scalar(
-            "SELECT count(*) FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND environment = $3 AND processing_state = 'awaiting_symbols'",
+            "SELECT count(*) FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND environment = $3 AND processing_state = 'awaiting_symbols'",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1396,7 +1388,7 @@ async fn processing_observation(
         .await
     } else {
         sqlx::query_scalar(
-            "SELECT count(*) FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND environment = $3 AND processing_state IN ('failed', 'quarantined')",
+            "SELECT count(*) FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND environment = $3 AND processing_state IN ('failed', 'quarantined')",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1420,7 +1412,7 @@ async fn silence_observation(
 ) -> Result<Vec<Observation>, AlertSchedulerError> {
     let window = rule.window_seconds.ok_or(AlertSchedulerError::Database)?;
     let silent: bool = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT max(e.received_at) FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.environment = $3), r.created_at) < now() - ($4 * interval '1 second') FROM alert_rules r WHERE r.id::text = $5 AND r.organization_id::text = $1 AND r.project_id::text = $2",
+        "SELECT COALESCE((SELECT max(e.received_at) FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.environment = $3), r.created_at) < now() - ($4 * interval '1 second') FROM alert_rules r WHERE r.id = $5::uuid AND r.organization_id = $1::uuid AND r.project_id = $2::uuid",
     )
     .bind(&rule.organization_id)
     .bind(&rule.project_id)
@@ -1444,7 +1436,7 @@ async fn quota_observation(
     rule: &RuleEvaluation,
 ) -> Result<Vec<Observation>, AlertSchedulerError> {
     let row = sqlx::query(
-        "SELECT COALESCE(c.accepted_events, 0) AS accepted_events, p.event_limit, p.courtesy_percent FROM project_usage_policies p LEFT JOIN usage_cycle_counters c ON c.organization_id = p.organization_id AND c.project_id = p.project_id AND c.cycle_start = date_trunc('month', now() AT TIME ZONE 'UTC')::date WHERE p.organization_id::text = $1 AND p.project_id::text = $2",
+        "SELECT COALESCE(c.accepted_events, 0) AS accepted_events, p.event_limit, p.courtesy_percent FROM project_usage_policies p LEFT JOIN usage_cycle_counters c ON c.organization_id = p.organization_id AND c.project_id = p.project_id AND c.cycle_start = date_trunc('month', now() AT TIME ZONE 'UTC')::date WHERE p.organization_id = $1::uuid AND p.project_id = $2::uuid",
     )
     .bind(&rule.organization_id)
     .bind(&rule.project_id)
@@ -1513,7 +1505,7 @@ async fn transition_condition(
         .await
         .map_err(|_| AlertSchedulerError::Database)?;
     let previous = sqlx::query(
-        "SELECT state, generation FROM alert_condition_states WHERE organization_id::text = $1 AND project_id::text = $2 AND rule_id::text = $3 AND scope_key = $4 FOR UPDATE",
+        "SELECT state, generation FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND scope_key = $4 FOR UPDATE",
     )
     .bind(&rule.organization_id)
     .bind(&rule.project_id)
@@ -1528,7 +1520,7 @@ async fn transition_condition(
         .is_some_and(|row| row.get::<String, _>("state") == next_state)
     {
         sqlx::query(
-            "UPDATE alert_condition_states SET payload = $5, evaluated_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND rule_id::text = $3 AND scope_key = $4",
+            "UPDATE alert_condition_states SET payload = $5, evaluated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND scope_key = $4",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1583,7 +1575,7 @@ async fn transition_condition(
         false
     } else {
         sqlx::query(
-            "UPDATE alert_deliveries SET state = 'suppressed', failure_code = 'quiet_recovered', updated_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND rule_id::text = $3 AND scope_key = $4 AND generation = $5 AND transition = 'triggered' AND state = 'pending' AND available_at > now()",
+            "UPDATE alert_deliveries SET state = 'suppressed', failure_code = 'quiet_recovered', updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND scope_key = $4 AND generation = $5 AND transition = 'triggered' AND state = 'pending' AND available_at > now()",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
@@ -1805,7 +1797,7 @@ async fn deliver_claim(
     delivery: &ClaimedDelivery,
 ) -> Result<(), DeliveryError> {
     let row = sqlx::query(
-        "SELECT i.kind, i.enabled, i.encrypted_config, i.config_nonce, CASE WHEN m.user_id IS NOT NULL THEN u.email END AS recipient_email FROM alert_integrations i LEFT JOIN users u ON u.id = i.recipient_user_id LEFT JOIN organization_memberships m ON m.organization_id = i.organization_id AND m.user_id = u.id WHERE i.id::text = $1 AND i.organization_id::text = $2 AND i.project_id::text = $3",
+        "SELECT i.kind, i.enabled, i.encrypted_config, i.config_nonce, CASE WHEN m.user_id IS NOT NULL THEN u.email END AS recipient_email FROM alert_integrations i LEFT JOIN users u ON u.id = i.recipient_user_id LEFT JOIN organization_memberships m ON m.organization_id = i.organization_id AND m.user_id = u.id WHERE i.id = $1::uuid AND i.organization_id = $2::uuid AND i.project_id = $3::uuid",
     )
     .bind(&delivery.integration_id)
     .bind(&delivery.organization_id)
@@ -2036,7 +2028,7 @@ async fn finish_delivery(
         Err(DeliveryError::Unknown(code)) => ("unknown", Some(code), 0, false),
     };
     let changed = sqlx::query(
-        "UPDATE alert_deliveries SET state = $4, available_at = now() + ($5 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $6, delivered_at = CASE WHEN $7 THEN now() ELSE delivered_at END, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lease_token::text = $8 AND state = 'leased'",
+        "UPDATE alert_deliveries SET state = $4, available_at = now() + ($5 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $6, delivered_at = CASE WHEN $7 THEN now() ELSE delivered_at END, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lease_token = $8::uuid AND state = 'leased'",
     )
     .bind(&delivery.id)
     .bind(&delivery.organization_id)
@@ -2351,7 +2343,7 @@ mod tests {
         .bind(&release_id)
         .fetch_one(&pool)
         .await?;
-        sqlx::query("UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = repeat('a', 64), variant_fingerprint = repeat('c', 64), grouping_quality = 100, grouped_at = now() WHERE id::text = $1")
+        sqlx::query("UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = repeat('a', 64), variant_fingerprint = repeat('c', 64), grouping_quality = 100, grouped_at = now() WHERE id = $1::uuid")
             .bind(&regression_event)
             .bind(&regression_issue)
             .execute(&pool)
@@ -2406,7 +2398,7 @@ mod tests {
         .bind(&first_event)
         .fetch_one(&pool)
         .await?;
-        sqlx::query("UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = repeat('b', 64), variant_fingerprint = repeat('d', 64), grouping_quality = 100, grouped_at = now() WHERE id::text = $1")
+        sqlx::query("UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = repeat('b', 64), variant_fingerprint = repeat('d', 64), grouping_quality = 100, grouped_at = now() WHERE id = $1::uuid")
             .bind(&first_event)
             .bind(&first_issue)
             .execute(&pool)
@@ -2439,7 +2431,7 @@ mod tests {
         .execute(&pool)
         .await?;
         sqlx::query(
-            "UPDATE project_usage_policies SET event_limit = 10 WHERE organization_id::text = $1 AND project_id::text = $2",
+            "UPDATE project_usage_policies SET event_limit = 10 WHERE organization_id = $1::uuid AND project_id = $2::uuid",
         )
         .bind(&organization_id)
         .bind(&project_id)
@@ -2477,13 +2469,13 @@ mod tests {
         assert_eq!(delivery_count(&pool, &project_id).await?, 7);
         assert_eq!(delivery_count(&pool, &other_project).await?, 0);
 
-        sqlx::query("UPDATE crash_events SET issue_id = NULL, grouping_state = 'disabled', fingerprint_algorithm = NULL, fingerprint_version = NULL, fingerprint = NULL, variant_fingerprint = NULL, grouping_quality = NULL, grouped_at = NULL, processing_state = 'processed', state_reason = NULL, received_at = now() - interval '2 hours' WHERE organization_id::text = $1 AND project_id::text = $2")
+        sqlx::query("UPDATE crash_events SET issue_id = NULL, grouping_state = 'disabled', fingerprint_algorithm = NULL, fingerprint_version = NULL, fingerprint = NULL, variant_fingerprint = NULL, grouping_quality = NULL, grouped_at = NULL, processing_state = 'processed', state_reason = NULL, received_at = now() - interval '2 hours' WHERE organization_id = $1::uuid AND project_id = $2::uuid")
             .bind(&organization_id)
             .bind(&project_id)
             .execute(&pool)
             .await?;
         sqlx::query(
-            "DELETE FROM issues WHERE organization_id::text = $1 AND project_id::text = $2",
+            "DELETE FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid",
         )
         .bind(&organization_id)
         .bind(&project_id)
@@ -2499,7 +2491,7 @@ mod tests {
             "silence-recovered",
         )
         .await?;
-        sqlx::query("UPDATE usage_cycle_counters SET accepted_events = 0 WHERE organization_id::text = $1 AND project_id::text = $2")
+        sqlx::query("UPDATE usage_cycle_counters SET accepted_events = 0 WHERE organization_id = $1::uuid AND project_id = $2::uuid")
             .bind(&organization_id)
             .bind(&project_id)
             .execute(&pool)
@@ -2520,7 +2512,7 @@ mod tests {
             Err(DeliveryError::Retryable("destination_retryable")),
         )
         .await?;
-        sqlx::query("UPDATE alert_deliveries SET available_at = CASE WHEN id::text = $1 THEN now() ELSE now() + interval '1 hour' END WHERE state IN ('pending', 'failed')")
+        sqlx::query("UPDATE alert_deliveries SET available_at = CASE WHEN id = $1::uuid THEN now() ELSE now() + interval '1 hour' END WHERE state IN ('pending', 'failed')")
             .bind(&claimed.id)
             .execute(&pool)
             .await?;
@@ -2530,7 +2522,7 @@ mod tests {
         assert_eq!(retried.id, claimed.id);
         finish_delivery(&pool, &retried, Ok(())).await?;
         let state: String = sqlx::query_scalar(
-            "SELECT state FROM alert_deliveries WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+            "SELECT state FROM alert_deliveries WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
         )
         .bind(&retried.id)
         .bind(&organization_id)
@@ -2564,7 +2556,7 @@ mod tests {
         assert_eq!(created["recipient_user_id"], user_id);
         assert!(created.get("signing_secret").is_none());
         let audit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM audit_log WHERE organization_id::text = $1 AND actor_user_id::text = $2 AND action = 'alert_integration.created'",
+            "SELECT count(*) FROM audit_log WHERE organization_id = $1::uuid AND actor_user_id = $2::uuid AND action = 'alert_integration.created'",
         )
         .bind(&organization_id)
         .bind(&user_id)
@@ -2590,7 +2582,7 @@ mod tests {
         .bind(&user_id)
         .fetch_one(&pool)
         .await?;
-        sqlx::query("DELETE FROM organization_memberships WHERE organization_id::text = $1 AND user_id::text = $2")
+        sqlx::query("DELETE FROM organization_memberships WHERE organization_id = $1::uuid AND user_id = $2::uuid")
             .bind(&organization_id)
             .bind(&departing_user)
             .execute(&pool)
@@ -2739,7 +2731,7 @@ mod tests {
     }
 
     async fn delivery_count(pool: &PgPool, project_id: &str) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("SELECT count(*) FROM alert_deliveries WHERE project_id::text = $1")
+        sqlx::query_scalar("SELECT count(*) FROM alert_deliveries WHERE project_id = $1::uuid")
             .bind(project_id)
             .fetch_one(pool)
             .await

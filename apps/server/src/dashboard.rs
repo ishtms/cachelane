@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{crash_ingest::RawObjectError, project_setup::ServerState};
+use crate::{crash_ingest::RawObjectError, identifiers::valid_uuid, project_setup::ServerState};
 
 const DEFAULT_PAGE_SIZE: u16 = 50;
 const MAX_PAGE_SIZE: u16 = 100;
@@ -569,7 +569,7 @@ pub(crate) async fn download_log(
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
     let scope = project_scope(pool, &actor).await?;
     let row = sqlx::query(
-        "SELECT e.crash_guid, r.result FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.id::text = $4",
+        "SELECT e.crash_guid, r.result FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND e.id = $4::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -615,7 +615,7 @@ pub(crate) async fn download_raw(
     let pool = state.control_pool().ok_or(DashboardError::Internal)?;
     let scope = project_scope(pool, &actor).await?;
     let row = sqlx::query(
-        "SELECT o.object_key, o.byte_size, o.checksum FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored' WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.id::text = $4",
+        "SELECT o.object_key, o.byte_size, o.checksum FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored' WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND e.id = $4::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -682,7 +682,7 @@ async fn project_scope(
     actor: &crate::auth::ProjectActor,
 ) -> Result<ProjectScope, DashboardError> {
     let project_slug = sqlx::query_scalar::<_, String>(
-        "SELECT slug FROM projects WHERE organization_id::text = $1 AND id::text = $2",
+        "SELECT slug FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -702,7 +702,7 @@ async fn transaction_scope(
     actor: &crate::auth::ProjectActor,
 ) -> Result<ProjectScope, DashboardError> {
     let project_slug = sqlx::query_scalar::<_, String>(
-        "SELECT slug FROM projects WHERE organization_id::text = $1 AND id::text = $2",
+        "SELECT slug FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -737,7 +737,7 @@ async fn require_issue(
     issue_id: &str,
 ) -> Result<(), DashboardError> {
     let found: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM issues WHERE organization_id::text = $1 AND project_id::text = $2 AND id::text = $3)",
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id = $3::uuid)",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1009,7 +1009,7 @@ async fn load_event_summaries(
     limit: u16,
 ) -> Result<Vec<EventSummary>, DashboardError> {
     let rows = sqlx::query(
-        "SELECT e.id::text AS event_id, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, e.environment, e.processing_state, e.state_reason, e.release_id::text AS release_id, rel.version AS release_version, s.crash_type, s.platform, s.architecture, s.engine_version, s.user_comment, e.current_result_id::text AS current_result_id, CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END AS symbolication_state FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND ($4::timestamptz IS NULL OR (e.received_at, e.id) < ($4::timestamptz, $5::uuid)) ORDER BY e.received_at DESC, e.id DESC LIMIT $6",
+        "SELECT e.id::text AS event_id, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, e.environment, e.processing_state, e.state_reason, e.release_id::text AS release_id, rel.version AS release_version, s.crash_type, s.platform, s.architecture, s.engine_version, s.user_comment, e.current_result_id::text AS current_result_id, CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END AS symbolication_state FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND ($4::timestamptz IS NULL OR (e.received_at, e.id) < ($4::timestamptz, $5::uuid)) ORDER BY e.received_at DESC, e.id DESC LIMIT $6",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1093,7 +1093,7 @@ async fn load_event_facets(
     issue_id: &str,
 ) -> Result<EventFacets, DashboardError> {
     let releases = sqlx::query(
-        "SELECT COALESCE(rel.id::text, 'unmapped') AS key, COALESCE(rel.version, 'Unmapped') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY rel.id, rel.version ORDER BY count DESC, label, key LIMIT 21",
+        "SELECT COALESCE(rel.id::text, 'unmapped') AS key, COALESCE(rel.version, 'Unmapped') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY rel.id, rel.version ORDER BY count DESC, label, key LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1103,7 +1103,7 @@ async fn load_event_facets(
     .map_err(|_| DashboardError::Internal)?;
     let (releases, releases_truncated, releases_other_count) = distribution_rows(&releases);
     let platforms = sqlx::query(
-        "SELECT COALESCE(s.platform, 'unknown') AS key, initcap(COALESCE(s.platform, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
+        "SELECT COALESCE(s.platform, 'unknown') AS key, initcap(COALESCE(s.platform, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1113,7 +1113,7 @@ async fn load_event_facets(
     .map_err(|_| DashboardError::Internal)?;
     let (platforms, platforms_truncated, platforms_other_count) = distribution_rows(&platforms);
     let architectures = sqlx::query(
-        "SELECT COALESCE(s.architecture, 'unknown') AS key, COALESCE(s.architecture, 'Unknown') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
+        "SELECT COALESCE(s.architecture, 'unknown') AS key, COALESCE(s.architecture, 'Unknown') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1124,7 +1124,7 @@ async fn load_event_facets(
     let (architectures, architectures_truncated, architectures_other_count) =
         distribution_rows(&architectures);
     let environments = sqlx::query(
-        "SELECT environment AS key, initcap(environment) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3 GROUP BY environment ORDER BY count DESC, environment LIMIT 21",
+        "SELECT environment AS key, initcap(environment) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid GROUP BY environment ORDER BY count DESC, environment LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1135,7 +1135,7 @@ async fn load_event_facets(
     let (environments, environments_truncated, environments_other_count) =
         distribution_rows(&environments);
     let crash_types = sqlx::query(
-        "SELECT COALESCE(s.crash_type, 'unknown') AS key, initcap(COALESCE(s.crash_type, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
+        "SELECT COALESCE(s.crash_type, 'unknown') AS key, initcap(COALESCE(s.crash_type, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1146,7 +1146,7 @@ async fn load_event_facets(
     let (crash_types, crash_types_truncated, crash_types_other_count) =
         distribution_rows(&crash_types);
     let processing_states = sqlx::query(
-        "SELECT processing_state AS key, initcap(replace(processing_state, '_', ' ')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3 GROUP BY processing_state ORDER BY count DESC, processing_state LIMIT 21",
+        "SELECT processing_state AS key, initcap(replace(processing_state, '_', ' ')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid GROUP BY processing_state ORDER BY count DESC, processing_state LIMIT 21",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1157,7 +1157,7 @@ async fn load_event_facets(
     let (processing_states, processing_states_truncated, processing_states_other_count) =
         distribution_rows(&processing_states);
     let context_rows = sqlx::query(
-        "WITH counts AS (SELECT f.key, f.value, bool_or(f.value_truncated) AS value_truncated, count(*) AS count FROM crash_events e JOIN crash_event_context_facets f ON f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY f.key, f.value), ranked AS (SELECT key, value, value_truncated, count, row_number() OVER (PARTITION BY key ORDER BY count DESC, value) AS rank, sum(count) OVER (PARTITION BY key)::bigint AS total_count FROM counts) SELECT key, value, value_truncated, count, total_count FROM ranked WHERE rank <= 21 ORDER BY key, rank",
+        "WITH counts AS (SELECT f.key, f.value, bool_or(f.value_truncated) AS value_truncated, count(*) AS count FROM crash_events e JOIN crash_event_context_facets f ON f.organization_id = e.organization_id AND f.project_id = e.project_id AND f.event_id = e.id AND f.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY f.key, f.value), ranked AS (SELECT key, value, value_truncated, count, row_number() OVER (PARTITION BY key ORDER BY count DESC, value) AS rank, sum(count) OVER (PARTITION BY key)::bigint AS total_count FROM counts) SELECT key, value, value_truncated, count, total_count FROM ranked WHERE rank <= 21 ORDER BY key, rank",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1234,7 +1234,7 @@ async fn load_event_detail(
     raw_artifact_download_enabled: bool,
 ) -> Result<EventDetail, DashboardError> {
     let row = sqlx::query(
-        "SELECT e.id::text AS event_id, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, e.environment, e.processing_state, e.state_reason, e.crash_guid, e.release_mapping_state, e.release_id::text AS release_id, rel.version AS release_version, rel.platform AS release_platform, rel.architecture AS release_architecture, rel.configuration AS release_configuration, e.current_result_id::text AS current_result_id, r.result, r.result #>> '{crash_context,crash_type}' AS crash_type, r.result #>> '{crash_context,platform,normalized}' AS platform, r.result #>> '{crash_context,architecture}' AS architecture, r.result #>> '{crash_context,engine_version}' AS engine_version, r.result #>> '{crash_context,user_comment}' AS user_comment, CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') AND jsonb_path_exists(r.result, '$.current.symbolication.modules[*] ? (@.status == \"missing_pe\" || @.status == \"missing_pdb\" || @.status == \"mismatched\" || @.status == \"missing_identity\")') THEN 'partial' WHEN r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') THEN 'readable' WHEN e.processing_state = 'awaiting_symbols' OR (r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.modules[*] ? (@.status == \"missing_pe\" || @.status == \"missing_pdb\" || @.status == \"mismatched\" || @.status == \"missing_identity\")')) THEN 'missing' ELSE 'processing' END AS symbolication_state, EXISTS(SELECT 1 FROM crash_event_objects o WHERE o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored') AS raw_available FROM crash_events e LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.id::text = $4",
+        "SELECT e.id::text AS event_id, to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS received_at, e.environment, e.processing_state, e.state_reason, e.crash_guid, e.release_mapping_state, e.release_id::text AS release_id, rel.version AS release_version, rel.platform AS release_platform, rel.architecture AS release_architecture, rel.configuration AS release_configuration, e.current_result_id::text AS current_result_id, r.result, r.result #>> '{crash_context,crash_type}' AS crash_type, r.result #>> '{crash_context,platform,normalized}' AS platform, r.result #>> '{crash_context,architecture}' AS architecture, r.result #>> '{crash_context,engine_version}' AS engine_version, r.result #>> '{crash_context,user_comment}' AS user_comment, CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') AND jsonb_path_exists(r.result, '$.current.symbolication.modules[*] ? (@.status == \"missing_pe\" || @.status == \"missing_pdb\" || @.status == \"mismatched\" || @.status == \"missing_identity\")') THEN 'partial' WHEN r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.threads[*].frames[*] ? (@.symbol_status == \"resolved\")') THEN 'readable' WHEN e.processing_state = 'awaiting_symbols' OR (r.result IS NOT NULL AND jsonb_path_exists(r.result, '$.current.symbolication.modules[*] ? (@.status == \"missing_pe\" || @.status == \"missing_pdb\" || @.status == \"mismatched\" || @.status == \"missing_identity\")')) THEN 'missing' ELSE 'processing' END AS symbolication_state, EXISTS(SELECT 1 FROM crash_event_objects o WHERE o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored') AS raw_available FROM crash_events e LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id LEFT JOIN releases rel ON rel.id = e.release_id AND rel.organization_id = e.organization_id AND rel.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND e.id = $4::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1246,7 +1246,7 @@ async fn load_event_detail(
     .ok_or(DashboardError::NotFound)?;
     let event = event_summary(&row, &scope.project_id, issue_id);
     let candidate_rows = sqlx::query(
-        "SELECT release_id::text AS release_id FROM crash_event_release_candidates WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY release_id LIMIT 101",
+        "SELECT release_id::text AS release_id FROM crash_event_release_candidates WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid ORDER BY release_id LIMIT 101",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1682,7 +1682,7 @@ async fn load_processing_history(
     current_result_id: Option<&str>,
 ) -> Result<ProcessingHistory, DashboardError> {
     let result_rows = sqlx::query(
-        "SELECT id::text AS result_id, schema_version, processing_version, data_rules_version, checksum, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM crash_processing_results WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY created_at DESC, id DESC LIMIT 51",
+        "SELECT id::text AS result_id, schema_version, processing_version, data_rules_version, checksum, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at FROM crash_processing_results WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid ORDER BY created_at DESC, id DESC LIMIT 51",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1708,7 +1708,7 @@ async fn load_processing_history(
         })
         .collect();
     let request_rows = sqlx::query(
-        "SELECT q.id::text AS request_id, q.source, x.state, x.failure_code, to_char(x.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN x.completed_at IS NULL THEN NULL ELSE to_char(x.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS completed_at FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests q ON q.id = x.request_id AND q.organization_id = x.organization_id AND q.project_id = x.project_id WHERE x.organization_id::text = $1 AND x.project_id::text = $2 AND x.event_id::text = $3 ORDER BY x.created_at DESC, q.id DESC LIMIT 51",
+        "SELECT q.id::text AS request_id, q.source, x.state, x.failure_code, to_char(x.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN x.completed_at IS NULL THEN NULL ELSE to_char(x.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS completed_at FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests q ON q.id = x.request_id AND q.organization_id = x.organization_id AND q.project_id = x.project_id WHERE x.organization_id = $1::uuid AND x.project_id = $2::uuid AND x.event_id = $3::uuid ORDER BY x.created_at DESC, q.id DESC LIMIT 51",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1779,17 +1779,6 @@ fn truncate_text(value: &str, maximum: usize) -> (String, bool) {
         end = end.saturating_sub(1);
     }
     (value[..end].to_owned(), true)
-}
-
-fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn symbolication_success_percent(readable: i64, partial: i64, missing: i64) -> Option<f64> {

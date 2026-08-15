@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
 
-use crate::project_setup::ServerState;
+use crate::{identifiers::valid_uuid, project_setup::ServerState};
 
 const DEFAULT_REQUEST_LIMIT: u16 = 100;
 const MAX_REQUEST_LIMIT: u16 = 1_000;
@@ -165,7 +165,7 @@ pub(crate) async fn create_request(
     let scope = project_scope(&mut transaction, &actor).await?;
 
     if let Some(row) = sqlx::query(
-        "SELECT id::text AS request_id, scope_fingerprint FROM crash_reprocessing_requests WHERE organization_id::text = $1 AND project_id::text = $2 AND source = 'manual' AND idempotency_digest = $3",
+        "SELECT id::text AS request_id, scope_fingerprint FROM crash_reprocessing_requests WHERE organization_id = $1::uuid AND project_id = $2::uuid AND source = 'manual' AND idempotency_digest = $3",
     )
     .bind(&scope.organization)
     .bind(&scope.project)
@@ -188,7 +188,7 @@ pub(crate) async fn create_request(
     }
 
     let active: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM crash_reprocessing_requests WHERE organization_id::text = $1 AND project_id::text = $2 AND source = 'manual' AND state IN ('pending', 'scheduling', 'running')",
+        "SELECT count(*) FROM crash_reprocessing_requests WHERE organization_id = $1::uuid AND project_id = $2::uuid AND source = 'manual' AND state IN ('pending', 'scheduling', 'running')",
     )
     .bind(&scope.organization)
     .bind(&scope.project)
@@ -201,7 +201,7 @@ pub(crate) async fn create_request(
 
     if let Some(cursor) = request.cursor.as_deref() {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM crash_events WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3)",
+            "SELECT EXISTS (SELECT 1 FROM crash_events WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid)",
         )
         .bind(cursor)
         .bind(&scope.organization)
@@ -287,7 +287,7 @@ pub(crate) async fn enqueue_artifact_request(
     manifest_id: &str,
 ) -> Result<(), sqlx::Error> {
     let checksum: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT m.checksum FROM release_manifest_artifacts m JOIN releases r ON r.id = m.release_id AND r.organization_id = m.organization_id AND r.project_id = m.project_id WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' FOR NO KEY UPDATE OF r",
+        "SELECT m.checksum FROM release_manifest_artifacts m JOIN releases r ON r.id = m.release_id AND r.organization_id = m.organization_id AND r.project_id = m.project_id WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available' FOR NO KEY UPDATE OF r",
     )
     .bind(manifest_id)
     .bind(organization_id)
@@ -304,7 +304,7 @@ pub(crate) async fn enqueue_artifact_request(
     digest.update(checksum);
     let digest: [u8; 32] = digest.finalize().into();
     sqlx::query(
-        "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, selection_before) SELECT m.organization_id, m.project_id, 'automatic', 'artifact', m.id::text, $4, $4, clock_timestamp() FROM release_manifest_artifacts m WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' ON CONFLICT (organization_id, project_id, source, idempotency_digest) DO NOTHING",
+        "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, selection_before) SELECT m.organization_id, m.project_id, 'automatic', 'artifact', m.id::text, $4, $4, clock_timestamp() FROM release_manifest_artifacts m WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available' ON CONFLICT (organization_id, project_id, source, idempotency_digest) DO NOTHING",
     )
     .bind(manifest_id)
     .bind(organization_id)
@@ -323,7 +323,7 @@ pub(crate) async fn enqueue_waiter_catchup_requests(
     result_id: &str,
 ) -> Result<(), sqlx::Error> {
     let release_id: Option<String> = sqlx::query_scalar(
-        "SELECT r.id::text FROM crash_symbol_waiters w JOIN releases r ON r.id = w.release_id AND r.organization_id = w.organization_id AND r.project_id = w.project_id WHERE w.organization_id::text = $1 AND w.project_id::text = $2 AND w.event_id::text = $3 AND w.result_id::text = $4 ORDER BY r.id LIMIT 1 FOR NO KEY UPDATE OF r",
+        "SELECT r.id::text FROM crash_symbol_waiters w JOIN releases r ON r.id = w.release_id AND r.organization_id = w.organization_id AND r.project_id = w.project_id WHERE w.organization_id = $1::uuid AND w.project_id = $2::uuid AND w.event_id = $3::uuid AND w.result_id = $4::uuid ORDER BY r.id LIMIT 1 FOR NO KEY UPDATE OF r",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -335,7 +335,7 @@ pub(crate) async fn enqueue_waiter_catchup_requests(
         return Ok(());
     };
     let manifest_id: Option<String> = sqlx::query_scalar(
-        "SELECT m.id::text FROM crash_symbol_waiters w JOIN release_manifest_artifacts m ON m.organization_id = w.organization_id AND m.project_id = w.project_id AND m.release_id = w.release_id WHERE w.organization_id::text = $1 AND w.project_id::text = $2 AND w.event_id::text = $3 AND w.result_id::text = $4 AND w.release_id::text = $5 AND m.state = 'available' AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) ORDER BY m.id LIMIT 1",
+        "SELECT m.id::text FROM crash_symbol_waiters w JOIN release_manifest_artifacts m ON m.organization_id = w.organization_id AND m.project_id = w.project_id AND m.release_id = w.release_id WHERE w.organization_id = $1::uuid AND w.project_id = $2::uuid AND w.event_id = $3::uuid AND w.result_id = $4::uuid AND w.release_id = $5::uuid AND m.state = 'available' AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) ORDER BY m.id LIMIT 1",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -349,7 +349,7 @@ pub(crate) async fn enqueue_waiter_catchup_requests(
     };
     let digest: [u8; 32] = Sha256::digest(format!("waiter-v1:{manifest_id}:{result_id}")).into();
     sqlx::query(
-        "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, selection_before) SELECT m.organization_id, m.project_id, 'automatic', 'artifact', m.id::text, $4, $4, clock_timestamp() FROM release_manifest_artifacts m WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' ON CONFLICT (organization_id, project_id, source, idempotency_digest) DO NOTHING",
+        "INSERT INTO crash_reprocessing_requests (organization_id, project_id, source, scope_kind, scope_value, scope_fingerprint, idempotency_digest, selection_before) SELECT m.organization_id, m.project_id, 'automatic', 'artifact', m.id::text, $4, $4, clock_timestamp() FROM release_manifest_artifacts m WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available' ON CONFLICT (organization_id, project_id, source, idempotency_digest) DO NOTHING",
     )
     .bind(&manifest_id)
     .bind(organization_id)
@@ -449,7 +449,7 @@ async fn project_scope(
     actor: &crate::auth::ProjectActor,
 ) -> Result<ProjectScope, ReprocessingError> {
     let found = sqlx::query_scalar::<_, String>(
-        "SELECT id::text FROM projects WHERE organization_id::text = $1 AND id::text = $2 FOR UPDATE",
+        "SELECT id::text FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid FOR UPDATE",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -478,7 +478,7 @@ async fn load_request(
     request_id: &str,
 ) -> Result<RequestView, ReprocessingError> {
     let row = sqlx::query(
-        "SELECT id::text AS request_id, source, scope_kind, scope_value, state, input_cursor_event_id::text AS cursor, request_limit, selection_complete, selection_truncated, next_cursor_event_id::text AS next_cursor, selected_count, queued_count, running_count, completed_count, failed_count, failure_code, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, CASE WHEN completed_at IS NULL THEN NULL ELSE to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS completed_at FROM crash_reprocessing_requests WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "SELECT id::text AS request_id, source, scope_kind, scope_value, state, input_cursor_event_id::text AS cursor, request_limit, selection_complete, selection_truncated, next_cursor_event_id::text AS next_cursor, selected_count, queued_count, running_count, completed_count, failed_count, failure_code, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, CASE WHEN completed_at IS NULL THEN NULL ELSE to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS completed_at FROM crash_reprocessing_requests WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(request_id)
     .bind(&scope.organization)
@@ -488,7 +488,7 @@ async fn load_request(
     .map_err(|_| ReprocessingError::Internal)?
     .ok_or(ReprocessingError::NotFound)?;
     let mut failures = sqlx::query(
-        "SELECT failure_code AS code, count(*) AS count FROM crash_reprocessing_request_events WHERE request_id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND failure_code IS NOT NULL GROUP BY failure_code ORDER BY count(*) DESC, failure_code LIMIT $4",
+        "SELECT failure_code AS code, count(*) AS count FROM crash_reprocessing_request_events WHERE request_id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND failure_code IS NOT NULL GROUP BY failure_code ORDER BY count(*) DESC, failure_code LIMIT $4",
     )
     .bind(request_id)
     .bind(&scope.organization)
@@ -559,17 +559,6 @@ fn require_version(value: u32) -> Result<(), ReprocessingError> {
     } else {
         Err(ReprocessingError::InvalidRequest)
     }
-}
-
-fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn valid_symbolicator_version(value: &str) -> bool {
@@ -779,7 +768,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("test database must reset: {error}"));
         let project = insert_project(&pool, "local-bootstrap", "race", "race").await;
         let scope = sqlx::query(
-            "SELECT p.organization_id::text AS organization_id, m.user_id::text AS user_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id WHERE p.id::text = $1 AND m.role = 'owner'",
+            "SELECT p.organization_id::text AS organization_id, m.user_id::text AS user_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id WHERE p.id = $1::uuid AND m.role = 'owner'",
         )
         .bind(&project)
         .fetch_one(&pool)
@@ -835,7 +824,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap_or_else(|error| panic!("test result must insert: {error}"));
-        sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id::text = $1")
+        sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id = $1::uuid")
             .bind(&event)
             .bind(&result)
             .execute(&pool)
@@ -869,7 +858,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("artifact transaction must begin: {error}"));
         sqlx::query(
-            "UPDATE release_manifest_artifacts SET state = 'available', uploaded_at = now() WHERE id::text = $1",
+            "UPDATE release_manifest_artifacts SET state = 'available', uploaded_at = now() WHERE id = $1::uuid",
         )
         .bind(&manifest)
         .execute(&mut *artifact_transaction)
@@ -941,7 +930,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("catch-up must finish after publication: {error}"))
             .unwrap_or_else(|error| panic!("catch-up task must succeed: {error}"));
         let requests: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id::text = $1 AND scope_value = $2",
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id = $1::uuid AND scope_value = $2",
         )
         .bind(&project)
         .bind(&manifest)
@@ -959,7 +948,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("race requests must reset: {error}"));
         sqlx::query(
-            "UPDATE release_manifest_artifacts SET state = 'missing', uploaded_at = NULL WHERE id::text = $1",
+            "UPDATE release_manifest_artifacts SET state = 'missing', uploaded_at = NULL WHERE id = $1::uuid",
         )
         .bind(&manifest)
         .execute(&pool)
@@ -971,7 +960,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("delayed artifact transaction must begin: {error}"));
         sqlx::query(
-            "UPDATE release_manifest_artifacts SET state = 'available', uploaded_at = now() WHERE id::text = $1",
+            "UPDATE release_manifest_artifacts SET state = 'available', uploaded_at = now() WHERE id = $1::uuid",
         )
         .bind(&manifest)
         .execute(&mut *delayed_artifact)
@@ -1022,7 +1011,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("delayed artifact must commit: {error}"));
         let waiter_in_snapshot: bool = sqlx::query_scalar(
-            "SELECT w.created_at <= r.selection_before FROM crash_reprocessing_requests r JOIN crash_symbol_waiters w ON w.organization_id = r.organization_id AND w.project_id = r.project_id WHERE r.project_id::text = $1 AND r.scope_value = $2 AND w.event_id::text = $3",
+            "SELECT w.created_at <= r.selection_before FROM crash_reprocessing_requests r JOIN crash_symbol_waiters w ON w.organization_id = r.organization_id AND w.project_id = r.project_id WHERE r.project_id = $1::uuid AND r.scope_value = $2 AND w.event_id = $3::uuid",
         )
         .bind(&project)
         .bind(&manifest)
@@ -1038,7 +1027,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("replacement transaction must begin: {error}"));
         sqlx::query(
-            "UPDATE release_manifest_artifacts SET checksum = $2, state = 'available', uploaded_at = now() WHERE id::text = $1",
+            "UPDATE release_manifest_artifacts SET checksum = $2, state = 'available', uploaded_at = now() WHERE id = $1::uuid",
         )
         .bind(&manifest)
         .bind(replacement_checksum)
@@ -1056,7 +1045,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("replacement artifact must commit: {error}"));
         let replacement_requests: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id::text = $1 AND scope_value = $2",
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id = $1::uuid AND scope_value = $2",
         )
         .bind(&project)
         .bind(&manifest)

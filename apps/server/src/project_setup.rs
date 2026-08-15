@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, migrate::Migrator, postgres::PgPoolOptions};
 use subtle::ConstantTimeEq;
 
+use crate::identifiers::valid_uuid;
+
 const BOOTSTRAP_SUBJECT: &str = "local-bootstrap";
 const INGEST_KEY_PREFIX: &str = "clpk_";
 const INGEST_KEY_BYTES: usize = 32;
@@ -922,6 +924,9 @@ async fn update_ingest_key_policy(
     .map_err(ApiError::from)?;
     let Json(request) = payload.map_err(|_| ApiError::InvalidRequest)?;
     let policy = ValidatedKeyPolicy::try_from(request)?;
+    if state.control_pool().is_some() && !valid_uuid(&key_id) {
+        return Err(ApiError::NotFound);
+    }
     let setup = state
         .store
         .update_key_policy(&actor.actor.user_id, &project_id, &key_id, &policy)
@@ -955,6 +960,9 @@ async fn revoke_ingest_key(
     )
     .await
     .map_err(ApiError::from)?;
+    if state.control_pool().is_some() && !valid_uuid(&key_id) {
+        return Err(ApiError::NotFound);
+    }
     state
         .store
         .revoke_key(&actor.actor.user_id, &project_id, &key_id)
@@ -1390,7 +1398,7 @@ async fn postgres_get_setup(
     project_id: &str,
 ) -> Result<ProjectSetupView, StoreError> {
     let row = sqlx::query(
-        "SELECT (SELECT owner.user_id::text FROM organization_memberships owner WHERE owner.organization_id = o.id AND owner.role = 'owner' ORDER BY owner.created_at, owner.user_id LIMIT 1) AS owner_id, o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, p.id::text AS project_id, p.name AS project_name, p.slug AS project_slug FROM users u JOIN organization_memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id JOIN projects p ON p.organization_id = o.id WHERE u.id::text = $1 AND p.id::text = $2",
+        "SELECT (SELECT owner.user_id::text FROM organization_memberships owner WHERE owner.organization_id = o.id AND owner.role = 'owner' ORDER BY owner.created_at, owner.user_id LIMIT 1) AS owner_id, o.id::text AS organization_id, o.name AS organization_name, o.slug AS organization_slug, p.id::text AS project_id, p.name AS project_name, p.slug AS project_slug FROM users u JOIN organization_memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id JOIN projects p ON p.organization_id = o.id WHERE u.id = $1::uuid AND p.id = $2::uuid",
     )
     .bind(subject)
     .bind(project_id)
@@ -1422,7 +1430,7 @@ async fn postgres_keys(
     project_id: &str,
 ) -> Result<Vec<IngestKeyView>, StoreError> {
     let rows = sqlx::query(
-        "SELECT k.id::text AS id, k.display_suffix, k.environment, k.allowed_cidrs, to_char(k.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN k.revoked_at IS NULL THEN NULL ELSE to_char(k.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS revoked_at FROM project_ingest_keys k JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id::text = $1 AND p.id::text = $2 ORDER BY k.created_at, k.id",
+        "SELECT k.id::text AS id, k.display_suffix, k.environment, k.allowed_cidrs, to_char(k.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, CASE WHEN k.revoked_at IS NULL THEN NULL ELSE to_char(k.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS revoked_at FROM project_ingest_keys k JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id = $1::uuid AND p.id = $2::uuid ORDER BY k.created_at, k.id",
     )
     .bind(subject)
     .bind(project_id)
@@ -1451,7 +1459,7 @@ async fn postgres_rotate_key(
     policy: &ValidatedKeyPolicy,
 ) -> Result<StoredSetup, StoreError> {
     let scope = sqlx::query(
-        "SELECT p.organization_id::text AS organization_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id::text = $1 AND p.id::text = $2",
+        "SELECT p.organization_id::text AS organization_id FROM projects p JOIN organization_memberships m ON m.organization_id = p.organization_id JOIN users u ON u.id = m.user_id WHERE u.id = $1::uuid AND p.id = $2::uuid",
     )
     .bind(subject)
     .bind(project_id)
@@ -1479,7 +1487,7 @@ async fn postgres_update_key_policy(
     policy: &ValidatedKeyPolicy,
 ) -> Result<ProjectSetupView, StoreError> {
     let result = sqlx::query(
-        "UPDATE project_ingest_keys k SET environment = $4, allowed_cidrs = $5 FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id::text = $1 AND p.id::text = $2 AND k.id::text = $3",
+        "UPDATE project_ingest_keys k SET environment = $4, allowed_cidrs = $5 FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id = $1::uuid AND p.id = $2::uuid AND k.id = $3::uuid",
     )
     .bind(subject)
     .bind(project_id)
@@ -1502,7 +1510,7 @@ async fn postgres_revoke_key(
     key_id: &str,
 ) -> Result<(), StoreError> {
     let result = sqlx::query(
-        "UPDATE project_ingest_keys k SET revoked_at = COALESCE(k.revoked_at, now()) FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id::text = $1 AND p.id::text = $2 AND k.id::text = $3",
+        "UPDATE project_ingest_keys k SET revoked_at = COALESCE(k.revoked_at, now()) FROM projects p, organization_memberships m, users u WHERE k.project_id = p.id AND k.organization_id = p.organization_id AND m.organization_id = p.organization_id AND u.id = m.user_id AND u.id = $1::uuid AND p.id = $2::uuid AND k.id = $3::uuid",
     )
     .bind(subject)
     .bind(project_id)
@@ -2320,7 +2328,7 @@ mod tests {
             .unwrap_or_else(|| panic!("created key id must exist"))
             .to_owned();
         let stored_hash: Vec<u8> =
-            sqlx::query_scalar("SELECT secret_hash FROM project_ingest_keys WHERE id::text = $1")
+            sqlx::query_scalar("SELECT secret_hash FROM project_ingest_keys WHERE id = $1::uuid")
                 .bind(&key_id)
                 .fetch_one(&pool)
                 .await
