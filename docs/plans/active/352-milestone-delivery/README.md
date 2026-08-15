@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/352
 
-Status: Implementing after approval on August 15, 2026
+Status: Staged for human review after the approved rollout on August 15, 2026
 
 ## Context
 
@@ -93,6 +93,15 @@ Reducing per-issue remote CI increases the time between remote checks. The mitig
 Roll out the workflow in two stages. First, land and exercise the tracked contract, local skills, and verification scripts on a draft pull request while the existing rules remain active. Second, after the exact head passes local and remote staging evidence, add the Project status and enable rebase in repository settings. Do not weaken existing required checks during the transition.
 
 Use the new workflow for the remaining M1 issues only after the workflow pull request is merged. Existing merged M1 history remains unchanged.
+
+## Rollout evidence
+
+- Local `./scripts/check` passed on the staged implementation and the hosted-fix head, including all 22 PostgreSQL tests, three Windows AddressSanitizer fuzz targets, release builds, smoke, Playwright, and clean-tree verification.
+- The final hosted staging run passed Linux `check`, Windows `windows check`, dependency audit, and dependency review on `b2bcf436b166f90117acadb22f98ef7621ffc734`.
+- Project 4 now preserves its five existing status options and adds `Locally verified` between `In Progress` and `In review`. Workflow issue #352 exercised that transition and is now In review.
+- Repository settings now allow rebase and squash while disallowing merge commits. The main ruleset preserves pull request enforcement, linear history, resolved review threads, strict required checks, deletion protection, and force-push protection.
+- Merged plans for #298, #299, #300, #311, and #346 moved from active to completed with their merged pull request recorded. Closed issue #346 was added to Project 4 as Done.
+- The dirty `feature/delivery-guards` and `feature/m1-delivery-proof` worktrees were not modified or removed.
 
 ## Rollback
 

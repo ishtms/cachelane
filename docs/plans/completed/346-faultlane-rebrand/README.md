@@ -2,7 +2,7 @@
 
 Issue: [#346](https://github.com/ishtms/faultlane/issues/346)
 
-Status: Implemented and verified, awaiting human review.
+Status: Completed through PR #347 on August 14, 2026. No production deployment was performed.
 
 ## Context
 
