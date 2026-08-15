@@ -297,6 +297,7 @@ export default async function ProjectPage({
               maxLength={120}
               placeholder="Arena::Tick or access violation"
             />
+            <small>Matches complete words. Punctuation separates terms.</small>
           </label>
           <label>
             Status

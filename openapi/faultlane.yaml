@@ -976,7 +976,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 120
-          description: Literal search across issue title and approved current-result fields.
+          description: Case-insensitive token search across issue titles, functions, modules, messages, and comments. Punctuation separates tokens and every token must match.
       responses:
         "200":
           description: Bounded issue page

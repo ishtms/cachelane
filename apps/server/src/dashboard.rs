@@ -437,7 +437,8 @@ pub(crate) async fn get_overview(
     let mut transaction = pool.begin().await.map_err(|_| DashboardError::Internal)?;
     configure_read_transaction(&mut transaction).await?;
     let scope = transaction_scope(&mut transaction, &actor).await?;
-    let overview = load_overview(&mut transaction, &scope).await?;
+    let overview =
+        load_overview(&mut transaction, &scope, state.dashboard_rollups_enabled()).await?;
     transaction
         .commit()
         .await
@@ -752,6 +753,7 @@ async fn require_issue(
 async fn load_overview(
     connection: &mut PgConnection,
     scope: &ProjectScope,
+    rollups_enabled: bool,
 ) -> Result<ProjectOverview, DashboardError> {
     let clock = sqlx::query(
         "WITH current_clock AS (SELECT clock_timestamp() AS value), bounds AS (SELECT value, date_trunc('day', value AT TIME ZONE 'UTC') AS utc_day, date_trunc('month', value AT TIME ZONE 'UTC') AS utc_month FROM current_clock) SELECT to_char(value AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS generated_at, to_char(utc_day - interval '29 days', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS window_start, to_char(utc_day + interval '1 day', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS window_end, to_char(utc_month, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS cycle_start FROM bounds",
@@ -764,16 +766,29 @@ async fn load_overview(
     let window_end: String = clock.get("window_end");
     let cycle_start: String = clock.get("cycle_start");
 
-    let totals = sqlx::query(
-        "SELECT (SELECT count(*) FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz) AS events, count(*) AS issues, count(*) FILTER (WHERE i.first_seen_at >= $3::timestamptz AND i.first_seen_at < $4::timestamptz) AS new_issues, count(*) FILTER (WHERE i.regression_state = 'regressed' AND i.last_seen_at >= $3::timestamptz AND i.last_seen_at < $4::timestamptz) AS regressed_issues FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid",
-    )
-    .bind(&scope.organization_id)
-    .bind(&scope.project_id)
-    .bind(&window_start)
-    .bind(&window_end)
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(|_| DashboardError::Internal)?;
+    let totals = if rollups_enabled {
+        sqlx::query(
+            "SELECT (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'event_total' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date) AS events, (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'issue_total') AS issues, (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'issue_new' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date) AS new_issues, (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'issue_regressed' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date) AS regressed_issues",
+        )
+        .bind(&scope.organization_id)
+        .bind(&scope.project_id)
+        .bind(&window_start)
+        .bind(&window_end)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+    } else {
+        sqlx::query(
+            "SELECT (SELECT count(*) FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz) AS events, count(*) AS issues, count(*) FILTER (WHERE i.first_seen_at >= $3::timestamptz AND i.first_seen_at < $4::timestamptz) AS new_issues, count(*) FILTER (WHERE i.regression_state = 'regressed' AND i.last_seen_at >= $3::timestamptz AND i.last_seen_at < $4::timestamptz) AS regressed_issues FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid",
+        )
+        .bind(&scope.organization_id)
+        .bind(&scope.project_id)
+        .bind(&window_start)
+        .bind(&window_end)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+    };
     let totals = OverviewTotals {
         events: totals.get("events"),
         issues: totals.get("issues"),
@@ -781,9 +796,11 @@ async fn load_overview(
         regressed_issues: totals.get("regressed_issues"),
     };
 
-    let events_over_time = sqlx::query(
-        "WITH days AS (SELECT generate_series($3::timestamptz AT TIME ZONE 'UTC', ($4::timestamptz AT TIME ZONE 'UTC') - interval '1 day', interval '1 day') AS day) SELECT to_char(d.day, 'YYYY-MM-DD') AS day, count(e.id) AS count FROM days d LEFT JOIN crash_events e ON e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= d.day AT TIME ZONE 'UTC' AND e.received_at < (d.day + interval '1 day') AT TIME ZONE 'UTC' GROUP BY d.day ORDER BY d.day",
-    )
+    let events_over_time = sqlx::query(if rollups_enabled {
+        "WITH days AS (SELECT generate_series(($3::timestamptz AT TIME ZONE 'UTC')::date, (($4::timestamptz AT TIME ZONE 'UTC')::date - 1), interval '1 day')::date AS day) SELECT to_char(days.day, 'YYYY-MM-DD') AS day, COALESCE(rollup.count, 0)::bigint AS count FROM days LEFT JOIN project_daily_rollups rollup ON rollup.organization_id = $1::uuid AND rollup.project_id = $2::uuid AND rollup.day = days.day AND rollup.dimension = 'event_total' AND rollup.key = 'all' ORDER BY days.day"
+    } else {
+        "WITH days AS (SELECT generate_series($3::timestamptz AT TIME ZONE 'UTC', ($4::timestamptz AT TIME ZONE 'UTC') - interval '1 day', interval '1 day') AS day) SELECT to_char(d.day, 'YYYY-MM-DD') AS day, count(e.id) AS count FROM days d LEFT JOIN crash_events e ON e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= d.day AT TIME ZONE 'UTC' AND e.received_at < (d.day + interval '1 day') AT TIME ZONE 'UTC' GROUP BY d.day ORDER BY d.day"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -821,9 +838,11 @@ async fn load_overview(
     })
     .collect();
 
-    let release_rows = sqlx::query(
-        "SELECT COALESCE(r.id::text, 'unmapped') AS key, COALESCE(r.version, 'Unmapped') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN releases r ON r.id = e.release_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY r.id, r.version ORDER BY count DESC, label, key LIMIT 21",
-    )
+    let release_rows = sqlx::query(if rollups_enabled {
+        "SELECT key, max(label) AS label, sum(count)::bigint AS count, (sum(sum(count)) OVER ())::bigint AS total_count FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'release' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date GROUP BY key ORDER BY count DESC, label, key LIMIT 21"
+    } else {
+        "SELECT COALESCE(r.id::text, 'unmapped') AS key, COALESCE(r.version, 'Unmapped') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN releases r ON r.id = e.release_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY r.id, r.version ORDER BY count DESC, label, key LIMIT 21"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -833,9 +852,11 @@ async fn load_overview(
     .map_err(|_| DashboardError::Internal)?;
     let (releases, releases_truncated, releases_other_count) = distribution_rows(&release_rows);
 
-    let platform_rows = sqlx::query(
-        "SELECT COALESCE(s.platform, 'unknown') || '/' || COALESCE(s.architecture, 'unknown') AS key, COALESCE(s.platform, 'Unknown') || ' / ' || COALESCE(s.architecture, 'unknown') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
-    )
+    let platform_rows = sqlx::query(if rollups_enabled {
+        "SELECT key, max(label) AS label, sum(count)::bigint AS count, (sum(sum(count)) OVER ())::bigint AS total_count FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'platform_architecture' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date GROUP BY key ORDER BY count DESC, key LIMIT 21"
+    } else {
+        "SELECT COALESCE(s.platform, 'unknown') || '/' || COALESCE(s.architecture, 'unknown') AS key, COALESCE(s.platform, 'Unknown') || ' / ' || COALESCE(s.architecture, 'unknown') AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY key, label ORDER BY count DESC, key LIMIT 21"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -845,9 +866,11 @@ async fn load_overview(
     .map_err(|_| DashboardError::Internal)?;
     let (platforms, platforms_truncated, platforms_other_count) = distribution_rows(&platform_rows);
 
-    let crash_type_rows = sqlx::query(
-        "SELECT COALESCE(s.crash_type, 'unknown') AS key, initcap(COALESCE(s.crash_type, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY key, label ORDER BY count DESC, key LIMIT 21",
-    )
+    let crash_type_rows = sqlx::query(if rollups_enabled {
+        "SELECT key, max(label) AS label, sum(count)::bigint AS count, (sum(sum(count)) OVER ())::bigint AS total_count FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'crash_type' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date GROUP BY key ORDER BY count DESC, key LIMIT 21"
+    } else {
+        "SELECT COALESCE(s.crash_type, 'unknown') AS key, initcap(COALESCE(s.crash_type, 'unknown')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz GROUP BY key, label ORDER BY count DESC, key LIMIT 21"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -858,9 +881,11 @@ async fn load_overview(
     let (crash_types, crash_types_truncated, crash_types_other_count) =
         distribution_rows(&crash_type_rows);
 
-    let symbolication = sqlx::query(
-        "WITH states AS (SELECT CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END AS state FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz) SELECT count(*) FILTER (WHERE state = 'readable') AS readable, count(*) FILTER (WHERE state = 'partial') AS partial, count(*) FILTER (WHERE state = 'missing') AS missing, count(*) FILTER (WHERE state = 'failed') AS failed, count(*) FILTER (WHERE state = 'processing') AS processing FROM states",
-    )
+    let symbolication = sqlx::query(if rollups_enabled {
+        "SELECT COALESCE(sum(count) FILTER (WHERE key = 'readable'), 0)::bigint AS readable, COALESCE(sum(count) FILTER (WHERE key = 'partial'), 0)::bigint AS partial, COALESCE(sum(count) FILTER (WHERE key = 'missing'), 0)::bigint AS missing, COALESCE(sum(count) FILTER (WHERE key = 'failed'), 0)::bigint AS failed, COALESCE(sum(count) FILTER (WHERE key = 'processing'), 0)::bigint AS processing FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'symbolication_state' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date"
+    } else {
+        "WITH states AS (SELECT CASE WHEN e.processing_state IN ('failed', 'quarantined') THEN 'failed' WHEN s.symbolication_state IS NOT NULL THEN s.symbolication_state WHEN e.processing_state = 'awaiting_symbols' THEN 'missing' ELSE 'processing' END AS state FROM crash_events e LEFT JOIN crash_event_search s ON s.organization_id = e.organization_id AND s.project_id = e.project_id AND s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $4::timestamptz) SELECT count(*) FILTER (WHERE state = 'readable') AS readable, count(*) FILTER (WHERE state = 'partial') AS partial, count(*) FILTER (WHERE state = 'missing') AS missing, count(*) FILTER (WHERE state = 'failed') AS failed, count(*) FILTER (WHERE state = 'processing') AS processing FROM states"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -883,7 +908,7 @@ async fn load_overview(
     };
 
     let missing_symbol_count = sqlx::query_scalar::<_, i64>(
-        "WITH candidates AS (SELECT w.required_artifact, w.module_name, w.architecture, w.debug_id, NULLIF(w.code_id, '') AS code_id, w.release_id FROM crash_symbol_waiters w JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE w.organization_id = $1::uuid AND w.project_id = $2::uuid UNION SELECT CASE WHEN m.artifact_type = 'pdb' THEN 'pdb' ELSE 'pe' END AS required_artifact, m.module_name, m.architecture, m.debug_id, NULLIF(m.code_id, '') AS code_id, m.release_id FROM release_manifest_artifacts m JOIN crash_events e ON e.organization_id = m.organization_id AND e.project_id = m.project_id AND e.release_id = m.release_id AND e.current_result_id IS NOT NULL WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state IN ('missing', 'mismatch')) SELECT count(*) FROM candidates",
+        "WITH candidates AS (SELECT w.required_artifact, w.module_name, w.architecture, w.debug_id, NULLIF(w.code_id, '') AS code_id, w.release_id FROM crash_symbol_waiters w JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE w.organization_id = $1::uuid AND w.project_id = $2::uuid UNION SELECT CASE WHEN m.artifact_type = 'pdb' THEN 'pdb' ELSE 'pe' END AS required_artifact, m.module_name, m.architecture, m.debug_id, NULLIF(m.code_id, '') AS code_id, m.release_id FROM release_manifest_artifacts m JOIN LATERAL (SELECT 1 FROM crash_events e WHERE e.organization_id = m.organization_id AND e.project_id = m.project_id AND e.release_id = m.release_id AND e.current_result_id IS NOT NULL ORDER BY e.received_at DESC, e.id DESC LIMIT 1) referenced ON true WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state IN ('missing', 'mismatch')) SELECT count(*) FROM candidates",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -891,9 +916,11 @@ async fn load_overview(
     .await
     .map_err(|_| DashboardError::Internal)?;
 
-    let ingest = sqlx::query(
-        "SELECT CASE WHEN max(received_at) IS NULL THEN NULL ELSE to_char(max(received_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS last_received_at, count(*) FILTER (WHERE received_at >= $3::timestamptz AND received_at < $4::timestamptz) AS events_in_window, count(*) FILTER (WHERE processing_state IN ('received', 'stored')) AS stored_or_received FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid",
-    )
+    let ingest = sqlx::query(if rollups_enabled {
+        "SELECT (SELECT to_char(received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY received_at DESC, id DESC LIMIT 1) AS last_received_at, (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'event_total' AND day >= ($3::timestamptz AT TIME ZONE 'UTC')::date AND day < ($4::timestamptz AT TIME ZONE 'UTC')::date) AS events_in_window, (SELECT COALESCE(sum(count), 0)::bigint FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'processing_state' AND key IN ('received', 'stored')) AS stored_or_received"
+    } else {
+        "SELECT CASE WHEN max(received_at) IS NULL THEN NULL ELSE to_char(max(received_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS last_received_at, count(*) FILTER (WHERE received_at >= $3::timestamptz AND received_at < $4::timestamptz) AS events_in_window, count(*) FILTER (WHERE processing_state IN ('received', 'stored')) AS stored_or_received FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&window_start)
@@ -915,9 +942,11 @@ async fn load_overview(
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| DashboardError::Internal)?;
-    let state_rows = sqlx::query(
-        "SELECT processing_state AS key, initcap(replace(processing_state, '_', ' ')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid GROUP BY processing_state ORDER BY count DESC, processing_state LIMIT 21",
-    )
+    let state_rows = sqlx::query(if rollups_enabled {
+        "SELECT key, max(label) AS label, sum(count)::bigint AS count, (sum(sum(count)) OVER ())::bigint AS total_count FROM project_daily_rollups WHERE organization_id = $1::uuid AND project_id = $2::uuid AND dimension = 'processing_state' GROUP BY key ORDER BY count DESC, key LIMIT 21"
+    } else {
+        "SELECT processing_state AS key, initcap(replace(processing_state, '_', ' ')) AS label, count(*) AS count, (sum(count(*)) OVER ())::bigint AS total_count FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid GROUP BY processing_state ORDER BY count DESC, processing_state LIMIT 21"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .fetch_all(&mut *connection)
@@ -933,9 +962,11 @@ async fn load_overview(
         states,
     };
 
-    let usage = sqlx::query(
-        "SELECT count(e.id) AS accepted_events, COALESCE(sum(o.byte_size), 0)::bigint AS retained_raw_bytes, (SELECT COALESCE(sum(a.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state = 'available' AND ao.lifecycle_state = 'stored') a) AS project_artifact_bytes, (SELECT count(*) FROM projects p WHERE p.organization_id = $1::uuid) AS organization_projects FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored' WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $3::timestamptz + interval '1 month'",
-    )
+    let usage = sqlx::query(if rollups_enabled {
+        "SELECT COALESCE(c.accepted_events, 0)::bigint AS accepted_events, COALESCE(storage.retained_raw_bytes, 0)::bigint AS retained_raw_bytes, COALESCE(storage.retained_symbol_bytes, 0)::bigint AS project_artifact_bytes, storage.reconciled_at IS NOT NULL AS authoritative, (SELECT count(*) FROM projects WHERE organization_id = $1::uuid) AS organization_projects FROM (SELECT 1) anchor LEFT JOIN usage_cycle_counters c ON c.organization_id = $1::uuid AND c.project_id = $2::uuid AND c.cycle_start = ($3::timestamptz AT TIME ZONE 'UTC')::date LEFT JOIN project_storage_counters storage ON storage.organization_id = $1::uuid AND storage.project_id = $2::uuid"
+    } else {
+        "SELECT count(e.id) AS accepted_events, COALESCE(sum(o.byte_size), 0)::bigint AS retained_raw_bytes, (SELECT COALESCE(sum(a.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state = 'available' AND ao.lifecycle_state = 'stored') a) AS project_artifact_bytes, false AS authoritative, (SELECT count(*) FROM projects p WHERE p.organization_id = $1::uuid) AS organization_projects FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state = 'stored' WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at >= $3::timestamptz AND e.received_at < $3::timestamptz + interval '1 month'"
+    })
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
     .bind(&cycle_start)
@@ -943,7 +974,7 @@ async fn load_overview(
     .await
     .map_err(|_| DashboardError::Internal)?;
     let observed_usage = ObservedUsage {
-        authoritative: false,
+        authoritative: usage.get("authoritative"),
         cycle_start,
         accepted_events: usage.get("accepted_events"),
         retained_raw_bytes: usage.get("retained_raw_bytes"),
