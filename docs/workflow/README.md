@@ -110,4 +110,4 @@ Do not claim local certification when a required service, database, browser, fix
 
 ## Current M1 transition
 
-Do not rewrite the ten M1 issues already merged. Start the remaining milestone branch from current `main`. The final M1 pull request should close only #301, #303, and #313 unless GitHub milestone scope changes before kickoff.
+Do not rewrite the ten M1 issues already merged. The remaining milestone branch started from current `main`. After the database audit scope change, the final M1 pull request should close #301, #303, #313, and #358 through #363 unless GitHub milestone scope changes again.
