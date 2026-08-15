@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/352
 
-Status: Approved on August 15, 2026
+Status: Implementing after approval on August 15, 2026
 
 ## Context
 
