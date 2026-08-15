@@ -8,7 +8,7 @@ cargo test -p faultlane-server alerts::tests --no-fail-fast
 
 bash ./scripts/with-test-database \
   cargo test -p faultlane-server \
-  alert_conditions_dedupe_recover_retry_and_stay_scoped \
-  -- --ignored --nocapture
+  alerts::tests \
+  -- --ignored --nocapture --test-threads=1
 
-echo "alert proof: seven conditions deduplicated, recovered, retried, and tenant scoped"
+echo "alert proof: conditions, rule and issue pages, final leases, retries, and tenant scope passed"

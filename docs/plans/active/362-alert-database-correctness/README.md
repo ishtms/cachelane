@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/362
 
-Status: Waiting for #358
+Status: Locally verified on August 16, 2026
 
 ## Context
 
@@ -57,6 +57,15 @@ Monitor oldest rule evaluation age, evaluation duration, issue pages, terminal e
 The new rule timestamp and index are additive. Older schedulers ignore them. New schedulers can evaluate existing rules with null timestamps first. Stage with alerts enabled only against disposable providers and data.
 
 Rollback disables alerts and restores the previous application while retaining rule timestamps and delivery states. Before resuming the old worker, reconcile any expired final leases manually or with the corrected build so they are not stranded again.
+
+## Verification evidence
+
+- A final-attempt delivery was claimed at attempt three, expired, and reconciled once to `dead` with `lease_expired_final` by two concurrent reclaimers. A separate nonfinal expired lease was reclaimed and delivered by exactly one worker.
+- A fixture with 1,001 enabled rules and one disabled rule evaluated 1,000 rules on the first tick and every enabled rule within two ticks. The disabled rule remained unevaluated. The final proof completed both ticks in 14.877 seconds.
+- A fixture with 1,001 matching issues stopped after its first page without running recovery, then replayed and completed two keyset pages in 26.606 seconds. Every matching scope stayed active, a moved still-active issue did not recover, only the resolved issue recovered, and another tenant remained untouched.
+- `./scripts/prove-alerts` passed all five non-database alert tests and four PostgreSQL alert tests in 52.2 seconds. It refreshed the seven original condition, deduplication, recovery, retry, API, redaction, adapter, and tenant-scope checks from #301.
+- `./scripts/check-fast` passed on the final issue tree.
+- No hosted or production rollout was performed. Rollback remains disabling alerts, retaining all state, and reconciling expired final leases with the corrected build before an older worker resumes.
 
 ## Out of scope
 
