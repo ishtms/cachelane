@@ -27,7 +27,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{fs, io::AsyncWriteExt};
 use url::Url;
 
-use crate::project_setup::{ServerState, StartupError};
+use crate::{
+    identifiers::valid_uuid,
+    project_setup::{ServerState, StartupError},
+};
 
 const TOKEN_PREFIX: &str = "clsu_";
 const TOKEN_BYTES: usize = 32;
@@ -96,7 +99,7 @@ impl SymbolUploads {
         bytes: Vec<u8>,
     ) -> Result<String, UploadError> {
         let row = sqlx::query(
-            "SELECT object_key, provider_upload_id FROM artifact_upload_sessions WHERE id::text = $1",
+            "SELECT object_key, provider_upload_id FROM artifact_upload_sessions WHERE id = $1::uuid",
         )
         .bind(upload_id)
         .fetch_one(self.pool()?)
@@ -786,8 +789,11 @@ pub(crate) async fn revoke_upload_token(
         crate::auth::AuthorizationError::Unauthorized => UploadError::Unauthorized,
         crate::auth::AuthorizationError::NotFound => UploadError::NotFound,
     })?;
+    if !valid_uuid(&token_id) {
+        return Err(UploadError::NotFound);
+    }
     let result = sqlx::query(
-        "UPDATE artifact_upload_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE artifact_upload_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(&token_id)
     .bind(&actor.organization_id)
@@ -914,6 +920,9 @@ pub(crate) async fn sign_part(
     let uploads = state.symbol_uploads();
     let scope = authorize_upload(uploads, &headers).await?;
     let Json(payload) = payload.map_err(|_| UploadError::Invalid)?;
+    if !valid_uuid(&upload_id) {
+        return Err(UploadError::NotFound);
+    }
     sign_upload_part(uploads, &scope, &upload_id, payload)
         .await
         .map(|value| no_store(Json(value)))
@@ -928,6 +937,9 @@ pub(crate) async fn record_part(
     let uploads = state.symbol_uploads();
     let scope = authorize_upload(uploads, &headers).await?;
     let Json(payload) = payload.map_err(|_| UploadError::Invalid)?;
+    if !valid_uuid(&upload_id) {
+        return Err(UploadError::NotFound);
+    }
     record_upload_part(uploads, &scope, &upload_id, part_number, payload).await?;
     Ok(no_store(StatusCode::NO_CONTENT))
 }
@@ -939,6 +951,9 @@ pub(crate) async fn complete_upload(
 ) -> Result<Response, UploadError> {
     let uploads = state.symbol_uploads();
     let scope = authorize_upload(uploads, &headers).await?;
+    if !valid_uuid(&upload_id) {
+        return Err(UploadError::NotFound);
+    }
     complete(uploads, &scope, &upload_id)
         .await
         .map(|value| no_store(Json(value)))
@@ -951,6 +966,9 @@ pub(crate) async fn get_coverage(
 ) -> Result<Response, UploadError> {
     let uploads = state.symbol_uploads();
     let scope = authorize_upload(uploads, &headers).await?;
+    if !valid_uuid(&release_id) {
+        return Err(UploadError::NotFound);
+    }
     coverage_response(uploads.pool()?, &scope, &release_id)
         .await
         .map(|value| no_store(Json(value)))
@@ -1423,7 +1441,7 @@ async fn mark_manifest_available(
 ) -> Result<(), UploadError> {
     let mut transaction = pool.begin().await.map_err(|_| UploadError::Unavailable)?;
     let result = sqlx::query(
-        "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, failure_code = NULL, uploaded_at = now(), updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, failure_code = NULL, uploaded_at = now(), updated_at = now() WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1473,7 +1491,7 @@ async fn update_manifest_state(
     debug_image_id: Option<&str>,
 ) -> Result<(), UploadError> {
     let result = sqlx::query(
-        "UPDATE release_manifest_artifacts SET state = $4, debug_image_id = $5::uuid, uploaded_at = CASE WHEN $4 = 'available' THEN now() ELSE NULL END, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND NOT (state = 'processing' AND $4 = 'missing')",
+        "UPDATE release_manifest_artifacts SET state = $4, debug_image_id = $5::uuid, uploaded_at = CASE WHEN $4 = 'available' THEN now() ELSE NULL END, updated_at = now() WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid AND NOT (state = 'processing' AND $4 = 'missing')",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1651,7 +1669,7 @@ async fn load_session(
     upload_id: &str,
 ) -> Result<Session, UploadError> {
     let row = sqlx::query(
-        "SELECT id::text AS id, release_id::text AS release_id, manifest_artifact_id::text AS manifest_artifact_id, upload_token_id::text AS upload_token_id, uploaded_by_user_id::text AS uploaded_by_user_id, object_key, provider_upload_id, checksum, byte_size, part_size, part_count, artifact_type, module_name, architecture, debug_id, code_id, ci_job, cli_version, state, expires_at <= now() AS expired FROM artifact_upload_sessions WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "SELECT id::text AS id, release_id::text AS release_id, manifest_artifact_id::text AS manifest_artifact_id, upload_token_id::text AS upload_token_id, uploaded_by_user_id::text AS uploaded_by_user_id, object_key, provider_upload_id, checksum, byte_size, part_size, part_count, artifact_type, module_name, architecture, debug_id, code_id, ci_job, cli_version, state, expires_at <= now() AS expired FROM artifact_upload_sessions WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1690,7 +1708,7 @@ async fn load_completed_parts(
     upload_id: &str,
 ) -> Result<Vec<CompletedPartView>, UploadError> {
     let rows = sqlx::query(
-        "SELECT p.part_number, p.byte_size, p.content_md5 FROM artifact_upload_parts p JOIN artifact_upload_sessions s ON s.id = p.upload_id AND s.organization_id = p.organization_id AND s.project_id = p.project_id WHERE p.upload_id::text = $3 AND p.organization_id = $1::uuid AND p.project_id = $2::uuid ORDER BY p.part_number",
+        "SELECT p.part_number, p.byte_size, p.content_md5 FROM artifact_upload_parts p JOIN artifact_upload_sessions s ON s.id = p.upload_id AND s.organization_id = p.organization_id AND s.project_id = p.project_id WHERE p.upload_id = $3::uuid AND p.organization_id = $1::uuid AND p.project_id = $2::uuid ORDER BY p.part_number",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1821,7 +1839,7 @@ async fn complete(
     let parts = load_provider_parts(uploads.pool()?, scope, &session).await?;
     if session.state == "active" {
         let result = sqlx::query(
-            "UPDATE artifact_upload_sessions SET state = 'completing', updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'active'",
+            "UPDATE artifact_upload_sessions SET state = 'completing', updated_at = now() WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'active'",
         )
         .bind(&scope.organization_id)
         .bind(&scope.project_id)
@@ -1858,7 +1876,7 @@ async fn enqueue_artifact_index(
     let job_id = random_uuid()?;
     let mut transaction = pool.begin().await.map_err(|_| UploadError::Unavailable)?;
     let updated = sqlx::query(
-        "UPDATE artifact_upload_sessions SET state = 'processing', updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'completing'",
+        "UPDATE artifact_upload_sessions SET state = 'processing', updated_at = now() WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid AND state = 'completing'",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1870,7 +1888,7 @@ async fn enqueue_artifact_index(
         return Err(UploadError::Conflict);
     }
     let manifest = sqlx::query(
-        "UPDATE release_manifest_artifacts SET state = 'processing', debug_image_id = NULL, failure_code = NULL, uploaded_at = NULL, updated_at = now() WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid AND checksum = $4 AND byte_size = $5 AND artifact_type = $6 AND module_name = $7 AND architecture = $8 AND debug_id = $9 AND code_id IS NOT DISTINCT FROM $10",
+        "UPDATE release_manifest_artifacts SET state = 'processing', debug_image_id = NULL, failure_code = NULL, uploaded_at = NULL, updated_at = now() WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid AND checksum = $4 AND byte_size = $5 AND artifact_type = $6 AND module_name = $7 AND architecture = $8 AND debug_id = $9 AND code_id IS NOT DISTINCT FROM $10",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1912,7 +1930,7 @@ async fn cleanup_duplicate_object(
     session: &Session,
 ) -> Result<(), UploadError> {
     let canonical_key: Option<String> = sqlx::query_scalar(
-        "SELECT o.object_key FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id WHERE m.id::text = $3 AND m.organization_id = $1::uuid AND m.project_id = $2::uuid",
+        "SELECT o.object_key FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id WHERE m.id = $3::uuid AND m.organization_id = $1::uuid AND m.project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1932,7 +1950,7 @@ async fn load_provider_parts(
     session: &Session,
 ) -> Result<Vec<ProviderPart>, UploadError> {
     let rows = sqlx::query(
-        "SELECT part_number, etag, byte_size FROM artifact_upload_parts WHERE upload_id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid ORDER BY part_number",
+        "SELECT part_number, etag, byte_size FROM artifact_upload_parts WHERE upload_id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid ORDER BY part_number",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -1980,7 +1998,7 @@ async fn coverage_response(
     release_id: &str,
 ) -> Result<CoverageResponse, UploadError> {
     let row = sqlx::query(
-        "SELECT id::text AS id, version, platform, architecture, configuration, revision, channel, build_timestamp FROM releases WHERE id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "SELECT id::text AS id, version, platform, architecture, configuration, revision, channel, build_timestamp FROM releases WHERE id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -2001,7 +2019,7 @@ async fn load_coverage(
     release_id: &str,
 ) -> Result<Coverage, UploadError> {
     let row = sqlx::query(
-        "SELECT count(*)::bigint AS total, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'missing')::bigint AS missing, count(*) FILTER (WHERE state = 'mismatch')::bigint AS mismatch, count(*) FILTER (WHERE state = 'processing')::bigint AS processing, count(*) FILTER (WHERE state = 'quarantined')::bigint AS quarantined FROM release_manifest_artifacts WHERE release_id::text = $3 AND organization_id = $1::uuid AND project_id = $2::uuid",
+        "SELECT count(*)::bigint AS total, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'missing')::bigint AS missing, count(*) FILTER (WHERE state = 'mismatch')::bigint AS mismatch, count(*) FILTER (WHERE state = 'processing')::bigint AS processing, count(*) FILTER (WHERE state = 'quarantined')::bigint AS quarantined FROM release_manifest_artifacts WHERE release_id = $3::uuid AND organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -2293,7 +2311,7 @@ mod tests {
 
     async fn publish_indexed_artifact(pool: &PgPool, upload_id: &str) {
         let session = sqlx::query(
-            "SELECT organization_id::text AS organization_id, project_id::text AS project_id, manifest_artifact_id::text AS manifest_artifact_id, object_key, checksum, byte_size, artifact_type, module_name, architecture, debug_id, code_id FROM artifact_upload_sessions WHERE id::text = $1",
+            "SELECT organization_id::text AS organization_id, project_id::text AS project_id, manifest_artifact_id::text AS manifest_artifact_id, object_key, checksum, byte_size, artifact_type, module_name, architecture, debug_id, code_id FROM artifact_upload_sessions WHERE id = $1::uuid",
         )
         .bind(upload_id)
         .fetch_one(pool)
@@ -2325,7 +2343,7 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("debug image must publish: {error}"));
         sqlx::query(
-            "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, uploaded_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+            "UPDATE release_manifest_artifacts SET state = 'available', debug_image_id = $4::uuid, uploaded_at = now(), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
         )
         .bind(session.get::<String, _>("manifest_artifact_id"))
         .bind(&organization_id)
@@ -2334,12 +2352,12 @@ mod tests {
         .execute(pool)
         .await
         .unwrap_or_else(|error| panic!("manifest must publish: {error}"));
-        sqlx::query("UPDATE artifact_upload_sessions SET state = 'completed' WHERE id::text = $1")
+        sqlx::query("UPDATE artifact_upload_sessions SET state = 'completed' WHERE id = $1::uuid")
             .bind(upload_id)
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("session must complete: {error}"));
-        sqlx::query("UPDATE jobs SET state = 'completed', completed_at = now() WHERE artifact_upload_id::text = $1")
+        sqlx::query("UPDATE jobs SET state = 'completed', completed_at = now() WHERE artifact_upload_id = $1::uuid")
             .bind(upload_id)
             .execute(pool)
             .await
@@ -2347,17 +2365,17 @@ mod tests {
     }
 
     async fn quarantine_artifact(pool: &PgPool, upload_id: &str) {
-        sqlx::query("UPDATE artifact_upload_sessions SET state = 'failed', failure_code = 'artifact_malformed' WHERE id::text = $1")
+        sqlx::query("UPDATE artifact_upload_sessions SET state = 'failed', failure_code = 'artifact_malformed' WHERE id = $1::uuid")
             .bind(upload_id)
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("session must fail: {error}"));
-        sqlx::query("UPDATE release_manifest_artifacts m SET state = 'quarantined', failure_code = 'artifact_malformed' FROM artifact_upload_sessions s WHERE s.id::text = $1 AND m.id = s.manifest_artifact_id AND m.organization_id = s.organization_id AND m.project_id = s.project_id")
+        sqlx::query("UPDATE release_manifest_artifacts m SET state = 'quarantined', failure_code = 'artifact_malformed' FROM artifact_upload_sessions s WHERE s.id = $1::uuid AND m.id = s.manifest_artifact_id AND m.organization_id = s.organization_id AND m.project_id = s.project_id")
             .bind(upload_id)
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("manifest must quarantine: {error}"));
-        sqlx::query("UPDATE jobs SET state = 'completed', failure_code = 'artifact_malformed', completed_at = now() WHERE artifact_upload_id::text = $1")
+        sqlx::query("UPDATE jobs SET state = 'completed', failure_code = 'artifact_malformed', completed_at = now() WHERE artifact_upload_id = $1::uuid")
             .bind(upload_id)
             .execute(pool)
             .await
@@ -2463,6 +2481,61 @@ mod tests {
             "cli_version": "0.1.0",
             "ci_job": "build-42"
         });
+
+        let (status, malformed_token) = request_json(
+            &state,
+            bootstrap(Request::builder().method("DELETE").uri(format!(
+                "/api/v1/projects/{project_id}/artifact-upload-tokens/not-a-uuid"
+            )))
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request must build: {error}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{malformed_token}");
+
+        let (status, malformed_upload) = request_json(
+            &state,
+            bearer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/artifact-uploads/not-a-uuid/parts"),
+                token,
+            )
+            .body(Body::from(
+                json!({"part_number": 1, "byte_size": 1, "content_md5": "AA=="}).to_string(),
+            ))
+            .unwrap_or_else(|error| panic!("request must build: {error}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{malformed_upload}");
+
+        let (status, malformed_complete) = request_json(
+            &state,
+            bearer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/artifact-uploads/not-a-uuid/complete"),
+                token,
+            )
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request must build: {error}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{malformed_complete}");
+
+        let (status, malformed_release) = request_json(
+            &state,
+            bearer(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/releases/not-a-uuid/coverage"),
+                token,
+            )
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request must build: {error}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{malformed_release}");
 
         let (status, negotiated) = request_json(
             &state,
@@ -2615,7 +2688,7 @@ mod tests {
             content_md5
         );
 
-        sqlx::query("UPDATE artifact_upload_sessions SET state = 'completing' WHERE id::text = $1")
+        sqlx::query("UPDATE artifact_upload_sessions SET state = 'completing' WHERE id = $1::uuid")
             .bind(upload_id)
             .execute(&pool)
             .await
@@ -2636,7 +2709,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
         let manifest_checksum: Vec<u8> = sqlx::query_scalar(
-            "SELECT checksum FROM release_manifest_artifacts WHERE release_id::text = $1 AND source_path = 'symbols/faultlane-symbolication.pdb'",
+            "SELECT checksum FROM release_manifest_artifacts WHERE release_id = $1::uuid AND source_path = 'symbols/faultlane-symbolication.pdb'",
         )
         .bind(release_id)
         .fetch_one(&pool)
@@ -2662,7 +2735,7 @@ mod tests {
         assert_eq!(completed["coverage"]["processing"], 1);
         assert_eq!(completed["coverage"]["ready"], false);
         let queued_jobs: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM jobs WHERE artifact_upload_id::text = $1 AND job_type = 'index_artifact' AND state = 'pending'",
+            "SELECT count(*) FROM jobs WHERE artifact_upload_id = $1::uuid AND job_type = 'index_artifact' AND state = 'pending'",
         )
         .bind(upload_id)
         .fetch_one(&pool)
@@ -2724,7 +2797,7 @@ mod tests {
         assert_ne!(deduplicated["release"]["id"], release_id);
         assert_eq!(deduplicated["coverage"]["available"], 1);
         let automatic_requests: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id::text = $1 AND source = 'automatic' AND scope_kind = 'artifact'",
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE project_id = $1::uuid AND source = 'automatic' AND scope_kind = 'artifact'",
         )
         .bind(project_id)
         .fetch_one(&pool)
@@ -2733,7 +2806,7 @@ mod tests {
         assert_eq!(automatic_requests, 2);
 
         let provenance = sqlx::query(
-            "SELECT source_path, cli_version, ci_job, state, uploaded_at IS NOT NULL AS has_uploaded_at FROM release_manifest_artifacts WHERE release_id::text = $1",
+            "SELECT source_path, cli_version, ci_job, state, uploaded_at IS NOT NULL AS has_uploaded_at FROM release_manifest_artifacts WHERE release_id = $1::uuid",
         )
         .bind(release_id)
         .fetch_one(&pool)
@@ -2751,7 +2824,7 @@ mod tests {
         assert_eq!(provenance.get::<String, _>("state"), "available");
         assert!(provenance.get::<bool, _>("has_uploaded_at"));
         let stored_digest: Vec<u8> = sqlx::query_scalar(
-            "SELECT secret_hash FROM artifact_upload_tokens WHERE id::text = $1",
+            "SELECT secret_hash FROM artifact_upload_tokens WHERE id = $1::uuid",
         )
         .bind(token_id)
         .fetch_one(&pool)

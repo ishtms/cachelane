@@ -228,7 +228,7 @@ impl Worker {
         lease_token: &str,
     ) -> Result<bool, WorkerStartupError> {
         sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM jobs WHERE id::text = $1 AND state = 'leased' AND lease_token::text = $2 AND lease_expires_at > now())",
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1::uuid AND state = 'leased' AND lease_token = $2::uuid AND lease_expires_at > now())",
         )
         .bind(job_id)
         .bind(lease_token)
@@ -392,7 +392,7 @@ impl Worker {
                         }
                     }
                     _ = interval.tick() => {
-                        let updated = sqlx::query("UPDATE jobs SET heartbeat_at = now(), lease_expires_at = now() + ($6 * interval '1 second'), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5")
+                        let updated = sqlx::query("UPDATE jobs SET heartbeat_at = now(), lease_expires_at = now() + ($6 * interval '1 second'), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid")
                             .bind(&job.id)
                             .bind(&job.organization_id)
                             .bind(&job.project_id)
@@ -417,7 +417,7 @@ impl Worker {
             .as_deref()
             .ok_or(JobError::Deterministic("missing_artifact_upload"))?;
         let row = sqlx::query(
-            "SELECT s.id::text AS id, s.release_id::text AS release_id, s.manifest_artifact_id::text AS manifest_artifact_id, s.upload_token_id::text AS upload_token_id, s.uploaded_by_user_id::text AS uploaded_by_user_id, s.object_key, s.checksum, s.byte_size, s.artifact_type, s.module_name, s.architecture, s.debug_id, s.code_id, s.ci_job, s.cli_version FROM artifact_upload_sessions s WHERE s.id::text = $1 AND s.organization_id::text = $2 AND s.project_id::text = $3 AND s.state = 'processing'",
+            "SELECT s.id::text AS id, s.release_id::text AS release_id, s.manifest_artifact_id::text AS manifest_artifact_id, s.upload_token_id::text AS upload_token_id, s.uploaded_by_user_id::text AS uploaded_by_user_id, s.object_key, s.checksum, s.byte_size, s.artifact_type, s.module_name, s.architecture, s.debug_id, s.code_id, s.ci_job, s.cli_version FROM artifact_upload_sessions s WHERE s.id = $1::uuid AND s.organization_id = $2::uuid AND s.project_id = $3::uuid AND s.state = 'processing'",
         )
         .bind(upload_id)
         .bind(&job.organization_id)
@@ -497,7 +497,7 @@ impl Worker {
             .as_deref()
             .ok_or(JobError::Deterministic("missing_cache"))?;
         let row = sqlx::query(
-            "SELECT c.id::text AS id, c.object_key AS cache_key, c.processor_version, c.format_version, o.object_key AS source_key, o.checksum AS source_checksum, o.byte_size AS source_size, d.debug_id, d.architecture FROM derived_symbol_caches c JOIN artifact_objects o ON o.id = c.source_object_id AND o.organization_id = c.organization_id JOIN artifact_debug_images d ON d.object_id = o.id AND d.organization_id = o.organization_id AND d.artifact_type = 'pdb' WHERE c.id::text = $1 AND c.organization_id::text = $2 AND c.project_id::text = $3 AND c.state IN ('pending', 'processing') LIMIT 1",
+            "SELECT c.id::text AS id, c.object_key AS cache_key, c.processor_version, c.format_version, o.object_key AS source_key, o.checksum AS source_checksum, o.byte_size AS source_size, d.debug_id, d.architecture FROM derived_symbol_caches c JOIN artifact_objects o ON o.id = c.source_object_id AND o.organization_id = c.organization_id JOIN artifact_debug_images d ON d.object_id = o.id AND d.organization_id = o.organization_id AND d.artifact_type = 'pdb' WHERE c.id = $1::uuid AND c.organization_id = $2::uuid AND c.project_id = $3::uuid AND c.state IN ('pending', 'processing') LIMIT 1",
         )
         .bind(cache_id)
         .bind(&job.organization_id)
@@ -569,7 +569,7 @@ impl Worker {
             .as_deref()
             .ok_or(JobError::Deterministic("missing_event"))?;
         let row = sqlx::query(
-            "SELECT e.crash_guid, o.object_key, o.checksum, o.byte_size, r.result AS previous_result FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
+            "SELECT e.crash_guid, o.object_key, o.checksum, o.byte_size, r.result AS previous_result FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -655,7 +655,7 @@ impl Worker {
             .as_deref()
             .ok_or(JobError::Deterministic("missing_event"))?;
         let raw = sqlx::query(
-            "SELECT o.id::text AS object_id, o.object_key, o.byte_size, o.lifecycle_state, e.raw_retention_class FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3",
+            "SELECT o.id::text AS object_id, o.object_key, o.byte_size, o.lifecycle_state, e.raw_retention_class FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -675,7 +675,7 @@ impl Worker {
                 .map_err(|_| JobError::Transient("database_unavailable"))?;
             lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
             let restored = sqlx::query(
-                "UPDATE crash_event_objects o SET lifecycle_state = 'stored' FROM crash_events e WHERE o.id::text = $1 AND o.organization_id::text = $2 AND o.project_id::text = $3 AND o.lifecycle_state = 'deleting' AND e.raw_object_id = o.id AND e.organization_id = o.organization_id AND e.project_id = o.project_id AND e.raw_retention_class = 'deleting'",
+                "UPDATE crash_event_objects o SET lifecycle_state = 'stored' FROM crash_events e WHERE o.id = $1::uuid AND o.organization_id = $2::uuid AND o.project_id = $3::uuid AND o.lifecycle_state = 'deleting' AND e.raw_object_id = o.id AND e.organization_id = o.organization_id AND e.project_id = o.project_id AND e.raw_retention_class = 'deleting'",
             )
             .bind(raw.get::<String, _>("object_id"))
             .bind(&job.organization_id)
@@ -685,7 +685,7 @@ impl Worker {
             .map_err(|_| JobError::Transient("database_unavailable"))?;
             if restored.rows_affected() == 1 {
                 sqlx::query(
-                    "UPDATE crash_events SET raw_retention_class = 'standard' WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND raw_retention_class = 'deleting'",
+                    "UPDATE crash_events SET raw_retention_class = 'standard' WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND raw_retention_class = 'deleting'",
                 )
                 .bind(event_id)
                 .bind(&job.organization_id)
@@ -723,7 +723,7 @@ impl Worker {
             .map_err(|_| JobError::Transient("database_unavailable"))?;
         lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
         let current = sqlx::query(
-            "SELECT o.id::text AS object_id, o.byte_size, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id::text = $1 AND e.organization_id::text = $2 AND e.project_id::text = $3 FOR UPDATE OF e, o",
+            "SELECT o.id::text AS object_id, o.byte_size, o.lifecycle_state FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid FOR UPDATE OF e, o",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -763,7 +763,7 @@ impl Worker {
             });
         };
         let candidates = sqlx::query_scalar::<_, String>(
-            "SELECT id::text FROM releases WHERE organization_id::text = $1 AND project_id::text = $2 AND version = $3 AND platform = $4 AND architecture = $5 AND lower(configuration) = lower($6) ORDER BY id LIMIT $7",
+            "SELECT id::text FROM releases WHERE organization_id = $1::uuid AND project_id = $2::uuid AND version = $3 AND platform = $4 AND architecture = $5 AND lower(configuration) = lower($6) ORDER BY id LIMIT $7",
         )
         .bind(&job.organization_id)
         .bind(&job.project_id)
@@ -798,7 +798,7 @@ impl Worker {
             .ok_or(JobError::Deterministic("processor_output_invalid"))?;
         let modules = processing_modules(result)?;
         let rows = sqlx::query(
-            "SELECT m.artifact_type, m.module_name, m.architecture, m.debug_id, m.code_id, o.id::text AS object_id, o.object_key, o.checksum, o.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id AND d.processing_status = 'available' JOIN artifact_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id AND o.lifecycle_state = 'stored' WHERE m.release_id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available'",
+            "SELECT m.artifact_type, m.module_name, m.architecture, m.debug_id, m.code_id, o.id::text AS object_id, o.object_key, o.checksum, o.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id AND d.processing_status = 'available' JOIN artifact_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id AND o.lifecycle_state = 'stored' WHERE m.release_id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available'",
         )
         .bind(release_id)
         .bind(&job.organization_id)
@@ -1009,7 +1009,7 @@ impl Worker {
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
         let manifest = sqlx::query(
-            "UPDATE release_manifest_artifacts SET debug_image_id = $4::uuid, state = 'available', failure_code = NULL, uploaded_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing' AND checksum = $5 AND byte_size = $6 AND artifact_type = $7 AND module_name = $8 AND architecture = $9 AND debug_id = $10 AND code_id IS NOT DISTINCT FROM $11",
+            "UPDATE release_manifest_artifacts SET debug_image_id = $4::uuid, state = 'available', failure_code = NULL, uploaded_at = now(), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing' AND checksum = $5 AND byte_size = $6 AND artifact_type = $7 AND module_name = $8 AND architecture = $9 AND debug_id = $10 AND code_id IS NOT DISTINCT FROM $11",
         )
         .bind(&artifact.manifest_artifact_id)
         .bind(&job.organization_id)
@@ -1029,7 +1029,7 @@ impl Worker {
             return Err(JobError::LostLease);
         }
         let session = sqlx::query(
-            "UPDATE artifact_upload_sessions SET state = 'completed', failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing' AND checksum = $4 AND byte_size = $5 AND artifact_type = $6 AND module_name = $7 AND architecture = $8 AND debug_id = $9 AND code_id IS NOT DISTINCT FROM $10",
+            "UPDATE artifact_upload_sessions SET state = 'completed', failure_code = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing' AND checksum = $4 AND byte_size = $5 AND artifact_type = $6 AND module_name = $7 AND architecture = $8 AND debug_id = $9 AND code_id IS NOT DISTINCT FROM $10",
         )
         .bind(&artifact.id)
         .bind(&job.organization_id)
@@ -1089,7 +1089,7 @@ impl Worker {
             .map_err(|_| JobError::Transient("database_unavailable"))?;
         lock_lease(&mut transaction, job, self.instance_id.as_ref()).await?;
         let session = sqlx::query(
-            "UPDATE artifact_upload_sessions SET state = 'failed', failure_code = $4, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing' AND checksum = $5 AND byte_size = $6 AND artifact_type = $7 AND module_name = $8 AND architecture = $9 AND debug_id = $10 AND code_id IS NOT DISTINCT FROM $11",
+            "UPDATE artifact_upload_sessions SET state = 'failed', failure_code = $4, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing' AND checksum = $5 AND byte_size = $6 AND artifact_type = $7 AND module_name = $8 AND architecture = $9 AND debug_id = $10 AND code_id IS NOT DISTINCT FROM $11",
         )
         .bind(&artifact.id)
         .bind(&job.organization_id)
@@ -1109,7 +1109,7 @@ impl Worker {
             return Err(JobError::LostLease);
         }
         let manifest = sqlx::query(
-            "UPDATE release_manifest_artifacts SET state = $4, failure_code = CASE WHEN $4 = 'quarantined' THEN $5 ELSE NULL END, debug_image_id = NULL, uploaded_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing' AND checksum = $6 AND byte_size = $7 AND artifact_type = $8 AND module_name = $9 AND architecture = $10 AND debug_id = $11 AND code_id IS NOT DISTINCT FROM $12",
+            "UPDATE release_manifest_artifacts SET state = $4, failure_code = CASE WHEN $4 = 'quarantined' THEN $5 ELSE NULL END, debug_image_id = NULL, uploaded_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing' AND checksum = $6 AND byte_size = $7 AND artifact_type = $8 AND module_name = $9 AND architecture = $10 AND debug_id = $11 AND code_id IS NOT DISTINCT FROM $12",
         )
         .bind(&artifact.manifest_artifact_id)
         .bind(&job.organization_id)
@@ -1140,7 +1140,7 @@ impl Worker {
 
     async fn mark_cache_processing(&self, job: &Job) -> Result<(), JobError> {
         let updated = sqlx::query(
-            "UPDATE derived_symbol_caches c SET state = 'processing', updated_at = now() FROM jobs j WHERE c.id = j.derived_cache_id AND c.organization_id = j.organization_id AND c.project_id = j.project_id AND j.id::text = $1 AND j.organization_id::text = $2 AND j.project_id::text = $3 AND j.state = 'leased' AND j.lease_owner = $4 AND j.lease_token::text = $5 AND j.lease_expires_at > now()",
+            "UPDATE derived_symbol_caches c SET state = 'processing', updated_at = now() FROM jobs j WHERE c.id = j.derived_cache_id AND c.organization_id = j.organization_id AND c.project_id = j.project_id AND j.id = $1::uuid AND j.organization_id = $2::uuid AND j.project_id = $3::uuid AND j.state = 'leased' AND j.lease_owner = $4 AND j.lease_token = $5::uuid AND j.lease_expires_at > now()",
         )
         .bind(&job.id)
         .bind(&job.organization_id)
@@ -1177,7 +1177,7 @@ impl Worker {
             .await
             .map_err(map_cache_object_error)?;
         let updated = sqlx::query(
-            "UPDATE derived_symbol_caches SET state = 'available', checksum = $4, byte_size = $5, failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing' AND object_key = $6",
+            "UPDATE derived_symbol_caches SET state = 'available', checksum = $4, byte_size = $5, failure_code = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing' AND object_key = $6",
         )
         .bind(cache_id)
         .bind(&job.organization_id)
@@ -1287,7 +1287,7 @@ impl Worker {
         .await
         .map_err(|_| JobError::Transient("database_unavailable"))?;
         sqlx::query(
-            "DELETE FROM crash_event_context_facets WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+            "DELETE FROM crash_event_context_facets WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid",
         )
         .bind(&job.organization_id)
         .bind(&job.project_id)
@@ -1337,7 +1337,7 @@ impl Worker {
             recompute_issue(&mut transaction, job, issue_id, self.grouping_enabled).await?;
         }
         let updated = sqlx::query(
-            "UPDATE crash_events SET current_result_id = $4::uuid, processing_state = $5, state_reason = CASE WHEN $5 = 'processed' THEN NULL ELSE $6 END, retryable = false, retry_at = NULL, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $7), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING requested_reprocessing_generation",
+            "UPDATE crash_events SET current_result_id = $4::uuid, processing_state = $5, state_reason = CASE WHEN $5 = 'processed' THEN NULL ELSE $6 END, retryable = false, retry_at = NULL, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $7), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING requested_reprocessing_generation",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -1420,7 +1420,7 @@ impl Worker {
             .await
             .map_err(|_| JobError::Transient("database_unavailable"))?;
         let updated = sqlx::query(
-            "UPDATE jobs SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = $7, resource_failures = resource_failures + CASE WHEN $8 THEN 1 ELSE 0 END, attempt = attempt - CASE WHEN $9 THEN 1 ELSE 0 END, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
+            "UPDATE jobs SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = $7, resource_failures = resource_failures + CASE WHEN $8 THEN 1 ELSE 0 END, attempt = attempt - CASE WHEN $9 THEN 1 ELSE 0 END, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid",
         )
         .bind(&job.id)
         .bind(&job.organization_id)
@@ -1441,7 +1441,7 @@ impl Worker {
             && let Some(event_id) = job.event_id.as_deref()
         {
             let request_ids = sqlx::query_scalar::<_, String>(
-                "UPDATE crash_reprocessing_request_events SET state = 'queued' WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state = 'running' RETURNING request_id::text",
+                "UPDATE crash_reprocessing_request_events SET state = 'queued' WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid AND generation <= $4 AND state = 'running' RETURNING request_id::text",
             )
             .bind(&job.organization_id)
             .bind(&job.project_id)
@@ -1490,7 +1490,7 @@ impl Worker {
         match job.kind.as_str() {
             "process_crash" => {
                 let updated = sqlx::query(
-                    "UPDATE crash_events SET processing_state = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN processing_state ELSE $4 END, state_reason = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN state_reason ELSE $5 END, retryable = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retryable ELSE false END, retry_at = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retry_at ELSE NULL END, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $6), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING requested_reprocessing_generation",
+                    "UPDATE crash_events SET processing_state = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN processing_state ELSE $4 END, state_reason = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN state_reason ELSE $5 END, retryable = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retryable ELSE false END, retry_at = CASE WHEN $6 > 0 AND current_result_id IS NOT NULL THEN retry_at ELSE NULL END, completed_reprocessing_generation = GREATEST(completed_reprocessing_generation, $6), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING requested_reprocessing_generation",
                 )
                 .bind(job.event_id.as_deref().unwrap_or_default())
                 .bind(&job.organization_id)
@@ -1505,7 +1505,7 @@ impl Worker {
                 let requested_generation: i64 = updated.get("requested_reprocessing_generation");
                 if job.target_generation > 0 {
                     let request_ids = sqlx::query_scalar::<_, String>(
-                        "UPDATE crash_reprocessing_request_events SET state = 'failed', result_id = NULL, failure_code = $5, completed_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
+                        "UPDATE crash_reprocessing_request_events SET state = 'failed', result_id = NULL, failure_code = $5, completed_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
                     )
                     .bind(&job.organization_id)
                     .bind(&job.project_id)
@@ -1523,7 +1523,7 @@ impl Worker {
             }
             "index_artifact" => {
                 let session = sqlx::query(
-                    "UPDATE artifact_upload_sessions SET state = 'failed', failure_code = $4, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'processing'",
+                    "UPDATE artifact_upload_sessions SET state = 'failed', failure_code = $4, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'processing'",
                 )
                 .bind(job.artifact_upload_id.as_deref().unwrap_or_default())
                 .bind(&job.organization_id)
@@ -1536,7 +1536,7 @@ impl Worker {
                     return Err(JobError::LostLease);
                 }
                 let manifest = sqlx::query(
-                    "UPDATE release_manifest_artifacts m SET state = 'quarantined', failure_code = $4, debug_image_id = NULL, updated_at = now() FROM artifact_upload_sessions s WHERE s.id::text = $1 AND s.organization_id::text = $2 AND s.project_id::text = $3 AND m.id = s.manifest_artifact_id AND m.organization_id = s.organization_id AND m.project_id = s.project_id AND m.state = 'processing'",
+                    "UPDATE release_manifest_artifacts m SET state = 'quarantined', failure_code = $4, debug_image_id = NULL, updated_at = now() FROM artifact_upload_sessions s WHERE s.id = $1::uuid AND s.organization_id = $2::uuid AND s.project_id = $3::uuid AND m.id = s.manifest_artifact_id AND m.organization_id = s.organization_id AND m.project_id = s.project_id AND m.state = 'processing'",
                 )
                 .bind(job.artifact_upload_id.as_deref().unwrap_or_default())
                 .bind(&job.organization_id)
@@ -1551,7 +1551,7 @@ impl Worker {
             }
             "generate_symcache" => {
                 let updated = sqlx::query(
-                    "UPDATE derived_symbol_caches SET state = $4, failure_code = $5, checksum = NULL, byte_size = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state IN ('pending', 'processing')",
+                    "UPDATE derived_symbol_caches SET state = $4, failure_code = $5, checksum = NULL, byte_size = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state IN ('pending', 'processing')",
                 )
                 .bind(job.derived_cache_id.as_deref().unwrap_or_default())
                 .bind(&job.organization_id)
@@ -1674,7 +1674,7 @@ async fn lock_reprocessing_request(
     worker_id: &str,
 ) -> Result<(), JobError> {
     let found: Option<String> = sqlx::query_scalar(
-        "SELECT id::text FROM crash_reprocessing_requests WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5 AND lease_expires_at > now() FOR UPDATE",
+        "SELECT id::text FROM crash_reprocessing_requests WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'scheduling' AND lease_owner = $4 AND lease_token = $5::uuid AND lease_expires_at > now() FOR UPDATE",
     )
     .bind(&request.id)
     .bind(&request.organization_id)
@@ -1694,7 +1694,7 @@ async fn automatic_reprocessing_candidates(
     let batch = i64::try_from(AUTOMATIC_REPROCESSING_BATCH + 1).unwrap_or(i64::MAX);
     let rows = match request.scope_kind.as_str() {
         "artifact" => sqlx::query(
-            "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id::text = $1 AND m.organization_id::text = $2 AND m.project_id::text = $3 AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
+            "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
         )
         .bind(request.scope_value.as_deref().unwrap_or_default())
         .bind(&request.organization_id)
@@ -1712,7 +1712,7 @@ async fn automatic_reprocessing_candidates(
                 .filter(|value| *value > 0)
                 .ok_or(JobError::Deterministic("reprocessing_request_invalid"))?;
             sqlx::query(
-                "SELECT e.id::text AS event_id FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.received_at <= $3 AND r.data_rules_version < $4 AND ($5::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id::text = $5 AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) ORDER BY e.received_at, e.id LIMIT $6",
+                "SELECT e.id::text AS event_id FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at <= $3 AND r.data_rules_version < $4 AND ($5::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id = $5::uuid AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) ORDER BY e.received_at, e.id LIMIT $6",
             )
             .bind(&request.organization_id)
             .bind(&request.project_id)
@@ -1742,7 +1742,7 @@ async fn manual_reprocessing_candidates(
         .request_limit
         .ok_or(JobError::Deterministic("reprocessing_request_invalid"))?;
     let rows = sqlx::query(
-        "SELECT e.id::text AS event_id FROM crash_events e LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.received_at <= $3 AND ($4::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id::text = $4 AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) AND (($5 = 'event' AND e.id::text = $6) OR ($5 = 'issue' AND e.issue_id::text = $6) OR ($5 = 'release' AND e.release_id::text = $6) OR ($5 = 'project') OR ($5 = 'parser_version' AND r.result #>> '{current,parser_version}' = $6) OR ($5 = 'symbolicator_version' AND r.result #>> '{current,symbolication,symbolicator_version}' = $6) OR ($5 = 'fingerprint_version' AND e.fingerprint_version::text = $6)) ORDER BY e.received_at, e.id LIMIT $7",
+        "SELECT e.id::text AS event_id FROM crash_events e LEFT JOIN crash_processing_results r ON r.id = e.current_result_id AND r.organization_id = e.organization_id AND r.project_id = e.project_id AND r.event_id = e.id WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.received_at <= $3 AND ($4::uuid IS NULL OR (e.received_at, e.id) > (SELECT c.received_at, c.id FROM crash_events c WHERE c.id = $4::uuid AND c.organization_id = e.organization_id AND c.project_id = e.project_id)) AND (($5 = 'event' AND e.id = $6::uuid) OR ($5 = 'issue' AND e.issue_id = $6::uuid) OR ($5 = 'release' AND e.release_id = $6::uuid) OR ($5 = 'project') OR ($5 = 'parser_version' AND r.result #>> '{current,parser_version}' = $6) OR ($5 = 'symbolicator_version' AND r.result #>> '{current,symbolication,symbolicator_version}' = $6) OR ($5 = 'fingerprint_version' AND e.fingerprint_version = $6::integer)) ORDER BY e.received_at, e.id LIMIT $7",
     )
     .bind(&request.organization_id)
     .bind(&request.project_id)
@@ -1768,7 +1768,7 @@ async fn schedule_reprocessing_events(
     event_ids: &[String],
 ) -> Result<(), JobError> {
     let locked_jobs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM (SELECT j.id FROM jobs j JOIN unnest($3::text[]) selected(event_id) ON selected.event_id::uuid = j.event_id WHERE j.organization_id::text = $1 AND j.project_id::text = $2 AND j.job_type = 'process_crash' ORDER BY j.id FOR UPDATE OF j) locked",
+        "SELECT count(*) FROM (SELECT j.id FROM jobs j JOIN unnest($3::text[]) selected(event_id) ON selected.event_id::uuid = j.event_id WHERE j.organization_id = $1::uuid AND j.project_id = $2::uuid AND j.job_type = 'process_crash' ORDER BY j.id FOR UPDATE OF j) locked",
     )
     .bind(&request.organization_id)
     .bind(&request.project_id)
@@ -1783,7 +1783,7 @@ async fn schedule_reprocessing_events(
         return Err(JobError::Deterministic("event_job_missing"));
     }
     let row = sqlx::query(
-        "WITH selected AS (SELECT unnest($4::text[])::uuid AS event_id), eligible AS MATERIALIZED (SELECT e.id, e.current_result_id, CASE WHEN j.state = 'leased' THEN CASE WHEN e.requested_reprocessing_generation <= COALESCE((SELECT max(x.generation) FROM crash_reprocessing_request_events x WHERE x.organization_id = e.organization_id AND x.project_id = e.project_id AND x.event_id = e.id AND x.state = 'running'), 0) THEN e.requested_reprocessing_generation + 1 ELSE e.requested_reprocessing_generation END WHEN e.requested_reprocessing_generation > e.completed_reprocessing_generation THEN e.requested_reprocessing_generation ELSE e.requested_reprocessing_generation + 1 END AS generation FROM crash_events e JOIN selected s ON s.event_id = e.id JOIN jobs j ON j.event_id = e.id AND j.organization_id = e.organization_id AND j.project_id = e.project_id AND j.job_type = 'process_crash' WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND NOT EXISTS (SELECT 1 FROM crash_reprocessing_request_events x WHERE x.request_id::text = $3 AND x.event_id = e.id) FOR UPDATE OF e), advanced AS (UPDATE crash_events e SET requested_reprocessing_generation = c.generation, updated_at = now() FROM eligible c WHERE e.id = c.id AND e.organization_id::text = $1 AND e.project_id::text = $2 RETURNING e.id, e.current_result_id, e.requested_reprocessing_generation), inserted AS (INSERT INTO crash_reprocessing_request_events (organization_id, project_id, request_id, event_id, generation, previous_result_id) SELECT $1::uuid, $2::uuid, $3::uuid, a.id, a.requested_reprocessing_generation, a.current_result_id FROM advanced a ON CONFLICT (request_id, event_id) DO NOTHING RETURNING event_id), reactivated AS (UPDATE jobs j SET state = CASE WHEN j.state = 'leased' THEN j.state ELSE 'pending' END, priority = CASE WHEN j.state IN ('completed', 'failed', 'dead') THEN 200 ELSE j.priority END, attempt = CASE WHEN j.state = 'leased' THEN j.attempt ELSE 0 END, resource_failures = CASE WHEN j.state = 'leased' THEN j.resource_failures ELSE 0 END, available_at = CASE WHEN j.state = 'leased' THEN j.available_at ELSE now() END, lease_owner = CASE WHEN j.state = 'leased' THEN j.lease_owner ELSE NULL END, lease_token = CASE WHEN j.state = 'leased' THEN j.lease_token ELSE NULL END, lease_expires_at = CASE WHEN j.state = 'leased' THEN j.lease_expires_at ELSE NULL END, heartbeat_at = CASE WHEN j.state = 'leased' THEN j.heartbeat_at ELSE NULL END, failure_code = CASE WHEN j.state = 'leased' THEN j.failure_code ELSE NULL END, completed_at = CASE WHEN j.state = 'leased' THEN j.completed_at ELSE NULL END, updated_at = now() FROM inserted i WHERE j.event_id = i.event_id AND j.organization_id::text = $1 AND j.project_id::text = $2 AND j.job_type = 'process_crash' RETURNING j.event_id) SELECT (SELECT count(*) FROM inserted) AS inserted_count, (SELECT count(*) FROM reactivated) AS reactivated_count",
+        "WITH selected AS (SELECT unnest($4::text[])::uuid AS event_id), eligible AS MATERIALIZED (SELECT e.id, e.current_result_id, CASE WHEN j.state = 'leased' THEN CASE WHEN e.requested_reprocessing_generation <= COALESCE((SELECT max(x.generation) FROM crash_reprocessing_request_events x WHERE x.organization_id = e.organization_id AND x.project_id = e.project_id AND x.event_id = e.id AND x.state = 'running'), 0) THEN e.requested_reprocessing_generation + 1 ELSE e.requested_reprocessing_generation END WHEN e.requested_reprocessing_generation > e.completed_reprocessing_generation THEN e.requested_reprocessing_generation ELSE e.requested_reprocessing_generation + 1 END AS generation FROM crash_events e JOIN selected s ON s.event_id = e.id JOIN jobs j ON j.event_id = e.id AND j.organization_id = e.organization_id AND j.project_id = e.project_id AND j.job_type = 'process_crash' WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND NOT EXISTS (SELECT 1 FROM crash_reprocessing_request_events x WHERE x.request_id = $3::uuid AND x.event_id = e.id) FOR UPDATE OF e), advanced AS (UPDATE crash_events e SET requested_reprocessing_generation = c.generation, updated_at = now() FROM eligible c WHERE e.id = c.id AND e.organization_id = $1::uuid AND e.project_id = $2::uuid RETURNING e.id, e.current_result_id, e.requested_reprocessing_generation), inserted AS (INSERT INTO crash_reprocessing_request_events (organization_id, project_id, request_id, event_id, generation, previous_result_id) SELECT $1::uuid, $2::uuid, $3::uuid, a.id, a.requested_reprocessing_generation, a.current_result_id FROM advanced a ON CONFLICT (request_id, event_id) DO NOTHING RETURNING event_id), reactivated AS (UPDATE jobs j SET state = CASE WHEN j.state = 'leased' THEN j.state ELSE 'pending' END, priority = CASE WHEN j.state IN ('completed', 'failed', 'dead') THEN 200 ELSE j.priority END, attempt = CASE WHEN j.state = 'leased' THEN j.attempt ELSE 0 END, resource_failures = CASE WHEN j.state = 'leased' THEN j.resource_failures ELSE 0 END, available_at = CASE WHEN j.state = 'leased' THEN j.available_at ELSE now() END, lease_owner = CASE WHEN j.state = 'leased' THEN j.lease_owner ELSE NULL END, lease_token = CASE WHEN j.state = 'leased' THEN j.lease_token ELSE NULL END, lease_expires_at = CASE WHEN j.state = 'leased' THEN j.lease_expires_at ELSE NULL END, heartbeat_at = CASE WHEN j.state = 'leased' THEN j.heartbeat_at ELSE NULL END, failure_code = CASE WHEN j.state = 'leased' THEN j.failure_code ELSE NULL END, completed_at = CASE WHEN j.state = 'leased' THEN j.completed_at ELSE NULL END, updated_at = now() FROM inserted i WHERE j.event_id = i.event_id AND j.organization_id = $1::uuid AND j.project_id = $2::uuid AND j.job_type = 'process_crash' RETURNING j.event_id) SELECT (SELECT count(*) FROM inserted) AS inserted_count, (SELECT count(*) FROM reactivated) AS reactivated_count",
     )
     .bind(&request.organization_id)
     .bind(&request.project_id)
@@ -1808,7 +1808,7 @@ async fn release_reprocessing_request_page(
     cursor: Option<&str>,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE crash_reprocessing_requests SET state = 'pending', selection_cursor_event_id = $6::uuid, attempt = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5",
+        "UPDATE crash_reprocessing_requests SET state = 'pending', selection_cursor_event_id = $6::uuid, attempt = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'scheduling' AND lease_owner = $4 AND lease_token = $5::uuid",
     )
     .bind(&request.id)
     .bind(&request.organization_id)
@@ -1834,7 +1834,7 @@ async fn complete_reprocessing_selection(
     next_cursor: Option<&str>,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE crash_reprocessing_requests SET state = 'running', selection_complete = true, selection_truncated = $6, next_cursor_event_id = $7::uuid, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'scheduling' AND lease_owner = $4 AND lease_token::text = $5",
+        "UPDATE crash_reprocessing_requests SET state = 'running', selection_complete = true, selection_truncated = $6, next_cursor_event_id = $7::uuid, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'scheduling' AND lease_owner = $4 AND lease_token = $5::uuid",
     )
     .bind(&request.id)
     .bind(&request.organization_id)
@@ -1858,7 +1858,7 @@ async fn refresh_reprocessing_request(
     request_id: &str,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "WITH counts AS (SELECT count(*) AS selected_count, count(*) FILTER (WHERE state = 'queued') AS queued_count, count(*) FILTER (WHERE state = 'running') AS running_count, count(*) FILTER (WHERE state = 'completed') AS completed_count, count(*) FILTER (WHERE state = 'failed') AS failed_count FROM crash_reprocessing_request_events WHERE request_id::text = $1), desired AS (SELECT r.id, c.*, CASE WHEN NOT r.selection_complete THEN r.state WHEN r.failure_code IS NOT NULL AND c.completed_count > 0 THEN 'partial' WHEN r.failure_code IS NOT NULL THEN 'failed' WHEN c.selected_count = 0 THEN 'completed' WHEN c.queued_count + c.running_count > 0 THEN 'running' WHEN c.completed_count > 0 AND c.failed_count > 0 THEN 'partial' WHEN c.failed_count > 0 THEN 'failed' ELSE 'completed' END AS next_state FROM crash_reprocessing_requests r CROSS JOIN counts c WHERE r.id::text = $1) UPDATE crash_reprocessing_requests r SET state = d.next_state, selected_count = d.selected_count, queued_count = d.queued_count, running_count = d.running_count, completed_count = d.completed_count, failed_count = d.failed_count, completed_at = CASE WHEN d.next_state IN ('completed', 'partial', 'failed') THEN COALESCE(r.completed_at, now()) ELSE NULL END, updated_at = now() FROM desired d WHERE r.id = d.id",
+        "WITH counts AS (SELECT count(*) AS selected_count, count(*) FILTER (WHERE state = 'queued') AS queued_count, count(*) FILTER (WHERE state = 'running') AS running_count, count(*) FILTER (WHERE state = 'completed') AS completed_count, count(*) FILTER (WHERE state = 'failed') AS failed_count FROM crash_reprocessing_request_events WHERE request_id = $1::uuid), desired AS (SELECT r.id, c.*, CASE WHEN NOT r.selection_complete THEN r.state WHEN r.failure_code IS NOT NULL AND c.completed_count > 0 THEN 'partial' WHEN r.failure_code IS NOT NULL THEN 'failed' WHEN c.selected_count = 0 THEN 'completed' WHEN c.queued_count + c.running_count > 0 THEN 'running' WHEN c.completed_count > 0 AND c.failed_count > 0 THEN 'partial' WHEN c.failed_count > 0 THEN 'failed' ELSE 'completed' END AS next_state FROM crash_reprocessing_requests r CROSS JOIN counts c WHERE r.id = $1::uuid) UPDATE crash_reprocessing_requests r SET state = d.next_state, selected_count = d.selected_count, queued_count = d.queued_count, running_count = d.running_count, completed_count = d.completed_count, failed_count = d.failed_count, completed_at = CASE WHEN d.next_state IN ('completed', 'partial', 'failed') THEN COALESCE(r.completed_at, now()) ELSE NULL END, updated_at = now() FROM desired d WHERE r.id = d.id",
     )
     .bind(request_id)
     .execute(&mut **transaction)
@@ -1888,7 +1888,7 @@ async fn finish_reprocessing_schedule_failure(
             .min(6);
         let seconds = i64::from(1_u32 << exponent).min(60);
         sqlx::query(
-            "UPDATE crash_reprocessing_requests SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $7, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lease_owner = $4 AND lease_token::text = $5",
+            "UPDATE crash_reprocessing_requests SET state = 'pending', available_at = now() + ($6 * interval '1 second'), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $7, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lease_owner = $4 AND lease_token = $5::uuid",
         )
         .bind(&request.id)
         .bind(&request.organization_id)
@@ -1902,7 +1902,7 @@ async fn finish_reprocessing_schedule_failure(
         .map_err(|_| JobError::Transient("database_unavailable"))?;
     } else {
         sqlx::query(
-            "UPDATE crash_reprocessing_requests SET state = 'failed', selection_complete = true, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $6, completed_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND lease_owner = $4 AND lease_token::text = $5",
+            "UPDATE crash_reprocessing_requests SET state = 'failed', selection_complete = true, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = $6, completed_at = now(), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lease_owner = $4 AND lease_token = $5::uuid",
         )
         .bind(&request.id)
         .bind(&request.organization_id)
@@ -1983,7 +1983,7 @@ async fn mark_reprocessing_events_running(
         return Ok(());
     };
     let request_ids = sqlx::query_scalar::<_, String>(
-        "UPDATE crash_reprocessing_request_events SET state = 'running', started_at = COALESCE(started_at, now()) WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state = 'queued' RETURNING request_id::text",
+        "UPDATE crash_reprocessing_request_events SET state = 'running', started_at = COALESCE(started_at, now()) WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid AND generation <= $4 AND state = 'queued' RETURNING request_id::text",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2416,7 +2416,7 @@ async fn lock_event(
     event_id: &str,
 ) -> Result<ExistingGrouping, JobError> {
     let row = sqlx::query(
-        "SELECT grouping_state, issue_id::text AS issue_id FROM crash_events WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+        "SELECT grouping_state, issue_id::text AS issue_id FROM crash_events WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid FOR UPDATE",
     )
     .bind(event_id)
     .bind(&job.organization_id)
@@ -2438,7 +2438,7 @@ async fn record_release_mapping(
     release: &ReleaseResolution,
 ) -> Result<(), JobError> {
     sqlx::query(
-        "DELETE FROM crash_event_release_candidates WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+        "DELETE FROM crash_event_release_candidates WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2459,7 +2459,7 @@ async fn record_release_mapping(
         .map_err(|_| JobError::Transient("database_unavailable"))?;
     }
     let updated = sqlx::query(
-        "UPDATE crash_events SET release_id = $4::uuid, release_mapping_state = $5, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE crash_events SET release_id = $4::uuid, release_mapping_state = $5, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(event_id)
     .bind(&job.organization_id)
@@ -2498,7 +2498,7 @@ async fn apply_grouping(
             }
         };
         let updated = sqlx::query(
-            "UPDATE crash_events SET grouping_state = $4, fingerprint_algorithm = $5, fingerprint_version = $6, issue_id = NULL, fingerprint = NULL, variant_fingerprint = NULL, grouping_quality = NULL, grouped_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND grouping_state <> 'grouped'",
+            "UPDATE crash_events SET grouping_state = $4, fingerprint_algorithm = $5, fingerprint_version = $6, issue_id = NULL, fingerprint = NULL, variant_fingerprint = NULL, grouping_quality = NULL, grouped_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND grouping_state <> 'grouped'",
         )
         .bind(event_id)
         .bind(&job.organization_id)
@@ -2526,7 +2526,7 @@ async fn assign_issue(
 ) -> Result<Option<String>, JobError> {
     let issue_id = random_uuid().map_err(|_| JobError::Transient("random_unavailable"))?;
     let stored_issue: String = sqlx::query_scalar(
-        "INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, first_seen_at, last_seen_at, event_count) SELECT $1::uuid, e.organization_id, e.project_id, $5, $6, $7, $8, e.received_at, e.received_at, 1 FROM crash_events e WHERE e.id::text = $2 AND e.organization_id::text = $3 AND e.project_id::text = $4 ON CONFLICT (organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint) DO UPDATE SET updated_at = issues.updated_at RETURNING id::text",
+        "INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, first_seen_at, last_seen_at, event_count) SELECT $1::uuid, e.organization_id, e.project_id, $5, $6, $7, $8, e.received_at, e.received_at, 1 FROM crash_events e WHERE e.id = $2::uuid AND e.organization_id = $3::uuid AND e.project_id = $4::uuid ON CONFLICT (organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint) DO UPDATE SET updated_at = issues.updated_at RETURNING id::text",
     )
     .bind(issue_id)
     .bind(event_id)
@@ -2541,7 +2541,7 @@ async fn assign_issue(
     .map_err(|_| JobError::Transient("database_unavailable"))?
     .ok_or(JobError::LostLease)?;
     let updated = sqlx::query(
-        "UPDATE crash_events SET issue_id = $4::uuid, grouping_state = 'grouped', fingerprint_algorithm = $5, fingerprint_version = $6, fingerprint = $7, variant_fingerprint = $8, grouping_quality = $9, grouped_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND grouping_state <> 'grouped'",
+        "UPDATE crash_events SET issue_id = $4::uuid, grouping_state = 'grouped', fingerprint_algorithm = $5, fingerprint_version = $6, fingerprint = $7, variant_fingerprint = $8, grouping_quality = $9, grouped_at = now(), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND grouping_state <> 'grouped'",
     )
     .bind(event_id)
     .bind(&job.organization_id)
@@ -2569,7 +2569,7 @@ async fn recompute_issue(
     transitions_enabled: bool,
 ) -> Result<(), JobError> {
     let issue = sqlx::query(
-        "SELECT status, regression_state, resolved_in_release_id::text AS resolved_in_release_id FROM issues WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+        "SELECT status, regression_state, resolved_in_release_id::text AS resolved_in_release_id FROM issues WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid FOR UPDATE",
     )
     .bind(issue_id)
     .bind(&job.organization_id)
@@ -2596,7 +2596,7 @@ async fn recompute_issue(
     let resolution_id: Option<String> = issue.get("resolved_in_release_id");
     let resolution_timestamp = if let Some(release_id) = resolution_id.as_deref() {
         sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
-            "SELECT build_timestamp FROM releases WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+            "SELECT build_timestamp FROM releases WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
         )
         .bind(release_id)
         .bind(&job.organization_id)
@@ -2648,7 +2648,7 @@ async fn refresh_issue_memberships(
     issue_id: &str,
 ) -> Result<(), JobError> {
     sqlx::query(
-        "DELETE FROM issue_variants WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3",
+        "DELETE FROM issue_variants WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2657,7 +2657,7 @@ async fn refresh_issue_memberships(
     .await
     .map_err(|_| JobError::Transient("database_unavailable"))?;
     sqlx::query(
-        "INSERT INTO issue_variants (organization_id, project_id, issue_id, variant_fingerprint, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 GROUP BY e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint",
+        "INSERT INTO issue_variants (organization_id, project_id, issue_id, variant_fingerprint, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid GROUP BY e.organization_id, e.project_id, e.issue_id, e.variant_fingerprint",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2666,7 +2666,7 @@ async fn refresh_issue_memberships(
     .await
     .map_err(|_| JobError::Transient("database_unavailable"))?;
     sqlx::query(
-        "DELETE FROM issue_releases WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3",
+        "DELETE FROM issue_releases WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2675,7 +2675,7 @@ async fn refresh_issue_memberships(
     .await
     .map_err(|_| JobError::Transient("database_unavailable"))?;
     sqlx::query(
-        "INSERT INTO issue_releases (organization_id, project_id, issue_id, release_id, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.release_id, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id::text = $1 AND e.project_id::text = $2 AND e.issue_id::text = $3 AND e.release_mapping_state = 'matched' GROUP BY e.organization_id, e.project_id, e.issue_id, e.release_id",
+        "INSERT INTO issue_releases (organization_id, project_id, issue_id, release_id, first_seen_at, last_seen_at, event_count, representative_event_id) SELECT e.organization_id, e.project_id, e.issue_id, e.release_id, min(e.received_at), max(e.received_at), count(*), (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] FROM crash_events e WHERE e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.issue_id = $3::uuid AND e.release_mapping_state = 'matched' GROUP BY e.organization_id, e.project_id, e.issue_id, e.release_id",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2684,7 +2684,7 @@ async fn refresh_issue_memberships(
     .await
     .map_err(|_| JobError::Transient("database_unavailable"))?;
     let updated = sqlx::query(
-        "WITH aggregate AS (SELECT min(e.received_at) AS first_seen_at, max(e.received_at) AS last_seen_at, count(*) AS event_count, (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] AS representative_event_id FROM crash_events e WHERE e.organization_id::text = $2 AND e.project_id::text = $3 AND e.issue_id::text = $1) UPDATE issues i SET first_seen_at = aggregate.first_seen_at, last_seen_at = aggregate.last_seen_at, event_count = aggregate.event_count, representative_event_id = aggregate.representative_event_id, updated_at = now() FROM aggregate WHERE i.id::text = $1 AND i.organization_id::text = $2 AND i.project_id::text = $3 AND aggregate.event_count > 0",
+        "WITH aggregate AS (SELECT min(e.received_at) AS first_seen_at, max(e.received_at) AS last_seen_at, count(*) AS event_count, (array_agg(e.id ORDER BY e.grouping_quality DESC, e.received_at, e.id))[1] AS representative_event_id FROM crash_events e WHERE e.organization_id = $2::uuid AND e.project_id = $3::uuid AND e.issue_id = $1::uuid) UPDATE issues i SET first_seen_at = aggregate.first_seen_at, last_seen_at = aggregate.last_seen_at, event_count = aggregate.event_count, representative_event_id = aggregate.representative_event_id, updated_at = now() FROM aggregate WHERE i.id = $1::uuid AND i.organization_id = $2::uuid AND i.project_id = $3::uuid AND aggregate.event_count > 0",
     )
     .bind(issue_id)
     .bind(&job.organization_id)
@@ -2705,7 +2705,7 @@ async fn load_release_chronology(
     issue_id: &str,
 ) -> Result<ReleaseChronology, JobError> {
     let rows = sqlx::query(
-        "SELECT r.id::text AS id, r.build_timestamp FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id::text = $1 AND ir.project_id::text = $2 AND ir.issue_id::text = $3 ORDER BY r.build_timestamp NULLS LAST, r.id",
+        "SELECT r.id::text AS id, r.build_timestamp FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id = $1::uuid AND ir.project_id = $2::uuid AND ir.issue_id = $3::uuid ORDER BY r.build_timestamp NULLS LAST, r.id",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2764,7 +2764,7 @@ async fn update_issue_chronology(
     regression_state: &str,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE issues SET first_release_id = $4::uuid, last_release_id = $5::uuid, status = $6, regression_state = $7, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3",
+        "UPDATE issues SET first_release_id = $4::uuid, last_release_id = $5::uuid, status = $6, regression_state = $7, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
     .bind(issue_id)
     .bind(&job.organization_id)
@@ -2789,7 +2789,7 @@ async fn lock_lease(
     worker_id: &str,
 ) -> Result<(), JobError> {
     let found: Option<String> = sqlx::query_scalar(
-        "UPDATE jobs SET heartbeat_at = now(), lease_expires_at = now() + ($6 * interval '1 second'), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5 AND lease_expires_at > now() RETURNING id::text",
+        "UPDATE jobs SET heartbeat_at = now(), lease_expires_at = now() + ($6 * interval '1 second'), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid AND lease_expires_at > now() RETURNING id::text",
     )
     .bind(&job.id)
     .bind(&job.organization_id)
@@ -2810,7 +2810,7 @@ async fn complete_job(
     failure_code: Option<&str>,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE jobs SET state = 'completed', failure_code = $6, completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
+        "UPDATE jobs SET state = 'completed', failure_code = $6, completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid",
     )
     .bind(&job.id)
     .bind(&job.organization_id)
@@ -2838,7 +2838,7 @@ async fn complete_reprocessing_request_events(
         return Ok(());
     }
     let request_ids = sqlx::query_scalar::<_, String>(
-        "UPDATE crash_reprocessing_request_events SET state = 'completed', result_id = $5::uuid, failure_code = NULL, completed_at = now() WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
+        "UPDATE crash_reprocessing_request_events SET state = 'completed', result_id = $5::uuid, failure_code = NULL, completed_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid AND generation <= $4 AND state IN ('queued', 'running') RETURNING request_id::text",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -2860,7 +2860,7 @@ async fn requeue_job_for_new_generation(
     worker_id: &str,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE jobs SET state = 'pending', priority = 200, attempt = 0, resource_failures = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
+        "UPDATE jobs SET state = 'pending', priority = 200, attempt = 0, resource_failures = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid",
     )
     .bind(&job.id)
     .bind(&job.organization_id)
@@ -2886,7 +2886,7 @@ async fn terminal_job(
     resource_failure: bool,
 ) -> Result<(), JobError> {
     let updated = sqlx::query(
-        "UPDATE jobs SET state = $6, failure_code = $7, resource_failures = resource_failures + CASE WHEN $8 THEN 1 ELSE 0 END, completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND state = 'leased' AND lease_owner = $4 AND lease_token::text = $5",
+        "UPDATE jobs SET state = $6, failure_code = $7, resource_failures = resource_failures + CASE WHEN $8 THEN 1 ELSE 0 END, completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_owner = $4 AND lease_token = $5::uuid",
     )
     .bind(&job.id)
     .bind(&job.organization_id)
@@ -3012,7 +3012,7 @@ async fn replace_symbol_waiters(
     waiters: &[SymbolWaiter],
 ) -> Result<(), JobError> {
     sqlx::query(
-        "DELETE FROM crash_symbol_waiters WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3",
+        "DELETE FROM crash_symbol_waiters WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid",
     )
     .bind(&job.organization_id)
     .bind(&job.project_id)
@@ -4048,7 +4048,7 @@ mod tests {
         let lease_token =
             random_uuid().unwrap_or_else(|error| panic!("lease token must generate: {error}"));
         let row = sqlx::query(
-            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id::text = $1 RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token, COALESCE((SELECT requested_reprocessing_generation FROM crash_events WHERE id = jobs.event_id), 0) AS target_generation",
+            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id = $1::uuid RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token, COALESCE((SELECT requested_reprocessing_generation FROM crash_events WHERE id = jobs.event_id), 0) AS target_generation",
         )
         .bind(job_id)
         .bind(owner)
@@ -4282,7 +4282,7 @@ mod tests {
             .event_id
             .clone()
             .unwrap_or_else(|| panic!("crash job must have an event"));
-        sqlx::query("UPDATE crash_events SET received_at = $2::timestamptz WHERE id::text = $1")
+        sqlx::query("UPDATE crash_events SET received_at = $2::timestamptz WHERE id = $1::uuid")
             .bind(&event_id)
             .bind(received_at)
             .execute(&worker.pool)
@@ -4353,7 +4353,7 @@ mod tests {
         )
         .await;
         let initial: (i64, String, i64) = sqlx::query_as(
-            "SELECT r.data_rules_version, s.search_text, (SELECT count(*) FROM crash_event_context_facets f WHERE f.event_id = e.id) FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.id::text = $1",
+            "SELECT r.data_rules_version, s.search_text, (SELECT count(*) FROM crash_event_context_facets f WHERE f.event_id = e.id) FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -4401,7 +4401,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("redacted result must publish: {error:?}"));
 
         let current = sqlx::query(
-            "SELECT r.result, r.data_rules_version, s.search_text, o.checksum, q.state AS request_state FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id JOIN crash_event_objects o ON o.id = e.raw_object_id JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id::text = $1",
+            "SELECT r.result, r.data_rules_version, s.search_text, o.checksum, q.state AS request_state FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN crash_event_search s ON s.event_id = e.id AND s.result_id = e.current_result_id JOIN crash_event_objects o ON o.id = e.raw_object_id JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -4419,7 +4419,7 @@ mod tests {
         assert_eq!(current.get::<Vec<u8>, _>("checksum"), vec![0_u8; 32]);
         assert_eq!(current.get::<String, _>("request_state"), "completed");
         let facets = sqlx::query(
-            "SELECT key, value, value_truncated FROM crash_event_context_facets WHERE organization_id::text = $1 AND project_id::text = $2 AND event_id::text = $3 ORDER BY key, value",
+            "SELECT key, value, value_truncated FROM crash_event_context_facets WHERE organization_id = $1::uuid AND project_id = $2::uuid AND event_id = $3::uuid ORDER BY key, value",
         )
         .bind(&scope.organization)
         .bind(&scope.project)
@@ -4445,7 +4445,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("duplicate reprocessing must publish: {error:?}"));
         let rule_version_results: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1 AND data_rules_version = 1",
+            "SELECT count(*) FROM crash_processing_results WHERE event_id = $1::uuid AND data_rules_version = 1",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -4516,7 +4516,7 @@ mod tests {
         )
         .await;
         let issue_id: String =
-            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&first_event)
                 .fetch_one(&pool)
                 .await
@@ -4556,7 +4556,7 @@ mod tests {
         )
         .await;
         let distinct_issue: String =
-            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&distinct_event)
                 .fetch_one(&pool)
                 .await
@@ -4564,7 +4564,7 @@ mod tests {
         assert_ne!(issue_id, distinct_issue);
 
         sqlx::query(
-            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id = $1::uuid",
         )
         .bind(&issue_id)
         .bind(&first_release)
@@ -4584,7 +4584,7 @@ mod tests {
         .await;
 
         let issue = sqlx::query(
-            "SELECT status, regression_state, event_count, representative_event_id::text AS representative_event_id, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+            "SELECT status, regression_state, event_count, representative_event_id::text AS representative_event_id, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id = $1::uuid",
         )
         .bind(&issue_id)
         .fetch_one(&pool)
@@ -4600,7 +4600,7 @@ mod tests {
         assert_eq!(issue.get::<String, _>("first_release_id"), first_release);
         assert_eq!(issue.get::<String, _>("last_release_id"), second_release);
         let repeated_ids = sqlx::query_scalar::<_, String>(
-            "SELECT issue_id::text FROM crash_events WHERE id::text = ANY($1)",
+            "SELECT issue_id::text FROM crash_events WHERE id = ANY(ARRAY(SELECT value::uuid FROM unnest($1::text[]) AS values(value)))",
         )
         .bind(vec![second_event, later_event])
         .fetch_all(&pool)
@@ -4608,14 +4608,14 @@ mod tests {
         .unwrap_or_else(|error| panic!("repeat assignments must load: {error}"));
         assert!(repeated_ids.iter().all(|id| id == &issue_id));
         let variants: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM issue_variants WHERE issue_id::text = $1")
+            sqlx::query_scalar("SELECT count(*) FROM issue_variants WHERE issue_id = $1::uuid")
                 .bind(&issue_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|error| panic!("variant count must load: {error}"));
         assert_eq!(variants, 1);
         let release_counts = sqlx::query(
-            "SELECT release_id::text AS release_id, event_count FROM issue_releases WHERE issue_id::text = $1 ORDER BY release_id",
+            "SELECT release_id::text AS release_id, event_count FROM issue_releases WHERE issue_id = $1::uuid ORDER BY release_id",
         )
         .bind(&issue_id)
         .fetch_all(&pool)
@@ -4630,7 +4630,7 @@ mod tests {
             3
         );
         let first_results: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+            "SELECT count(*) FROM crash_processing_results WHERE event_id = $1::uuid",
         )
         .bind(&first_event)
         .fetch_one(&pool)
@@ -4638,7 +4638,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("processing result count must load: {error}"));
         assert_eq!(first_results, 1);
         let search = sqlx::query(
-            "SELECT search.search_text, search.result_id = event.current_result_id AS current FROM crash_event_search search JOIN crash_events event ON event.id = search.event_id AND event.organization_id = search.organization_id AND event.project_id = search.project_id WHERE event.id::text = $1",
+            "SELECT search.search_text, search.result_id = event.current_result_id AS current FROM crash_event_search search JOIN crash_events event ON event.id = search.event_id AND event.organization_id = search.organization_id AND event.project_id = search.project_id WHERE event.id = $1::uuid",
         )
         .bind(&first_event)
         .fetch_one(&pool)
@@ -4680,7 +4680,7 @@ mod tests {
         )
         .await;
         let mappings = sqlx::query(
-            "SELECT id::text AS event_id, release_mapping_state, release_id::text AS release_id, (SELECT count(*) FROM crash_event_release_candidates c WHERE c.event_id = e.id) AS candidates FROM crash_events e WHERE id::text = ANY($1)",
+            "SELECT id::text AS event_id, release_mapping_state, release_id::text AS release_id, (SELECT count(*) FROM crash_event_release_candidates c WHERE c.event_id = e.id) AS candidates FROM crash_events e WHERE id = ANY(ARRAY(SELECT value::uuid FROM unnest($1::text[]) AS values(value)))",
         )
         .bind(vec![ambiguous_event, missing_event])
         .fetch_all(&pool)
@@ -4789,7 +4789,7 @@ mod tests {
         assert!(first.is_ok(), "first concurrent publication: {first:?}");
         assert!(second.is_ok(), "second concurrent publication: {second:?}");
         let issue = sqlx::query(
-            "SELECT id::text AS issue_id, count(*) OVER () AS issues, event_count FROM issues WHERE project_id::text = $1",
+            "SELECT id::text AS issue_id, count(*) OVER () AS issues, event_count FROM issues WHERE project_id = $1::uuid",
         )
         .bind(&project_id)
         .fetch_one(&pool)
@@ -4843,7 +4843,7 @@ mod tests {
             .clone()
             .unwrap_or_else(|| panic!("stale event must exist"));
         sqlx::query(
-            "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+            "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1::uuid",
         )
         .bind(&stale_job.id)
         .execute(&pool)
@@ -4861,7 +4861,7 @@ mod tests {
             .await;
         assert!(matches!(stale, Err(JobError::LostLease)));
         let stale_rows: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+            "SELECT count(*) FROM crash_processing_results WHERE event_id = $1::uuid",
         )
         .bind(&stale_event)
         .fetch_one(&pool)
@@ -4869,7 +4869,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("stale result count must load: {error}"));
         assert_eq!(stale_rows, 0);
         let stale_candidates: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_event_release_candidates WHERE event_id::text = $1",
+            "SELECT count(*) FROM crash_event_release_candidates WHERE event_id = $1::uuid",
         )
         .bind(&stale_event)
         .fetch_one(&pool)
@@ -4902,7 +4902,7 @@ mod tests {
                 panic!("disabled reprocessing must retain exact rollups: {error:?}")
             });
         let retained = sqlx::query(
-            "SELECT i.event_count, (SELECT count(*) FROM issue_releases ir WHERE ir.issue_id = i.id) AS releases FROM issues i WHERE i.id::text = $1",
+            "SELECT i.event_count, (SELECT count(*) FROM issue_releases ir WHERE ir.issue_id = i.id) AS releases FROM issues i WHERE i.id = $1::uuid",
         )
         .bind(&concurrent_issue_id)
         .fetch_one(&pool)
@@ -4931,7 +4931,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("disabled grouping must still process: {error:?}"));
         let disabled_state = sqlx::query(
-            "SELECT grouping_state, fingerprint_algorithm, fingerprint_version, issue_id::text AS issue_id, current_result_id::text AS current_result_id FROM crash_events WHERE id::text = $1",
+            "SELECT grouping_state, fingerprint_algorithm, fingerprint_version, issue_id::text AS issue_id, current_result_id::text AS current_result_id FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&disabled_event)
         .fetch_one(&pool)
@@ -4984,7 +4984,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("insufficient event must process: {error:?}"));
         let insufficient_state: String =
-            sqlx::query_scalar("SELECT grouping_state FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT grouping_state FROM crash_events WHERE id = $1::uuid")
                 .bind(&insufficient_event)
                 .fetch_one(&pool)
                 .await
@@ -5058,13 +5058,13 @@ mod tests {
         )
         .await;
         let late_issue: String =
-            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&late_root_event)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|error| panic!("late issue must load: {error}"));
         sqlx::query(
-            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id = $1::uuid",
         )
         .bind(&late_issue)
         .bind(&resolved)
@@ -5082,7 +5082,7 @@ mod tests {
         )
         .await;
         let late_state = sqlx::query(
-            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id = $1::uuid",
         )
         .bind(&late_issue)
         .fetch_one(&pool)
@@ -5104,13 +5104,13 @@ mod tests {
         )
         .await;
         let tied_issue: String =
-            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT issue_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&tied_root_event)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|error| panic!("tied issue must load: {error}"));
         sqlx::query(
-            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id::text = $1",
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', resolved_in_release_id = $2::uuid, resolved_at = now() WHERE id = $1::uuid",
         )
         .bind(&tied_issue)
         .bind(&resolved)
@@ -5128,7 +5128,7 @@ mod tests {
         )
         .await;
         let tied_state = sqlx::query(
-            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id::text = $1",
+            "SELECT status, regression_state, first_release_id::text AS first_release_id, last_release_id::text AS last_release_id FROM issues WHERE id = $1::uuid",
         )
         .bind(&tied_issue)
         .fetch_one(&pool)
@@ -5211,14 +5211,14 @@ mod tests {
             (right, "worker-right")
         };
         sqlx::query(
-            "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+            "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1::uuid",
         )
         .bind(&stale.id)
         .execute(&pool)
         .await
         .unwrap_or_else(|error| panic!("lease must expire: {error}"));
         sqlx::query(
-            "UPDATE jobs SET available_at = now() + interval '1 hour' WHERE project_id::text = $1 AND state = 'pending'",
+            "UPDATE jobs SET available_at = now() + interval '1 hour' WHERE project_id = $1::uuid AND state = 'pending'",
         )
         .bind(&stale.project_id)
         .execute(&pool)
@@ -5302,7 +5302,7 @@ mod tests {
             );
         let resource_job_id =
             insert_event_job(&pool, &organization_id, &unsafe_project, "resource").await;
-        sqlx::query("UPDATE jobs SET max_attempt = 1 WHERE id::text = $1")
+        sqlx::query("UPDATE jobs SET max_attempt = 1 WHERE id = $1::uuid")
             .bind(&resource_job_id)
             .execute(&pool)
             .await
@@ -5325,7 +5325,7 @@ mod tests {
             .finish_result(&first, Err(JobError::Resource("processor_resource_limit")))
             .await;
         let retry = sqlx::query(
-            "SELECT state, attempt, resource_failures, failure_code FROM jobs WHERE id::text = $1",
+            "SELECT state, attempt, resource_failures, failure_code FROM jobs WHERE id = $1::uuid",
         )
         .bind(&resource_job_id)
         .fetch_one(&pool)
@@ -5338,7 +5338,7 @@ mod tests {
             retry.get::<Option<String>, _>("failure_code").as_deref(),
             Some("processor_resource_limit")
         );
-        sqlx::query("UPDATE jobs SET available_at = now() WHERE id::text = $1")
+        sqlx::query("UPDATE jobs SET available_at = now() WHERE id = $1::uuid")
             .bind(&resource_job_id)
             .execute(&pool)
             .await
@@ -5353,7 +5353,7 @@ mod tests {
             .finish_result(&waiting, Err(JobError::Dependency))
             .await;
         let dependency = sqlx::query(
-            "SELECT state, attempt, resource_failures, failure_code FROM jobs WHERE id::text = $1",
+            "SELECT state, attempt, resource_failures, failure_code FROM jobs WHERE id = $1::uuid",
         )
         .bind(&resource_job_id)
         .fetch_one(&pool)
@@ -5368,7 +5368,7 @@ mod tests {
                 .as_deref(),
             Some("dependency_pending")
         );
-        sqlx::query("UPDATE jobs SET available_at = now() WHERE id::text = $1")
+        sqlx::query("UPDATE jobs SET available_at = now() WHERE id = $1::uuid")
             .bind(&resource_job_id)
             .execute(&pool)
             .await
@@ -5383,7 +5383,7 @@ mod tests {
             .finish_result(&second, Err(JobError::Resource("processor_resource_limit")))
             .await;
         let terminal = sqlx::query(
-            "SELECT j.state, j.attempt, j.resource_failures, e.processing_state FROM jobs j JOIN crash_events e ON e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id WHERE j.id::text = $1",
+            "SELECT j.state, j.attempt, j.resource_failures, e.processing_state FROM jobs j JOIN crash_events e ON e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id WHERE j.id = $1::uuid",
         )
         .bind(&resource_job_id)
         .fetch_one(&pool)
@@ -5404,13 +5404,13 @@ mod tests {
             .cancel_job(&cancelled)
             .await
             .unwrap_or_else(|_| panic!("cancellation must release the lease"));
-        let attempt: i32 = sqlx::query_scalar("SELECT attempt FROM jobs WHERE id::text = $1")
+        let attempt: i32 = sqlx::query_scalar("SELECT attempt FROM jobs WHERE id = $1::uuid")
             .bind(&cancelled_job)
             .fetch_one(&pool)
             .await
             .unwrap_or_else(|error| panic!("cancelled attempt must load: {error}"));
         assert_eq!(attempt, 0);
-        sqlx::query("UPDATE jobs SET available_at = now() + interval '1 hour' WHERE id::text = $1")
+        sqlx::query("UPDATE jobs SET available_at = now() + interval '1 hour' WHERE id = $1::uuid")
             .bind(&cancelled_job)
             .execute(&pool)
             .await
@@ -5432,7 +5432,7 @@ mod tests {
             .cancel_job(&claimed)
             .await
             .unwrap_or_else(|_| panic!("unrelated lease must release"));
-        sqlx::query("UPDATE jobs SET available_at = now() + interval '1 hour' WHERE id::text = $1")
+        sqlx::query("UPDATE jobs SET available_at = now() + interval '1 hour' WHERE id = $1::uuid")
             .bind(&unrelated_job)
             .execute(&pool)
             .await
@@ -5457,14 +5457,14 @@ mod tests {
                     Err(JobError::Transient("object_store_unavailable")),
                 )
                 .await;
-            let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE id::text = $1")
+            let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE id = $1::uuid")
                 .bind(&transient_job)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|error| panic!("transient state must load: {error}"));
             if attempt < 5 {
                 assert_eq!(state, "pending");
-                sqlx::query("UPDATE jobs SET available_at = now() WHERE id::text = $1")
+                sqlx::query("UPDATE jobs SET available_at = now() WHERE id = $1::uuid")
                     .bind(&transient_job)
                     .execute(&pool)
                     .await
@@ -5474,7 +5474,7 @@ mod tests {
             }
         }
         let failed_state: String =
-            sqlx::query_scalar("SELECT processing_state FROM crash_events WHERE id = (SELECT event_id FROM jobs WHERE id::text = $1)")
+            sqlx::query_scalar("SELECT processing_state FROM crash_events WHERE id = (SELECT event_id FROM jobs WHERE id = $1::uuid)")
                 .bind(&transient_job)
                 .fetch_one(&pool)
                 .await
@@ -5549,13 +5549,13 @@ mod tests {
         .unwrap_or_else(|error| panic!("upload token must insert: {error}"));
         let job_id = insert_event_job(&pool, &organization_id, &project_id, "reprocessing").await;
         let event_id: String =
-            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id = $1::uuid")
                 .bind(&job_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|error| panic!("event ID must load: {error}"));
         let raw_object_id: String =
-            sqlx::query_scalar("SELECT raw_object_id::text FROM crash_events WHERE id::text = $1")
+            sqlx::query_scalar("SELECT raw_object_id::text FROM crash_events WHERE id = $1::uuid")
                 .bind(&event_id)
                 .fetch_one(&pool)
                 .await
@@ -5584,7 +5584,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("partial result must publish: {error:?}"));
         let waiter_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id::text = $1 AND release_id::text = $2 AND required_artifact = 'pdb' AND debug_id = 'DEBUG-A'",
+            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id = $1::uuid AND release_id = $2::uuid AND required_artifact = 'pdb' AND debug_id = 'DEBUG-A'",
         )
         .bind(&event_id)
         .bind(&release_id)
@@ -5636,7 +5636,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("request must schedule"))
         );
         let scheduled = sqlx::query(
-            "SELECT e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state, j.priority, r.state AS request_state, r.selected_count, r.queued_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id::text = $1",
+            "SELECT e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state, j.priority, r.state AS request_state, r.selected_count, r.queued_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5682,7 +5682,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("resolved result must publish: {error:?}"));
         let completed = sqlx::query(
-            "SELECT e.processing_state, e.raw_object_id::text AS raw_object_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, jsonb_array_length(r.result->'history') AS history_count, j.state AS job_state, q.state AS request_state, q.completed_count, q.failed_count FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id::text = $1",
+            "SELECT e.processing_state, e.raw_object_id::text AS raw_object_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, jsonb_array_length(r.result->'history') AS history_count, j.state AS job_state, q.state AS request_state, q.completed_count, q.failed_count FROM crash_events e JOIN crash_processing_results r ON r.id = e.current_result_id JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests q ON q.id = x.request_id WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5704,7 +5704,7 @@ mod tests {
         assert_eq!(completed.get::<i64, _>("completed_count"), 1);
         assert_eq!(completed.get::<i64, _>("failed_count"), 0);
         let retained_results: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_processing_results WHERE event_id::text = $1",
+            "SELECT count(*) FROM crash_processing_results WHERE event_id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5712,7 +5712,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("result history must load: {error}"));
         assert_eq!(retained_results, 2);
         let remaining_waiters: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id::text = $1",
+            "SELECT count(*) FROM crash_symbol_waiters WHERE event_id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5755,7 +5755,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("mismatch request must schedule"))
         );
         let generation: i64 = sqlx::query_scalar(
-            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5779,7 +5779,7 @@ mod tests {
         let catchup_job_id =
             insert_event_job(&pool, &organization_id, &project_id, "reprocessing-catchup").await;
         let catchup_event_id: String =
-            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id = $1::uuid")
                 .bind(&catchup_job_id)
                 .fetch_one(&pool)
                 .await
@@ -5819,7 +5819,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("catch-up request must schedule"))
         );
         let catchup = sqlx::query(
-            "SELECT e.requested_reprocessing_generation, r.state, r.selected_count FROM crash_events e JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id::text = $1 AND r.scope_value = $2",
+            "SELECT e.requested_reprocessing_generation, r.state, r.selected_count FROM crash_events e JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id = $1::uuid AND r.scope_value = $2",
         )
         .bind(&catchup_event_id)
         .bind(&manifest_id)
@@ -5892,7 +5892,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("release must insert: {error}"));
         let job_id = insert_event_job(&pool, &organization_id, &project_id, "coalescing").await;
         let event_id: String =
-            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id::text = $1")
+            sqlx::query_scalar("SELECT event_id::text FROM jobs WHERE id = $1::uuid")
                 .bind(&job_id)
                 .fetch_one(&pool)
                 .await
@@ -5912,7 +5912,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("initial result must publish: {error:?}"));
         let initial = sqlx::query(
-            "SELECT current_result_id::text AS result_id, raw_object_id::text AS raw_object_id FROM crash_events WHERE id::text = $1",
+            "SELECT current_result_id::text AS result_id, raw_object_id::text AS raw_object_id FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -5972,7 +5972,7 @@ mod tests {
             );
         }
         let generations = sqlx::query(
-            "SELECT request_id::text AS request_id, generation FROM crash_reprocessing_request_events WHERE event_id::text = $1 ORDER BY generation, request_id",
+            "SELECT request_id::text AS request_id, generation FROM crash_reprocessing_request_events WHERE event_id = $1::uuid ORDER BY generation, request_id",
         )
         .bind(&event_id)
         .fetch_all(&pool)
@@ -5995,7 +5995,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("first generation must publish: {error:?}"));
         let after_first = sqlx::query(
-            "SELECT e.current_result_id::text AS result_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id::text = $1",
+            "SELECT e.current_result_id::text AS result_id, e.requested_reprocessing_generation, e.completed_reprocessing_generation, j.state AS job_state FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -6036,7 +6036,7 @@ mod tests {
             )
             .await;
         let failed = sqlx::query(
-            "SELECT e.current_result_id::text AS result_id, e.raw_object_id::text AS raw_object_id, e.processing_state, e.state_reason, e.completed_reprocessing_generation, j.state AS job_state, j.failure_code, (SELECT count(*) FROM crash_processing_results r WHERE r.event_id = e.id) AS result_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id::text = $1",
+            "SELECT e.current_result_id::text AS result_id, e.raw_object_id::text AS raw_object_id, e.processing_state, e.state_reason, e.completed_reprocessing_generation, j.state AS job_state, j.failure_code, (SELECT count(*) FROM crash_processing_results r WHERE r.event_id = e.id) AS result_count FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -6054,7 +6054,7 @@ mod tests {
         );
         assert_eq!(failed.get::<i64, _>("result_count"), 2);
         let states = sqlx::query(
-            "SELECT id::text AS request_id, state, completed_count, failed_count FROM crash_reprocessing_requests WHERE id::text = ANY($1::text[]) ORDER BY id",
+            "SELECT id::text AS request_id, state, completed_count, failed_count FROM crash_reprocessing_requests WHERE id = ANY(ARRAY(SELECT value::uuid FROM unnest($1::text[]) AS values(value))) ORDER BY id",
         )
         .bind(vec![&first_request, &second_request, &third_request])
         .fetch_all(&pool)
@@ -6088,7 +6088,7 @@ mod tests {
             .unwrap_or_else(|| panic!("request lease must exist"));
         assert_eq!(expired.id, recovered_request);
         sqlx::query(
-            "UPDATE crash_reprocessing_requests SET lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+            "UPDATE crash_reprocessing_requests SET lease_expires_at = now() - interval '1 second' WHERE id = $1::uuid",
         )
         .bind(&recovered_request)
         .execute(&pool)
@@ -6111,7 +6111,7 @@ mod tests {
             .await
             .unwrap_or_else(|()| panic!("current request lease must schedule"));
         let recovered_generation: i64 = sqlx::query_scalar(
-            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -6119,7 +6119,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("recovered generation must load: {error}"));
         assert_eq!(recovered_generation, 3);
         sqlx::query(
-            "UPDATE jobs SET state = 'completed', completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL WHERE id::text = $1",
+            "UPDATE jobs SET state = 'completed', completed_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL WHERE id = $1::uuid",
         )
         .bind(&job_id)
         .execute(&pool)
@@ -6131,7 +6131,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("request event reconciliation must succeed"))
         );
         let reconciled = sqlx::query(
-            "SELECT j.state AS job_state, x.state AS event_state, r.state AS request_state FROM jobs j JOIN crash_reprocessing_request_events x ON x.event_id = j.event_id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE j.id::text = $1 AND r.id::text = $2",
+            "SELECT j.state AS job_state, x.state AS event_state, r.state AS request_state FROM jobs j JOIN crash_reprocessing_request_events x ON x.event_id = j.event_id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE j.id = $1::uuid AND r.id = $2::uuid",
         )
         .bind(&job_id)
         .bind(&recovered_request)
@@ -6153,7 +6153,7 @@ mod tests {
         )
         .await;
         sqlx::query(
-            "UPDATE crash_reprocessing_requests SET state = 'scheduling', attempt = max_attempt, lease_owner = 'abandoned-scheduler', lease_token = gen_random_uuid(), lease_expires_at = now() - interval '1 second' WHERE id::text = $1",
+            "UPDATE crash_reprocessing_requests SET state = 'scheduling', attempt = max_attempt, lease_owner = 'abandoned-scheduler', lease_token = gen_random_uuid(), lease_expires_at = now() - interval '1 second' WHERE id = $1::uuid",
         )
         .bind(&exhausted_request)
         .execute(&pool)
@@ -6167,7 +6167,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("exhausted request must terminalize"))
         );
         let exhausted = sqlx::query(
-            "SELECT state, selection_complete, attempt, max_attempt, lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL AS lease_released, failure_code, completed_at IS NOT NULL AS completed, (SELECT count(*) FROM crash_reprocessing_request_events x WHERE x.request_id = r.id) AS event_count FROM crash_reprocessing_requests r WHERE id::text = $1",
+            "SELECT state, selection_complete, attempt, max_attempt, lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL AS lease_released, failure_code, completed_at IS NOT NULL AS completed, (SELECT count(*) FROM crash_reprocessing_request_events x WHERE x.request_id = r.id) AS event_count FROM crash_reprocessing_requests r WHERE id = $1::uuid",
         )
         .bind(&exhausted_request)
         .fetch_one(&pool)
@@ -6189,7 +6189,7 @@ mod tests {
         assert!(exhausted.get::<bool, _>("completed"));
         assert_eq!(exhausted.get::<i64, _>("event_count"), 0);
         let generation_after_exhaustion: i64 = sqlx::query_scalar(
-            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&event_id)
         .fetch_one(&pool)
@@ -6270,7 +6270,7 @@ mod tests {
         )
         .await;
         let identity = sqlx::query(
-            "SELECT issue_id::text AS issue_id, fingerprint_version FROM crash_events WHERE id::text = $1",
+            "SELECT issue_id::text AS issue_id, fingerprint_version FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&first_event)
         .fetch_one(&pool)
@@ -6322,7 +6322,7 @@ mod tests {
             );
         }
         let selected = sqlx::query(
-            "SELECT count(*) AS selected_count, count(DISTINCT event_id) AS event_count, min(event_id::text) AS event_id, min(generation) AS min_generation, max(generation) AS max_generation FROM crash_reprocessing_request_events WHERE request_id::text = ANY($1::text[])",
+            "SELECT count(*) AS selected_count, count(DISTINCT event_id) AS event_count, min(event_id::text) AS event_id, min(generation) AS min_generation, max(generation) AS max_generation FROM crash_reprocessing_request_events WHERE request_id = ANY(ARRAY(SELECT value::uuid FROM unnest($1::text[]) AS values(value)))",
         )
         .bind(&request_ids)
         .fetch_one(&pool)
@@ -6340,7 +6340,7 @@ mod tests {
         let project_request =
             project_request.unwrap_or_else(|| panic!("project request must exist"));
         let project_page = sqlx::query(
-            "SELECT selection_truncated, next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_requests WHERE id::text = $1",
+            "SELECT selection_truncated, next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_requests WHERE id = $1::uuid",
         )
         .bind(&project_request)
         .fetch_one(&pool)
@@ -6367,7 +6367,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("next page must schedule"))
         );
         let next = sqlx::query(
-            "SELECT x.event_id::text AS event_id, x.generation, r.selection_truncated, r.next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE x.request_id::text = $1",
+            "SELECT x.event_id::text AS event_id, x.generation, r.selection_truncated, r.next_cursor_event_id::text AS next_cursor FROM crash_reprocessing_request_events x JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE x.request_id = $1::uuid",
         )
         .bind(&next_request)
         .fetch_one(&pool)
@@ -6378,7 +6378,7 @@ mod tests {
         assert!(!next.get::<bool, _>("selection_truncated"));
         assert_eq!(next.get::<Option<String>, _>("next_cursor"), None);
         let outside_generation: i64 = sqlx::query_scalar(
-            "SELECT requested_reprocessing_generation FROM crash_events WHERE id::text = $1",
+            "SELECT requested_reprocessing_generation FROM crash_events WHERE id = $1::uuid",
         )
         .bind(&outside_event)
         .fetch_one(&pool)
@@ -6438,7 +6438,7 @@ mod tests {
         assert_eq!(inserted.get::<i64, _>("events"), 501);
         assert_eq!(inserted.get::<i64, _>("results"), 501);
         let prepared = sqlx::query(
-            "WITH updated AS (UPDATE crash_events e SET current_result_id = r.id FROM crash_processing_results r WHERE e.id = r.event_id AND e.organization_id::text = $1 AND e.project_id::text = $2 AND e.current_result_id IS NULL RETURNING e.id AS event_id, e.current_result_id), inserted_jobs AS (INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, state, priority, attempt, idempotency_key, completed_at) SELECT gen_random_uuid(), $1::uuid, $2::uuid, u.event_id, 'process_crash', '{}'::jsonb, 'completed', 100, 1, 'automatic-backlog-' || u.event_id::text, now() FROM updated u RETURNING event_id), inserted_waiters AS (INSERT INTO crash_symbol_waiters (organization_id, project_id, event_id, result_id, release_id, required_artifact, module_name, architecture, debug_id, code_id) SELECT $1::uuid, $2::uuid, u.event_id, u.current_result_id, $3::uuid, 'pdb', 'game.exe', 'x86_64', 'DEBUG-A', '' FROM updated u RETURNING event_id) SELECT (SELECT count(*) FROM inserted_jobs) AS jobs, (SELECT count(*) FROM inserted_waiters) AS waiters",
+            "WITH updated AS (UPDATE crash_events e SET current_result_id = r.id FROM crash_processing_results r WHERE e.id = r.event_id AND e.organization_id = $1::uuid AND e.project_id = $2::uuid AND e.current_result_id IS NULL RETURNING e.id AS event_id, e.current_result_id), inserted_jobs AS (INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, state, priority, attempt, idempotency_key, completed_at) SELECT gen_random_uuid(), $1::uuid, $2::uuid, u.event_id, 'process_crash', '{}'::jsonb, 'completed', 100, 1, 'automatic-backlog-' || u.event_id::text, now() FROM updated u RETURNING event_id), inserted_waiters AS (INSERT INTO crash_symbol_waiters (organization_id, project_id, event_id, result_id, release_id, required_artifact, module_name, architecture, debug_id, code_id) SELECT $1::uuid, $2::uuid, u.event_id, u.current_result_id, $3::uuid, 'pdb', 'game.exe', 'x86_64', 'DEBUG-A', '' FROM updated u RETURNING event_id) SELECT (SELECT count(*) FROM inserted_jobs) AS jobs, (SELECT count(*) FROM inserted_waiters) AS waiters",
         )
         .bind(&scope.organization)
         .bind(&scope.project)
@@ -6523,7 +6523,7 @@ mod tests {
                 .unwrap_or_else(|()| panic!("empty scheduler pass must succeed"))
         );
         let aggregate = sqlx::query(
-            "SELECT count(*) AS events, min(requested_reprocessing_generation) AS minimum_generation, max(requested_reprocessing_generation) AS maximum_generation, count(*) FILTER (WHERE j.state = 'pending' AND j.priority = 200) AS pending_jobs, (SELECT count(*) FROM crash_reprocessing_requests) AS requests, (SELECT count(*) FROM crash_reprocessing_request_events) AS request_events FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.project_id::text = $1",
+            "SELECT count(*) AS events, min(requested_reprocessing_generation) AS minimum_generation, max(requested_reprocessing_generation) AS maximum_generation, count(*) FILTER (WHERE j.state = 'pending' AND j.priority = 200) AS pending_jobs, (SELECT count(*) FROM crash_reprocessing_requests) AS requests, (SELECT count(*) FROM crash_reprocessing_request_events) AS request_events FROM crash_events e JOIN jobs j ON j.event_id = e.id AND j.job_type = 'process_crash' WHERE e.project_id = $1::uuid",
         )
         .bind(&scope.project)
         .fetch_one(&pool)

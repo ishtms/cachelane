@@ -115,7 +115,7 @@ pub(crate) async fn get_data_rules(
     .await?;
     let pool = state.control_pool().ok_or(DataRulesError::Internal)?;
     let row = sqlx::query(
-        "SELECT r.version, r.redaction_patterns, r.indexed_game_data_keys FROM projects p LEFT JOIN project_data_rules r ON r.organization_id = p.organization_id AND r.project_id = p.id WHERE p.organization_id::text = $1 AND p.id::text = $2",
+        "SELECT r.version, r.redaction_patterns, r.indexed_game_data_keys FROM projects p LEFT JOIN project_data_rules r ON r.organization_id = p.organization_id AND r.project_id = p.id WHERE p.organization_id = $1::uuid AND p.id = $2::uuid",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -157,7 +157,7 @@ pub(crate) async fn update_data_rules(
     let pool = state.control_pool().ok_or(DataRulesError::Internal)?;
     let mut transaction = pool.begin().await.map_err(|_| DataRulesError::Internal)?;
     let project: Option<String> = sqlx::query_scalar(
-        "SELECT id::text FROM projects WHERE organization_id::text = $1 AND id::text = $2 FOR UPDATE",
+        "SELECT id::text FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid FOR UPDATE",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -168,7 +168,7 @@ pub(crate) async fn update_data_rules(
         return Err(DataRulesError::NotFound);
     }
     let current = sqlx::query(
-        "SELECT version, redaction_patterns, indexed_game_data_keys FROM project_data_rules WHERE organization_id::text = $1 AND project_id::text = $2",
+        "SELECT version, redaction_patterns, indexed_game_data_keys FROM project_data_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid",
     )
     .bind(&actor.organization_id)
     .bind(&actor.project_id)
@@ -245,7 +245,7 @@ pub(crate) async fn lock_for_publication(
     project_id: &str,
 ) -> Result<DataRules, DataRulesError> {
     let row = sqlx::query(
-        "SELECT r.version, r.redaction_patterns, r.indexed_game_data_keys FROM projects p LEFT JOIN project_data_rules r ON r.organization_id = p.organization_id AND r.project_id = p.id WHERE p.organization_id::text = $1 AND p.id::text = $2 FOR UPDATE OF p",
+        "SELECT r.version, r.redaction_patterns, r.indexed_game_data_keys FROM projects p LEFT JOIN project_data_rules r ON r.organization_id = p.organization_id AND r.project_id = p.id WHERE p.organization_id = $1::uuid AND p.id = $2::uuid FOR UPDATE OF p",
     )
     .bind(organization_id)
     .bind(project_id)
@@ -716,7 +716,7 @@ mod tests {
         .await;
         assert_eq!(unchanged.status(), axum::http::StatusCode::OK);
         let requests: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM crash_reprocessing_requests WHERE organization_id::text = $1 AND project_id::text = $2 AND scope_kind = 'data_rules_version'",
+            "SELECT count(*) FROM crash_reprocessing_requests WHERE organization_id = $1::uuid AND project_id = $2::uuid AND scope_kind = 'data_rules_version'",
         )
         .bind(&organization_id)
         .bind(&project_id)

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::project_setup::ServerState;
+use crate::{identifiers::valid_uuid, project_setup::ServerState};
 
 const DEFAULT_PAGE_SIZE: u16 = 50;
 const MAX_PAGE_SIZE: u16 = 100;
@@ -348,7 +348,7 @@ pub(crate) async fn resolve_issue(
     let scope = transaction_scope(&actor);
     lock_issue(&mut transaction, &scope, &issue_id).await?;
     let resolution_timestamp = sqlx::query_scalar::<_, time::OffsetDateTime>(
-        "SELECT build_timestamp FROM releases WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 AND build_timestamp IS NOT NULL",
+        "SELECT build_timestamp FROM releases WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND build_timestamp IS NOT NULL",
     )
     .bind(&request.release_id)
     .bind(&scope.organization_id)
@@ -366,7 +366,7 @@ pub(crate) async fn resolve_issue(
         ("resolved", "resolved")
     };
     let row = sqlx::query(
-        "UPDATE issues SET status = $4, regression_state = $5, resolved_in_release_id = $6::uuid, resolved_at = now(), updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING id::text AS issue_id, status, regression_state, resolved_in_release_id::text AS resolved_in_release_id, to_char(resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS resolved_at",
+        "UPDATE issues SET status = $4, regression_state = $5, resolved_in_release_id = $6::uuid, resolved_at = now(), updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS issue_id, status, regression_state, resolved_in_release_id::text AS resolved_in_release_id, to_char(resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS resolved_at",
     )
     .bind(&issue_id)
     .bind(&scope.organization_id)
@@ -416,7 +416,7 @@ pub(crate) async fn reopen_issue(
     lock_issue(&mut transaction, &scope, &issue_id).await?;
     let regression_state = retained_regression_state(&mut transaction, &scope, &issue_id).await?;
     let row = sqlx::query(
-        "UPDATE issues SET status = 'open', regression_state = $4, resolved_in_release_id = NULL, resolved_at = NULL, updated_at = now() WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 RETURNING id::text AS issue_id, status, regression_state, NULL::text AS resolved_in_release_id, NULL::text AS resolved_at",
+        "UPDATE issues SET status = 'open', regression_state = $4, resolved_in_release_id = NULL, resolved_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS issue_id, status, regression_state, NULL::text AS resolved_in_release_id, NULL::text AS resolved_at",
     )
     .bind(&issue_id)
     .bind(&scope.organization_id)
@@ -672,7 +672,7 @@ async fn lock_issue(
     issue_id: &str,
 ) -> Result<(), IssueError> {
     let found: Option<String> = sqlx::query_scalar(
-        "SELECT id::text FROM issues WHERE id::text = $1 AND organization_id::text = $2 AND project_id::text = $3 FOR UPDATE",
+        "SELECT id::text FROM issues WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid FOR UPDATE",
     )
     .bind(issue_id)
     .bind(&scope.organization_id)
@@ -689,7 +689,7 @@ async fn retained_regression_state(
     issue_id: &str,
 ) -> Result<&'static str, IssueError> {
     let row = sqlx::query(
-        "SELECT count(*) AS releases, count(r.build_timestamp) AS timestamped, count(DISTINCT r.build_timestamp) AS distinct_timestamps FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id::text = $1 AND ir.project_id::text = $2 AND ir.issue_id::text = $3",
+        "SELECT count(*) AS releases, count(r.build_timestamp) AS timestamped, count(DISTINCT r.build_timestamp) AS distinct_timestamps FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id = $1::uuid AND ir.project_id = $2::uuid AND ir.issue_id = $3::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -718,7 +718,7 @@ async fn has_provably_later_release(
     resolution_timestamp: time::OffsetDateTime,
 ) -> Result<bool, IssueError> {
     let row = sqlx::query(
-        "SELECT count(*) AS releases, count(r.build_timestamp) AS timestamped, count(DISTINCT r.build_timestamp) AS distinct_timestamps, max(r.build_timestamp) AS latest_timestamp FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id::text = $1 AND ir.project_id::text = $2 AND ir.issue_id::text = $3",
+        "SELECT count(*) AS releases, count(r.build_timestamp) AS timestamped, count(DISTINCT r.build_timestamp) AS distinct_timestamps, max(r.build_timestamp) AS latest_timestamp FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id = $1::uuid AND ir.project_id = $2::uuid AND ir.issue_id = $3::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -742,7 +742,7 @@ async fn load_issue_detail(
     issue_id: &str,
 ) -> Result<IssueDetail, IssueError> {
     let row = sqlx::query(
-        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.id::text = $1 AND i.organization_id::text = $2 AND i.project_id::text = $3",
+        "SELECT i.id::text AS issue_id, i.title, i.fingerprint_algorithm, i.fingerprint_version, i.fingerprint, i.status, i.regression_state, to_char(i.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(i.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, i.event_count, i.representative_event_id::text AS representative_event_id, i.first_release_id::text AS first_release_id, i.last_release_id::text AS last_release_id, i.resolved_in_release_id::text AS resolved_in_release_id, CASE WHEN i.resolved_at IS NULL THEN NULL ELSE to_char(i.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS resolved_at, (SELECT count(*) FROM issue_releases ir WHERE ir.organization_id = i.organization_id AND ir.project_id = i.project_id AND ir.issue_id = i.id) AS affected_release_count FROM issues i WHERE i.id = $1::uuid AND i.organization_id = $2::uuid AND i.project_id = $3::uuid",
     )
     .bind(issue_id)
     .bind(&scope.organization_id)
@@ -771,7 +771,7 @@ async fn load_mapping_summary(
     issue_id: &str,
 ) -> Result<ReleaseMappingSummary, IssueError> {
     let row = sqlx::query(
-        "SELECT count(*) FILTER (WHERE release_mapping_state = 'matched') AS matched, count(*) FILTER (WHERE release_mapping_state = 'missing') AS missing, count(*) FILTER (WHERE release_mapping_state = 'ambiguous') AS ambiguous FROM crash_events WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3",
+        "SELECT count(*) FILTER (WHERE release_mapping_state = 'matched') AS matched, count(*) FILTER (WHERE release_mapping_state = 'missing') AS missing, count(*) FILTER (WHERE release_mapping_state = 'ambiguous') AS ambiguous FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -792,7 +792,7 @@ async fn load_variants(
     issue_id: &str,
 ) -> Result<(Vec<VariantView>, bool), IssueError> {
     let rows = sqlx::query(
-        "SELECT variant_fingerprint, to_char(first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, event_count, representative_event_id::text AS representative_event_id FROM issue_variants WHERE organization_id::text = $1 AND project_id::text = $2 AND issue_id::text = $3 ORDER BY event_count DESC, variant_fingerprint LIMIT $4",
+        "SELECT variant_fingerprint, to_char(first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, event_count, representative_event_id::text AS representative_event_id FROM issue_variants WHERE organization_id = $1::uuid AND project_id = $2::uuid AND issue_id = $3::uuid ORDER BY event_count DESC, variant_fingerprint LIMIT $4",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -822,7 +822,7 @@ async fn load_releases(
     issue_id: &str,
 ) -> Result<(Vec<IssueReleaseView>, bool), IssueError> {
     let rows = sqlx::query(
-        "SELECT r.id::text AS release_id, r.version, r.platform, r.architecture, r.configuration, CASE WHEN r.build_timestamp IS NULL THEN NULL ELSE to_char(r.build_timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS build_timestamp, to_char(ir.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(ir.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, ir.event_count, ir.representative_event_id::text AS representative_event_id FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id::text = $1 AND ir.project_id::text = $2 AND ir.issue_id::text = $3 ORDER BY r.build_timestamp DESC NULLS LAST, r.id LIMIT $4",
+        "SELECT r.id::text AS release_id, r.version, r.platform, r.architecture, r.configuration, CASE WHEN r.build_timestamp IS NULL THEN NULL ELSE to_char(r.build_timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS build_timestamp, to_char(ir.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, to_char(ir.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, ir.event_count, ir.representative_event_id::text AS representative_event_id FROM issue_releases ir JOIN releases r ON r.id = ir.release_id AND r.organization_id = ir.organization_id AND r.project_id = ir.project_id WHERE ir.organization_id = $1::uuid AND ir.project_id = $2::uuid AND ir.issue_id = $3::uuid ORDER BY r.build_timestamp DESC NULLS LAST, r.id LIMIT $4",
     )
     .bind(&scope.organization_id)
     .bind(&scope.project_id)
@@ -882,17 +882,6 @@ fn resolution_view(row: &sqlx::postgres::PgRow) -> ResolutionView {
         resolved_in_release_id: row.get("resolved_in_release_id"),
         resolved_at: row.get("resolved_at"),
     }
-}
-
-fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 fn no_store(status: StatusCode, value: &impl Serialize) -> Response {
@@ -1127,7 +1116,7 @@ mod tests {
         assert_no_store(&cross_filter_cursor);
 
         sqlx::query(
-            "UPDATE issues SET last_seen_at = '2026-01-03T00:00:00Z' WHERE id::text IN ($1, $2)",
+            "UPDATE issues SET last_seen_at = '2026-01-03T00:00:00Z' WHERE id IN ($1::uuid, $2::uuid)",
         )
         .bind(&first.issue_id)
         .bind(&second.issue_id)
@@ -1150,7 +1139,7 @@ mod tests {
         let tied_cursor = tied_page["next_cursor"]
             .as_str()
             .ok_or("tied page must include a cursor")?;
-        sqlx::query("UPDATE issues SET last_seen_at = '2026-02-01T00:00:00Z' WHERE id::text = $1")
+        sqlx::query("UPDATE issues SET last_seen_at = '2026-02-01T00:00:00Z' WHERE id = $1::uuid")
             .bind(tied_first_id)
             .execute(&pool)
             .await?;
@@ -1477,7 +1466,7 @@ mod tests {
         ))
         .execute(pool)
         .await?;
-        sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id::text = $1")
+        sqlx::query("UPDATE crash_events SET current_result_id = $2::uuid WHERE id = $1::uuid")
             .bind(&event_id)
             .bind(&result_id)
             .execute(pool)
@@ -1501,7 +1490,7 @@ mod tests {
         .fetch_one(pool)
         .await?;
         sqlx::query(
-            "UPDATE crash_events SET issue_id = $2::uuid, release_id = $3::uuid, release_mapping_state = 'matched', grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $4, variant_fingerprint = $5, grouping_quality = 100, grouped_at = $6::timestamptz WHERE id::text = $1",
+            "UPDATE crash_events SET issue_id = $2::uuid, release_id = $3::uuid, release_mapping_state = 'matched', grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = $4, variant_fingerprint = $5, grouping_quality = 100, grouped_at = $6::timestamptz WHERE id = $1::uuid",
         )
         .bind(&event_id)
         .bind(&issue_id)
