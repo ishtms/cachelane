@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/361
 
-Status: Approved, waiting for #358 and #359
+Status: Locally verified on August 16, 2026
 
 ## Context
 
@@ -63,6 +63,17 @@ Logs and metrics include configured bounds, active global and project jobs, clai
 Old workers and new workers can share the queue because lease fields and fencing remain compatible. Start with both bounds at one, then raise them only in disposable staging after #359 is verified. No hosted or production rollout is part of this issue.
 
 Rollback sets both bounds to one or restores the prior worker. Existing jobs, attempts, leases, results, and objects remain. Wait for or expire active leases before reducing worker instances.
+
+## Verification evidence
+
+- Settings default to one, reject values outside one through eight, and size each worker pool to two connections per active job plus four. The focused settings test passed with a maximum pool size of 20.
+- Three synthetic workers with six total slots drained 10,100 jobs in 110.123 seconds at 91 jobs per second. The second project claimed work in 202 milliseconds before any hot-project completion, hot-project concurrency reached and never exceeded four, and every job completed once at attempt one.
+- The measured rate exceeds the disposable project ingest setting of 120 requests per minute plus the four-slot minimum-backoff retry ceiling.
+- Focused claim, lease, stale-publication, concurrent-publication, retry, resource-quarantine, shutdown, and pool-pressure tests passed.
+- `./scripts/prove-isolated-processing` passed with two real worker processes and same-project concurrency two. It also verified the processor boundary, resource limits, storage and database outage recovery, lease fencing, owned cleanup, publication, and runtime smoke behavior.
+- The runtime configuration permits at most four processors using four CPUs, 8 GiB memory, and 256 MiB scratch. The disposable Docker host reported 24 CPUs and about 16 GiB memory.
+- `./scripts/check-fast` passed on the final issue tree.
+- No hosted or production rollout was performed. Rollback remains resetting both concurrency settings to one after active leases finish or expire.
 
 ## Out of scope
 

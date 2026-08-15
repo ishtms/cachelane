@@ -20,6 +20,16 @@ Object-store failures return a job to bounded backoff without changing customer-
 
 Rollback sets `FAULTLANE_ISOLATED_PROCESSING_ENABLED=false`, which keeps the API available but disables symbol-upload routes in the current build, stops workers and their owned processor containers, and restores the previous application build. The migration is additive. Original objects, pending jobs, results, and derived caches remain available for a corrected worker. Do not remove queue rows or objects during rollback.
 
+## Concurrency rollout
+
+`FAULTLANE_WORKER_CONCURRENCY` controls active jobs in one worker. `FAULTLANE_PROJECT_CONCURRENCY` controls active leases for one project across workers that share the setting. Both default to one and accept values from one through eight. Invalid values stop worker startup.
+
+Each worker opens two database connections per active job plus four connections for claims, heartbeats, reconciliation, and reprocessing scheduling. Each active processor keeps the existing ceiling of one CPU, 2 GiB memory, and 64 MiB scratch. For example, worker concurrency four requires a 12-connection pool and permits up to four CPUs, 8 GiB memory, and 256 MiB scratch for that worker.
+
+Apply the additive queue indexes with both settings at one. Raise the settings only after disposable staging confirms enough CPU, memory, scratch, Docker capacity, database connections, and object-store request capacity. Keep the same project setting on every worker. Monitor configured bounds, active leases by project, queue age, claim duration, processor duration, lease loss, cancellation, database pool pressure, and scratch growth.
+
+To roll back concurrency, stop new workers, let current leases finish or expire, and restart with both settings at one. Existing pending jobs, retry attempts, leases, results, and objects remain compatible with the previous worker.
+
 ## Reprocessing rollout
 
 Apply migrations and start the current API and worker with `FAULTLANE_REPROCESSING_ENABLED=false`. Confirm normal crash processing, artifact publication, and queue health before enabling the flag on both roles. New crash jobs retain priority 100. Reactivated crash jobs use priority 200, and the worker schedules at most one request page after every 20 ordinary jobs or when the queue is idle.

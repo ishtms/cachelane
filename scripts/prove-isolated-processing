@@ -54,6 +54,8 @@ export FAULTLANE_RATE_LIMIT_SECRET="faultlane-proof-rate-limit-secret-$proof_id"
 export FAULTLANE_TRUSTED_PROXY_CIDRS=""
 export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
 export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
+export FAULTLANE_WORKER_CONCURRENCY=2
+export FAULTLANE_PROJECT_CONCURRENCY=2
 export FAULTLANE_GROUPING_ENABLED=true
 export FAULTLANE_REPROCESSING_ENABLED=true
 export FAULTLANE_DASHBOARD_ENABLED=true
@@ -541,6 +543,26 @@ start_role worker
 worker_pid="$started_pid"
 start_role worker worker-two
 worker_two_pid="$started_pid"
+
+proof_phase "verifying same-project processor concurrency"
+concurrent_project_leases=""
+for _ in $(seq 1 50); do
+  concurrent_project_leases="$(docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+    "SELECT count(*) FROM jobs WHERE project_id::text = '$project_id' AND state = 'leased';")"
+  if [[ "$concurrent_project_leases" == "2" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$concurrent_project_leases" != "2" ]]; then
+  cat "$proof_directory"/worker*.log >&2
+  echo "workers did not reach same-project concurrency two" >&2
+  exit 1
+fi
 
 event_state=""
 for _ in $(seq 1 180); do
@@ -1706,6 +1728,11 @@ FIRST_UPLOAD="$first_upload" SECOND_UPLOAD="$second_upload" DATABASE_EVIDENCE="$
     repeat_state: repeat.state,
     symcache_jobs: 1,
     concurrent_workers: 2,
+    worker_concurrency: 2,
+    same_project_concurrency: 2,
+    processor_cpu_capacity: 4,
+    processor_memory_mib_capacity: 8192,
+    processor_scratch_mib_capacity: 256,
     boundary_verified: true,
     orphan_event_id: orphan.event_id,
     orphan_state: orphan.state,

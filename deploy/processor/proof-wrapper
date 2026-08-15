@@ -12,7 +12,11 @@ if [ "$#" -eq 2 ] \
     sleep 15
     cat /scratch/proof-result.json
   elif grep -q "UECC-Windows-Resource-311" /scratch/proof-result.json; then
+    sleep 3
     dd if=/dev/zero bs=1048576 count=17 2>/dev/null
+  elif grep -q "UECC-Windows-Proof-311" /scratch/proof-result.json; then
+    sleep 3
+    cat /scratch/proof-result.json
   else
     cat /scratch/proof-result.json
   fi

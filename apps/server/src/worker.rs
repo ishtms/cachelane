@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use faultlane_symbols::{SYMCACHE_FORMAT_VERSION, SYMCACHE_PROCESSOR_VERSION};
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use tracing::{info, warn};
 use url::Url;
 
@@ -37,13 +37,16 @@ const MAX_STORED_RELEASE_CANDIDATES: i64 = 101;
 const MAX_SYMBOL_WAITERS: usize = 4_096;
 const AUTOMATIC_REPROCESSING_BATCH: usize = 100;
 const JOBS_BETWEEN_REPROCESSING_REQUESTS: u32 = 20;
+const MAX_WORKER_CONCURRENCY: u32 = 8;
+const MAX_PROJECT_CONCURRENCY: u32 = 8;
 const SCRATCH_MARKER: &[u8] = b"faultlane-worker-scratch-v1\n";
 
 pub(crate) async fn run() -> Result<(), WorkerStartupError> {
     let database_url = required_env("DATABASE_URL")?;
     let processor_scope = processor_scope(&database_url)?;
+    let settings = WorkerSettings::from_environment()?;
     let pool = PgPoolOptions::new()
-        .max_connections(6)
+        .max_connections(settings.pool_connections())
         .acquire_timeout(Duration::from_secs(5))
         .connect(&database_url)
         .await
@@ -66,7 +69,53 @@ pub(crate) async fn run() -> Result<(), WorkerStartupError> {
             .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
     };
     worker.reconcile_containers().await?;
-    worker.run_loop().await
+    worker.run_loop(settings).await
+}
+
+#[derive(Clone, Copy)]
+struct WorkerSettings {
+    worker_concurrency: usize,
+    project_concurrency: i64,
+}
+
+impl WorkerSettings {
+    fn from_environment() -> Result<Self, WorkerStartupError> {
+        Self::parse(
+            env::var("FAULTLANE_WORKER_CONCURRENCY").ok().as_deref(),
+            env::var("FAULTLANE_PROJECT_CONCURRENCY").ok().as_deref(),
+        )
+    }
+
+    fn parse(
+        worker_concurrency: Option<&str>,
+        project_concurrency: Option<&str>,
+    ) -> Result<Self, WorkerStartupError> {
+        let worker_concurrency = parse_concurrency(worker_concurrency, MAX_WORKER_CONCURRENCY)?;
+        let project_concurrency = parse_concurrency(project_concurrency, MAX_PROJECT_CONCURRENCY)?;
+        Ok(Self {
+            worker_concurrency: usize::try_from(worker_concurrency)
+                .map_err(|_| WorkerStartupError::Configuration)?,
+            project_concurrency: i64::from(project_concurrency),
+        })
+    }
+
+    fn pool_connections(self) -> u32 {
+        u32::try_from(self.worker_concurrency)
+            .unwrap_or(MAX_WORKER_CONCURRENCY)
+            .saturating_mul(2)
+            .saturating_add(4)
+    }
+}
+
+fn parse_concurrency(value: Option<&str>, maximum: u32) -> Result<u32, WorkerStartupError> {
+    let value = value
+        .unwrap_or("1")
+        .parse::<u32>()
+        .map_err(|_| WorkerStartupError::Configuration)?;
+    if !(1..=maximum).contains(&value) {
+        return Err(WorkerStartupError::Configuration);
+    }
+    Ok(value)
 }
 
 #[derive(Debug)]
@@ -203,57 +252,106 @@ struct Worker {
 }
 
 impl Worker {
-    async fn run_loop(&self) -> Result<(), WorkerStartupError> {
-        info!(worker_id = self.instance_id.as_ref(), "worker started");
+    #[allow(clippy::too_many_lines)]
+    async fn run_loop(&self, settings: WorkerSettings) -> Result<(), WorkerStartupError> {
+        info!(
+            worker_id = self.instance_id.as_ref(),
+            worker_concurrency = settings.worker_concurrency,
+            project_concurrency = settings.project_concurrency,
+            database_connections = settings.pool_connections(),
+            "worker started"
+        );
         let mut reconciliation = tokio::time::interval(Duration::from_secs(30));
         reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         reconciliation.tick().await;
         let mut jobs_since_reprocessing = 0_u32;
+        let mut running = JoinSet::<(Job, i64)>::new();
+        let mut active = BTreeMap::<String, Job>::new();
+        let mut wait = Duration::ZERO;
         loop {
-            if self.reprocessing_enabled
-                && jobs_since_reprocessing >= JOBS_BETWEEN_REPROCESSING_REQUESTS
-            {
-                if self.schedule_reprocessing_request().await.is_err() {
-                    warn!("reprocessing request scheduling failed");
+            if running.len() < settings.worker_concurrency && wait.is_zero() {
+                if self.reprocessing_enabled
+                    && jobs_since_reprocessing >= JOBS_BETWEEN_REPROCESSING_REQUESTS
+                {
+                    if self.schedule_reprocessing_request().await.is_err() {
+                        warn!("reprocessing request scheduling failed");
+                    }
+                    jobs_since_reprocessing = 0;
                 }
-                jobs_since_reprocessing = 0;
-            }
-            tokio::select! {
-                result = self.claim() => {
-                    match result {
-                        Ok(Some(job)) => {
-                            jobs_since_reprocessing = jobs_since_reprocessing.saturating_add(1);
-                            let running = job.clone();
-                            tokio::select! {
-                                () = self.run_job(running) => {}
-                                shutdown = tokio::signal::ctrl_c() => {
-                                    shutdown.map_err(|_| WorkerStartupError::Configuration)?;
-                                    self.runner.cancel(&container_name(&job.id, &job.lease_token)).await;
-                                    let _ = self.cancel_job(&job).await;
-                                    info!("worker stopped");
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            let scheduled = self.reprocessing_enabled
-                                && self.schedule_reprocessing_request().await.unwrap_or_else(|()| {
+                let claim_started = Instant::now();
+                match self.claim(settings.project_concurrency).await {
+                    Ok(Some(job)) => {
+                        jobs_since_reprocessing = jobs_since_reprocessing.saturating_add(1);
+                        info!(
+                            worker_id = self.instance_id.as_ref(),
+                            job_id = job.id,
+                            project_id = job.project_id,
+                            active_jobs = running.len().saturating_add(1),
+                            project_active_jobs = job.project_active_jobs,
+                            queue_age_seconds = job.queue_age_seconds,
+                            claim_duration_ms = i64::try_from(claim_started.elapsed().as_millis())
+                                .unwrap_or(i64::MAX),
+                            "worker job claimed"
+                        );
+                        active.insert(job.id.clone(), job.clone());
+                        let worker = self.clone();
+                        running.spawn(async move {
+                            let started = Instant::now();
+                            let completed = job.clone();
+                            worker.run_job(job).await;
+                            (
+                                completed,
+                                i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                            )
+                        });
+                        continue;
+                    }
+                    Ok(None) => {
+                        let scheduled = self.reprocessing_enabled
+                            && self
+                                .schedule_reprocessing_request()
+                                .await
+                                .unwrap_or_else(|()| {
                                     warn!("reprocessing request scheduling failed");
                                     false
                                 });
-                            jobs_since_reprocessing = 0;
-                            if !scheduled {
-                                tokio::time::sleep(Duration::from_millis(POLL_MILLISECONDS)).await;
-                            }
+                        jobs_since_reprocessing = 0;
+                        if scheduled {
+                            continue;
                         }
-                        Err(()) => {
-                            warn!("worker claim failed");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        wait = Duration::from_millis(POLL_MILLISECONDS);
+                    }
+                    Err(()) => {
+                        warn!("worker claim failed");
+                        wait = Duration::from_secs(1);
+                    }
+                }
+            }
+            tokio::select! {
+                completed = running.join_next(), if !running.is_empty() => {
+                    match completed {
+                        Some(Ok((job, duration_ms))) => {
+                            active.remove(&job.id);
+                            info!(
+                                worker_id = self.instance_id.as_ref(),
+                                job_id = job.id,
+                                active_jobs = running.len(),
+                                duration_ms,
+                                "worker job finished"
+                            );
+                            wait = Duration::ZERO;
                         }
+                        Some(Err(_)) => {
+                            warn!("worker job task failed");
+                            self.stop_running_jobs(&mut running, &active).await;
+                            return Err(WorkerStartupError::Processor);
+                        }
+                        None => {}
                     }
                 }
                 shutdown = tokio::signal::ctrl_c() => {
                     shutdown.map_err(|_| WorkerStartupError::Configuration)?;
+                    self.stop_running_jobs(&mut running, &active).await;
                     info!("worker stopped");
                     return Ok(());
                 }
@@ -262,8 +360,32 @@ impl Worker {
                         warn!("worker container reconciliation failed");
                     }
                 }
+                () = tokio::time::sleep(wait), if !wait.is_zero() => {
+                    wait = Duration::ZERO;
+                }
             }
         }
+    }
+
+    async fn stop_running_jobs(
+        &self,
+        running: &mut JoinSet<(Job, i64)>,
+        active: &BTreeMap<String, Job>,
+    ) {
+        running.abort_all();
+        while running.join_next().await.is_some() {}
+        let mut cancellations = JoinSet::new();
+        for job in active.values().cloned() {
+            let worker = self.clone();
+            cancellations.spawn(async move {
+                worker
+                    .runner
+                    .cancel(&container_name(&job.id, &job.lease_token))
+                    .await;
+                let _ = worker.cancel_job(&job).await;
+            });
+        }
+        while cancellations.join_next().await.is_some() {}
     }
 
     async fn reconcile_containers(&self) -> Result<(), WorkerStartupError> {
@@ -334,8 +456,9 @@ impl Worker {
         .map_err(|_| WorkerStartupError::Database)
     }
 
-    async fn claim(&self) -> Result<Option<Job>, ()> {
-        claim_job(&self.pool, self.instance_id.as_ref()).await
+    async fn claim(&self, project_concurrency: i64) -> Result<Option<Job>, ()> {
+        claim_job_with_project_limit(&self.pool, self.instance_id.as_ref(), project_concurrency)
+            .await
     }
 
     async fn schedule_reprocessing_request(&self) -> Result<bool, ()> {
@@ -2049,15 +2172,25 @@ async fn finish_reprocessing_schedule_failure(
         .map_err(|_| JobError::Transient("database_unavailable"))
 }
 
+#[cfg(test)]
 async fn claim_job(pool: &PgPool, worker_id: &str) -> Result<Option<Job>, ()> {
+    claim_job_with_project_limit(pool, worker_id, 1).await
+}
+
+async fn claim_job_with_project_limit(
+    pool: &PgPool,
+    worker_id: &str,
+    project_concurrency: i64,
+) -> Result<Option<Job>, ()> {
     let lease_token = random_uuid().map_err(|_| ())?;
     let mut transaction = pool.begin().await.map_err(|_| ())?;
     let row = sqlx::query(
-        "WITH candidate AS (SELECT j.id FROM jobs j JOIN projects p ON p.id = j.project_id AND p.organization_id = j.organization_id WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.project_id = j.project_id AND active.id <> j.id AND active.state = 'leased' AND active.lease_expires_at > now()) ORDER BY j.priority, j.available_at, j.created_at FOR UPDATE OF p, j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token, COALESCE((SELECT e.requested_reprocessing_generation FROM crash_events e WHERE e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id), 0) AS target_generation",
+        "WITH candidate AS (SELECT j.id, active.job_count AS prior_project_active_jobs FROM jobs j JOIN projects p ON p.id = j.project_id AND p.organization_id = j.organization_id CROSS JOIN LATERAL (SELECT count(*)::bigint AS job_count FROM jobs active WHERE active.organization_id = j.organization_id AND active.project_id = j.project_id AND active.id <> j.id AND active.state = 'leased' AND active.lease_expires_at > now()) active WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) AND active.job_count < $4 ORDER BY j.priority, j.available_at, j.created_at, j.id FOR UPDATE OF p, j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token, COALESCE((SELECT e.requested_reprocessing_generation FROM crash_events e WHERE e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id), 0) AS target_generation, candidate.prior_project_active_jobs + 1 AS project_active_jobs, GREATEST(0, EXTRACT(EPOCH FROM now() - j.created_at)::bigint) AS queue_age_seconds",
     )
     .bind(worker_id)
     .bind(&lease_token)
     .bind(LEASE_SECONDS)
+    .bind(project_concurrency)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| ())?;
@@ -2074,6 +2207,8 @@ async fn claim_job(pool: &PgPool, worker_id: &str) -> Result<Option<Job>, ()> {
         resource_failures: row.get("resource_failures"),
         lease_token: row.get("lease_token"),
         target_generation: row.get("target_generation"),
+        project_active_jobs: row.get("project_active_jobs"),
+        queue_age_seconds: row.get("queue_age_seconds"),
     });
     if let Some(job) = job.as_ref() {
         mark_reprocessing_events_running(&mut transaction, job)
@@ -2098,6 +2233,8 @@ struct Job {
     resource_failures: i32,
     lease_token: String,
     target_generation: i64,
+    project_active_jobs: i64,
+    queue_age_seconds: i64,
 }
 
 async fn mark_reprocessing_events_running(
@@ -3896,18 +4033,25 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         env,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicI64, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+    use tokio::task::JoinSet;
 
     use super::{
         Job, JobError, ModuleIdentity, ReleaseEvidence, ReleaseLookup, ReleaseResolution,
-        SelectedArtifact, Worker, attempt_identity, claim_job, container_name, event_search_text,
+        SelectedArtifact, Worker, WorkerSettings, attempt_identity, claim_job,
+        claim_job_with_project_limit, complete_job, container_name, event_search_text,
         has_resolved_frame, lock_lease, owned_attempt, prepare_worker_scratch, processor_scope,
         projected_symbolication_state, projected_text, random_uuid, release_chronology,
         release_lookup, selected_artifact_size_valid, set_private_permissions, strict_json,
@@ -3929,6 +4073,26 @@ mod tests {
         }
         #[cfg(not(windows))]
         env::temp_dir()
+    }
+
+    #[test]
+    fn worker_concurrency_is_bounded_and_sizes_the_database_pool() {
+        let defaults = WorkerSettings::parse(None, None)
+            .unwrap_or_else(|error| panic!("default settings must parse: {error}"));
+        assert_eq!(defaults.worker_concurrency, 1);
+        assert_eq!(defaults.project_concurrency, 1);
+        assert_eq!(defaults.pool_connections(), 6);
+
+        let maximum = WorkerSettings::parse(Some("8"), Some("8"))
+            .unwrap_or_else(|error| panic!("maximum settings must parse: {error}"));
+        assert_eq!(maximum.worker_concurrency, 8);
+        assert_eq!(maximum.project_concurrency, 8);
+        assert_eq!(maximum.pool_connections(), 20);
+
+        for invalid in ["0", "9", "invalid"] {
+            assert!(WorkerSettings::parse(Some(invalid), None).is_err());
+            assert!(WorkerSettings::parse(None, Some(invalid)).is_err());
+        }
     }
 
     #[test]
@@ -4374,6 +4538,17 @@ mod tests {
         assert!(!missing.valid);
     }
 
+    async fn explain_plan(pool: &PgPool, query: &'static str) -> String {
+        sqlx::query(query)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|error| panic!("query plan must load: {error}"))
+            .iter()
+            .map(|row| row.get::<String, _>("QUERY PLAN"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     async fn insert_event_job(
         pool: &PgPool,
         organization_id: &str,
@@ -4426,7 +4601,7 @@ mod tests {
         let lease_token =
             random_uuid().unwrap_or_else(|error| panic!("lease token must generate: {error}"));
         let row = sqlx::query(
-            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id = $1::uuid RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token, COALESCE((SELECT requested_reprocessing_generation FROM crash_events WHERE id = jobs.event_id), 0) AS target_generation",
+            "UPDATE jobs SET state = 'leased', attempt = attempt + 1, lease_owner = $2, lease_token = $3::uuid, lease_expires_at = now() + interval '5 minutes', heartbeat_at = now(), failure_code = NULL, completed_at = NULL, updated_at = now() WHERE id = $1::uuid RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, event_id::text AS event_id, artifact_upload_id::text AS artifact_upload_id, derived_cache_id::text AS derived_cache_id, job_type, attempt, max_attempt, resource_failures, lease_token::text AS lease_token, COALESCE((SELECT requested_reprocessing_generation FROM crash_events WHERE id = jobs.event_id), 0) AS target_generation, 1::bigint AS project_active_jobs, 0::bigint AS queue_age_seconds",
         )
         .bind(job_id)
         .bind(owner)
@@ -4447,6 +4622,8 @@ mod tests {
             resource_failures: row.get("resource_failures"),
             lease_token: row.get("lease_token"),
             target_generation: row.get("target_generation"),
+            project_active_jobs: row.get("project_active_jobs"),
+            queue_age_seconds: row.get("queue_age_seconds"),
         }
     }
 
@@ -6297,6 +6474,335 @@ mod tests {
             .rollback()
             .await
             .unwrap_or_else(|error| panic!("transaction must roll back: {error}"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    async fn shutdown_releases_all_active_leases_and_pool_pressure_recovers() {
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(6)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let scope = insert_test_scope(&pool, "shutdown-worker", "shutdown-worker").await;
+        let _ =
+            insert_event_job(&pool, &scope.organization, &scope.project, "shutdown-first").await;
+        let _ = insert_event_job(
+            &pool,
+            &scope.organization,
+            &scope.project,
+            "shutdown-second",
+        )
+        .await;
+
+        let first = claim_job_with_project_limit(&pool, "shutdown-worker", 2)
+            .await
+            .unwrap_or_else(|()| panic!("first shutdown claim must succeed"))
+            .unwrap_or_else(|| panic!("first shutdown claim must find work"));
+        let second = claim_job_with_project_limit(&pool, "shutdown-worker", 2)
+            .await
+            .unwrap_or_else(|()| panic!("second shutdown claim must succeed"))
+            .unwrap_or_else(|| panic!("second shutdown claim must find work"));
+        assert_eq!(first.project_active_jobs, 1);
+        assert_eq!(second.project_active_jobs, 2);
+
+        let worker = publication_worker(pool.clone(), "shutdown-worker", false);
+        let mut running = JoinSet::new();
+        let mut active = BTreeMap::new();
+        for job in [first, second] {
+            active.insert(job.id.clone(), job.clone());
+            running.spawn(async move {
+                tokio::time::sleep(Duration::from_mins(1)).await;
+                (job, 60_000)
+            });
+        }
+        worker.stop_running_jobs(&mut running, &active).await;
+        assert!(running.is_empty());
+        let released = sqlx::query(
+            "SELECT count(*)::bigint AS jobs, min(attempt) AS minimum_attempt, max(attempt) AS maximum_attempt, bool_and(state = 'pending' AND failure_code = 'processing_cancelled' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL) AS safely_released FROM jobs WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("released jobs must load: {error}"));
+        assert_eq!(released.get::<i64, _>("jobs"), 2);
+        assert_eq!(released.get::<i32, _>("minimum_attempt"), 0);
+        assert_eq!(released.get::<i32, _>("maximum_attempt"), 0);
+        assert!(released.get::<bool, _>("safely_released"));
+
+        let constrained = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(500))
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("constrained pool must connect: {error}"));
+        let held = constrained
+            .acquire()
+            .await
+            .unwrap_or_else(|error| panic!("only pool connection must acquire: {error}"));
+        let pressure_started = Instant::now();
+        assert!(
+            claim_job_with_project_limit(&constrained, "pool-worker", 2)
+                .await
+                .is_err()
+        );
+        assert!(pressure_started.elapsed() < Duration::from_secs(2));
+        drop(held);
+        let recovered = claim_job_with_project_limit(&constrained, "pool-worker", 2)
+            .await
+            .unwrap_or_else(|()| panic!("claim must recover after pool pressure"))
+            .unwrap_or_else(|| panic!("recovered claim must find work"));
+        publication_worker(pool.clone(), "pool-worker", false)
+            .cancel_job(&recovered)
+            .await
+            .unwrap_or_else(|error| panic!("recovered claim must release: {error:?}"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::too_many_lines)]
+    async fn concurrent_workers_drain_a_hot_project_without_starving_another() {
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must run: {error}"));
+        migrate(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("migrations must rerun: {error}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(24)
+            .connect(&database_url)
+            .await
+            .unwrap_or_else(|error| panic!("test database must connect: {error}"));
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("test database must reset: {error}"));
+        let scope = insert_test_scope(&pool, "queue-scale", "queue-scale").await;
+        let cold_project: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Queue scale cold', 'queue-scale-cold') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("cold project must insert: {error}"));
+        let hot_ingest_key: String = sqlx::query_scalar(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, 'hot00000') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .bind(vec![21_u8; 32])
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("hot ingest key must insert: {error}"));
+        let cold_ingest_key: String = sqlx::query_scalar(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, 'cold0000') RETURNING id::text",
+        )
+        .bind(&scope.organization)
+        .bind(&cold_project)
+        .bind(vec![22_u8; 32])
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("cold ingest key must insert: {error}"));
+
+        for (project_id, ingest_key_id, job_count, prefix) in [
+            (&scope.project, &hot_ingest_key, 10_000_i64, "hot"),
+            (&cold_project, &cold_ingest_key, 100_i64, "cold"),
+        ] {
+            let inserted: i64 = sqlx::query_scalar(
+                "WITH generated AS MATERIALIZED (SELECT gen_random_uuid() AS object_id, gen_random_uuid() AS event_id, n FROM generate_series(1, $4) values(n)), objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) SELECT object_id, $1::uuid, $2::uuid, $5 || '/' || n::text, decode(md5($2 || ':' || n::text) || md5(n::text || ':' || $2), 'hex'), 1, 'application/octet-stream' FROM generated RETURNING id), events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment) SELECT generated.event_id, $1::uuid, $2::uuid, $3::uuid, generated.object_id, 'production' FROM generated JOIN objects ON objects.id = generated.object_id RETURNING id), inserted_jobs AS (INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, idempotency_key) SELECT gen_random_uuid(), $1::uuid, $2::uuid, id, 'process_crash', '{}'::jsonb, 'queue-scale:' || id::text FROM events RETURNING 1) SELECT count(*)::bigint FROM inserted_jobs",
+            )
+            .bind(&scope.organization)
+            .bind(project_id)
+            .bind(ingest_key_id)
+            .bind(job_count)
+            .bind(prefix)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("queue scale jobs must insert: {error}"));
+            assert_eq!(inserted, job_count);
+        }
+        sqlx::query("ANALYZE jobs")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("queue statistics must refresh: {error}"));
+
+        let pending_plan = explain_plan(
+            &pool,
+            "EXPLAIN (FORMAT TEXT) SELECT id FROM jobs WHERE state = 'pending' AND available_at <= now() AND attempt < max_attempt ORDER BY priority, available_at, created_at, id LIMIT 1",
+        )
+        .await;
+        assert!(
+            pending_plan.contains("jobs_pending_priority_order"),
+            "{pending_plan}"
+        );
+        let active_plan_rows = sqlx::query(
+            "EXPLAIN (FORMAT TEXT) SELECT count(*) FROM jobs WHERE organization_id = $1::uuid AND project_id = $2::uuid AND state = 'leased' AND lease_expires_at > now()",
+        )
+        .bind(&scope.organization)
+        .bind(&scope.project)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("active lease plan must load: {error}"));
+        let active_plan = active_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>("QUERY PLAN"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            active_plan.contains("jobs_active_project_leases"),
+            "{active_plan}"
+        );
+        let expired_plan = explain_plan(
+            &pool,
+            "EXPLAIN (FORMAT TEXT) SELECT id FROM jobs WHERE state = 'leased' AND lease_expires_at <= now() ORDER BY lease_expires_at, project_id LIMIT 1",
+        )
+        .await;
+        assert!(
+            expired_plan.contains("jobs_expired_leases")
+                || expired_plan.contains("jobs_active_project_leases"),
+            "{expired_plan}"
+        );
+
+        let started = Instant::now();
+        let mut initial = Vec::new();
+        for slot in 0..6 {
+            let worker_id = format!("queue-scale-worker-{}", slot / 2);
+            let job = claim_job_with_project_limit(&pool, &worker_id, 4)
+                .await
+                .unwrap_or_else(|()| panic!("initial scale claim must succeed"))
+                .unwrap_or_else(|| panic!("initial scale claim must find work"));
+            if slot < 4 {
+                assert_eq!(job.project_id, scope.project);
+                assert_eq!(job.project_active_jobs, i64::from(slot + 1));
+            } else {
+                assert_eq!(job.project_id, cold_project);
+            }
+            assert!(job.project_active_jobs <= 4);
+            initial.push((worker_id, job));
+        }
+        let cold_first_millis = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        assert!(cold_first_millis < 2_000, "{cold_first_millis}");
+
+        let active_hot = Arc::new(AtomicI64::new(4));
+        let active_cold = Arc::new(AtomicI64::new(2));
+        let max_hot = Arc::new(AtomicI64::new(4));
+        let max_cold = Arc::new(AtomicI64::new(2));
+        let mut tasks = Vec::new();
+        for (worker_id, first_job) in initial {
+            let task_pool = pool.clone();
+            let hot_project = scope.project.clone();
+            let active_hot = active_hot.clone();
+            let active_cold = active_cold.clone();
+            let max_hot = max_hot.clone();
+            let max_cold = max_cold.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut next = Some(first_job);
+                let mut completed = 0_i64;
+                let mut empty_polls = 0_u32;
+                loop {
+                    let job = if let Some(job) = next.take() {
+                        job
+                    } else {
+                        match claim_job_with_project_limit(&task_pool, &worker_id, 4).await {
+                            Ok(Some(job)) => {
+                                empty_polls = 0;
+                                let active = if job.project_id == hot_project {
+                                    active_hot.fetch_add(1, Ordering::SeqCst) + 1
+                                } else {
+                                    active_cold.fetch_add(1, Ordering::SeqCst) + 1
+                                };
+                                if job.project_id == hot_project {
+                                    max_hot.fetch_max(active, Ordering::SeqCst);
+                                } else {
+                                    max_cold.fetch_max(active, Ordering::SeqCst);
+                                }
+                                if job.project_active_jobs > 4 {
+                                    return Err("project concurrency exceeded its bound");
+                                }
+                                job
+                            }
+                            Ok(None) if empty_polls < 50 => {
+                                empty_polls += 1;
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                continue;
+                            }
+                            Ok(None) => return Ok(completed),
+                            Err(()) => return Err("queue scale claim failed"),
+                        }
+                    };
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let mut transaction = task_pool
+                        .begin()
+                        .await
+                        .map_err(|_| "queue scale completion must begin")?;
+                    lock_lease(&mut transaction, &job, &worker_id)
+                        .await
+                        .map_err(|_| "queue scale lease must remain current")?;
+                    complete_job(&mut transaction, &job, &worker_id, None)
+                        .await
+                        .map_err(|_| "queue scale completion must publish once")?;
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|_| "queue scale completion must commit")?;
+                    if job.project_id == hot_project {
+                        active_hot.fetch_sub(1, Ordering::SeqCst);
+                    } else {
+                        active_cold.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    completed = completed.saturating_add(1);
+                }
+            }));
+        }
+        let mut completed = 0_i64;
+        for task in tasks {
+            completed = completed.saturating_add(
+                task.await
+                    .unwrap_or_else(|error| panic!("queue scale task must join: {error}"))
+                    .unwrap_or_else(|error| panic!("queue scale task must drain: {error}")),
+            );
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(completed, 10_100);
+        assert_eq!(max_hot.load(Ordering::SeqCst), 4);
+        assert!(max_cold.load(Ordering::SeqCst) <= 4);
+        assert_eq!(active_hot.load(Ordering::SeqCst), 0);
+        assert_eq!(active_cold.load(Ordering::SeqCst), 0);
+        let final_state = sqlx::query(
+            "SELECT count(*) FILTER (WHERE state = 'completed')::bigint AS completed, count(*) FILTER (WHERE state = 'pending')::bigint AS pending, count(*) FILTER (WHERE state = 'leased')::bigint AS leased, min(attempt) AS minimum_attempt, max(attempt) AS maximum_attempt FROM jobs",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("queue scale state must load: {error}"));
+        assert_eq!(final_state.get::<i64, _>("completed"), 10_100);
+        assert_eq!(final_state.get::<i64, _>("pending"), 0);
+        assert_eq!(final_state.get::<i64, _>("leased"), 0);
+        assert_eq!(final_state.get::<i32, _>("minimum_attempt"), 1);
+        assert_eq!(final_state.get::<i32, _>("maximum_attempt"), 1);
+        let elapsed_millis = i64::try_from(elapsed.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let throughput_per_second = completed.saturating_mul(1_000) / elapsed_millis;
+        assert!(throughput_per_second > 6, "{throughput_per_second}");
+        println!(
+            "jobs={completed} workers=3 slots=6 project_concurrency=4 cold_first_ms={cold_first_millis} hot_completed_before_cold=0 elapsed_ms={elapsed_millis} throughput_per_second={throughput_per_second} database_connections_per_worker=8 processor_cpu_capacity=6 processor_memory_mib_capacity=12288 processor_scratch_mib_capacity=384"
+        );
     }
 
     #[tokio::test]
