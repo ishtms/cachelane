@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -39,6 +39,9 @@ const MAX_ENDPOINT_BYTES: usize = 2048;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 const DELIVERY_LEASE_SECONDS: i64 = 30;
 const DELIVERY_POLL_MILLISECONDS: u64 = 250;
+const ALERT_RULE_PAGE_SIZE: i64 = 1_000;
+const ALERT_ISSUE_PAGE_SIZE: i64 = 1_000;
+const ALERT_RECOVERY_PAGE_SIZE: i64 = 1_000;
 const CONFIG_VERSION: i32 = 1;
 
 #[derive(Clone)]
@@ -777,7 +780,7 @@ pub(crate) async fn update_rule(
     )?;
     let mut transaction = pool.begin().await.map_err(|_| AlertError::Unavailable)?;
     let row = sqlx::query(
-        "UPDATE alert_rules SET enabled = COALESCE($4, enabled), threshold = $5, window_seconds = $6, quiet_start_minute = $7, quiet_end_minute = $8, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        "UPDATE alert_rules SET enabled = COALESCE($4, enabled), threshold = $5, window_seconds = $6, quiet_start_minute = $7, quiet_end_minute = $8, last_evaluated_at = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid RETURNING id::text AS id, integration_id::text AS integration_id, condition_kind, environment, threshold, window_seconds, quiet_start_minute, quiet_end_minute, enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
     )
     .bind(&rule_id)
     .bind(&actor.organization_id)
@@ -1179,11 +1182,19 @@ struct RuleEvaluation {
     window_seconds: Option<i32>,
     quiet_start_minute: Option<i32>,
     quiet_end_minute: Option<i32>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 struct Observation {
     scope_key: String,
     payload: Value,
+}
+
+struct IssueObservation {
+    sort_at: OffsetDateTime,
+    issue_id: String,
+    observation: Observation,
 }
 
 #[derive(Debug)]
@@ -1229,16 +1240,19 @@ pub(crate) async fn run_scheduler() -> Result<(), AlertSchedulerError> {
 }
 
 pub(crate) async fn evaluate_rules_once(pool: &PgPool) -> Result<(), AlertSchedulerError> {
+    let started = Instant::now();
     validate_public_base_url(
         &env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
     )
     .map_err(|_| AlertSchedulerError::Configuration)?;
     let rows = sqlx::query(
-        "SELECT r.id::text AS id, r.organization_id::text AS organization_id, r.project_id::text AS project_id, p.name AS project_name, r.integration_id::text AS integration_id, r.condition_kind, r.environment, r.threshold, r.window_seconds, r.quiet_start_minute, r.quiet_end_minute FROM alert_rules r JOIN alert_integrations i ON i.id = r.integration_id AND i.organization_id = r.organization_id AND i.project_id = r.project_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id WHERE r.enabled AND i.enabled ORDER BY r.updated_at, r.id LIMIT 1000",
+        "SELECT r.id::text AS id, r.organization_id::text AS organization_id, r.project_id::text AS project_id, p.name AS project_name, r.integration_id::text AS integration_id, r.condition_kind, r.environment, r.threshold, r.window_seconds, r.quiet_start_minute, r.quiet_end_minute, r.created_at, r.updated_at FROM alert_rules r JOIN alert_integrations i ON i.id = r.integration_id AND i.organization_id = r.organization_id AND i.project_id = r.project_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id WHERE r.enabled AND i.enabled ORDER BY r.last_evaluated_at NULLS FIRST, r.id LIMIT $1",
     )
+    .bind(ALERT_RULE_PAGE_SIZE)
     .fetch_all(pool)
     .await
     .map_err(|_| AlertSchedulerError::Database)?;
+    let selected_rules = rows.len();
     for row in rows {
         let rule = RuleEvaluation {
             id: row.get("id"),
@@ -1252,16 +1266,39 @@ pub(crate) async fn evaluate_rules_once(pool: &PgPool) -> Result<(), AlertSchedu
             window_seconds: row.get("window_seconds"),
             quiet_start_minute: row.get("quiet_start_minute"),
             quiet_end_minute: row.get("quiet_end_minute"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
         };
         evaluate_rule(pool, &rule).await?;
+        sqlx::query(
+            "UPDATE alert_rules r SET last_evaluated_at = now() WHERE r.id = $1::uuid AND r.organization_id = $2::uuid AND r.project_id = $3::uuid AND r.updated_at = $4::timestamptz AND r.enabled AND EXISTS (SELECT 1 FROM alert_integrations i WHERE i.id = r.integration_id AND i.organization_id = r.organization_id AND i.project_id = r.project_id AND i.enabled)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.organization_id)
+        .bind(&rule.project_id)
+        .bind(rule.updated_at)
+        .execute(pool)
+        .await
+        .map_err(|_| AlertSchedulerError::Database)?;
     }
+    info!(
+        evaluated_rules = selected_rules,
+        duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        "alert rule page evaluated"
+    );
     Ok(())
 }
 
 async fn evaluate_rule(pool: &PgPool, rule: &RuleEvaluation) -> Result<(), AlertSchedulerError> {
+    if rule.condition_kind == "first_seen" {
+        evaluate_issue_rule_pages(pool, rule, false).await?;
+        return Ok(());
+    }
+    if rule.condition_kind == "regression" {
+        evaluate_issue_rule_pages(pool, rule, true).await?;
+        return Ok(());
+    }
     let observations = match rule.condition_kind.as_str() {
-        "first_seen" => issue_observations(pool, rule, false).await?,
-        "regression" => issue_observations(pool, rule, true).await?,
         "volume" => volume_observation(pool, rule).await?,
         "missing_symbols" => processing_observation(pool, rule, true).await?,
         "processing_failure" => processing_observation(pool, rule, false).await?,
@@ -1283,6 +1320,14 @@ async fn evaluate_rule(pool: &PgPool, rule: &RuleEvaluation) -> Result<(), Alert
         )
         .await?;
     }
+    recover_absent_conditions(pool, rule, &active_scopes).await
+}
+
+async fn recover_absent_conditions(
+    pool: &PgPool,
+    rule: &RuleEvaluation,
+    active_scopes: &BTreeSet<String>,
+) -> Result<(), AlertSchedulerError> {
     let rows = sqlx::query(
         "SELECT scope_key, payload FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND state = 'active'",
     )
@@ -1308,28 +1353,99 @@ async fn evaluate_rule(pool: &PgPool, rule: &RuleEvaluation) -> Result<(), Alert
     Ok(())
 }
 
-async fn issue_observations(
+async fn evaluate_issue_rule_pages(
     pool: &PgPool,
     rule: &RuleEvaluation,
     regression: bool,
-) -> Result<Vec<Observation>, AlertSchedulerError> {
+) -> Result<bool, AlertSchedulerError> {
+    evaluate_issue_rule_pages_bounded(pool, rule, regression, None).await
+}
+
+async fn evaluate_issue_rule_pages_bounded(
+    pool: &PgPool,
+    rule: &RuleEvaluation,
+    regression: bool,
+    maximum_pages: Option<usize>,
+) -> Result<bool, AlertSchedulerError> {
+    let mut cursor: Option<(OffsetDateTime, String)> = None;
+    let mut pages = 0_usize;
+    loop {
+        let observations = issue_observations_page(pool, rule, regression, cursor.as_ref()).await?;
+        if observations.is_empty() {
+            recover_issue_conditions(pool, rule, regression).await?;
+            info!(
+                rule_id = rule.id,
+                project_id = rule.project_id,
+                pages,
+                "alert issue rule evaluated"
+            );
+            return Ok(true);
+        }
+        let page_length = observations.len();
+        let next_cursor = observations
+            .last()
+            .map(|observation| (observation.sort_at, observation.issue_id.clone()));
+        for observation in observations {
+            transition_condition(
+                pool,
+                rule,
+                &observation.observation.scope_key,
+                true,
+                observation.observation.payload,
+            )
+            .await?;
+        }
+        pages = pages.saturating_add(1);
+        if page_length
+            < usize::try_from(ALERT_ISSUE_PAGE_SIZE).map_err(|_| AlertSchedulerError::Database)?
+        {
+            recover_issue_conditions(pool, rule, regression).await?;
+            info!(
+                rule_id = rule.id,
+                project_id = rule.project_id,
+                pages,
+                "alert issue rule evaluated"
+            );
+            return Ok(true);
+        }
+        if maximum_pages.is_some_and(|maximum| pages >= maximum) {
+            return Ok(false);
+        }
+        cursor = next_cursor;
+    }
+}
+
+async fn issue_observations_page(
+    pool: &PgPool,
+    rule: &RuleEvaluation,
+    regression: bool,
+    cursor: Option<&(OffsetDateTime, String)>,
+) -> Result<Vec<IssueObservation>, AlertSchedulerError> {
+    let cursor_at = cursor.map(|(sort_at, _)| *sort_at);
+    let cursor_id = cursor.map(|(_, issue_id)| issue_id.as_str());
     let rows = if regression {
         sqlx::query(
-            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.regression_state = 'regressed' AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.updated_at, i.id LIMIT 1000",
+            "SELECT i.id::text AS issue_id, i.title, i.event_count, i.updated_at AS sort_at FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.regression_state = 'regressed' AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) AND ($4::timestamptz IS NULL OR (i.updated_at, i.id) > ($4::timestamptz, $5::uuid)) ORDER BY i.updated_at, i.id LIMIT $6",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
         .bind(&rule.environment)
+        .bind(cursor_at)
+        .bind(cursor_id)
+        .bind(ALERT_ISSUE_PAGE_SIZE)
         .fetch_all(pool)
         .await
     } else {
         sqlx::query(
-            "SELECT i.id::text AS issue_id, i.title, i.event_count FROM issues i JOIN alert_rules r ON r.id = $4::uuid AND r.organization_id = i.organization_id AND r.project_id = i.project_id WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.first_seen_at >= r.created_at AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) ORDER BY i.first_seen_at, i.id LIMIT 1000",
+            "SELECT i.id::text AS issue_id, i.title, i.event_count, i.first_seen_at AS sort_at FROM issues i WHERE i.organization_id = $1::uuid AND i.project_id = $2::uuid AND i.status = 'open' AND i.first_seen_at >= $4::timestamptz AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $3) AND ($5::timestamptz IS NULL OR (i.first_seen_at, i.id) > ($5::timestamptz, $6::uuid)) ORDER BY i.first_seen_at, i.id LIMIT $7",
         )
         .bind(&rule.organization_id)
         .bind(&rule.project_id)
         .bind(&rule.environment)
-        .bind(&rule.id)
+        .bind(rule.created_at)
+        .bind(cursor_at)
+        .bind(cursor_id)
+        .bind(ALERT_ISSUE_PAGE_SIZE)
         .fetch_all(pool)
         .await
     }
@@ -1339,12 +1455,69 @@ async fn issue_observations(
         .map(|row| {
             let issue_id = row.get::<String, _>("issue_id");
             let title = row.get::<String, _>("title");
-            Observation {
-                scope_key: format!("issue:{issue_id}"),
-                payload: base_payload(rule, Some(&issue_id), Some(&title), row.get("event_count")),
+            IssueObservation {
+                sort_at: row.get("sort_at"),
+                issue_id: issue_id.clone(),
+                observation: Observation {
+                    scope_key: format!("issue:{issue_id}"),
+                    payload: base_payload(
+                        rule,
+                        Some(&issue_id),
+                        Some(&title),
+                        row.get("event_count"),
+                    ),
+                },
             }
         })
         .collect())
+}
+
+async fn recover_issue_conditions(
+    pool: &PgPool,
+    rule: &RuleEvaluation,
+    regression: bool,
+) -> Result<(), AlertSchedulerError> {
+    loop {
+        let rows = if regression {
+            sqlx::query(
+                "SELECT s.scope_key, s.payload FROM alert_condition_states s WHERE s.organization_id = $1::uuid AND s.project_id = $2::uuid AND s.rule_id = $3::uuid AND s.state = 'active' AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = (s.payload ->> 'issue_id')::uuid AND i.organization_id = s.organization_id AND i.project_id = s.project_id AND i.status = 'open' AND i.regression_state = 'regressed' AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $4)) ORDER BY s.scope_key LIMIT $5",
+            )
+            .bind(&rule.organization_id)
+            .bind(&rule.project_id)
+            .bind(&rule.id)
+            .bind(&rule.environment)
+            .bind(ALERT_RECOVERY_PAGE_SIZE)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT s.scope_key, s.payload FROM alert_condition_states s WHERE s.organization_id = $1::uuid AND s.project_id = $2::uuid AND s.rule_id = $3::uuid AND s.state = 'active' AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = (s.payload ->> 'issue_id')::uuid AND i.organization_id = s.organization_id AND i.project_id = s.project_id AND i.status = 'open' AND i.first_seen_at >= $5::timestamptz AND EXISTS (SELECT 1 FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND e.environment = $4)) ORDER BY s.scope_key LIMIT $6",
+            )
+            .bind(&rule.organization_id)
+            .bind(&rule.project_id)
+            .bind(&rule.id)
+            .bind(&rule.environment)
+            .bind(rule.created_at)
+            .bind(ALERT_RECOVERY_PAGE_SIZE)
+            .fetch_all(pool)
+            .await
+        }
+        .map_err(|_| AlertSchedulerError::Database)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            let scope_key = row.get::<String, _>("scope_key");
+            transition_condition(
+                pool,
+                rule,
+                &scope_key,
+                false,
+                row.get::<Value, _>("payload"),
+            )
+            .await?;
+        }
+    }
 }
 
 async fn volume_observation(
@@ -1768,26 +1941,83 @@ async fn claim_delivery(
     pool: &PgPool,
     worker_id: &str,
 ) -> Result<Option<ClaimedDelivery>, AlertWorkerError> {
-    let lease_token = random_uuid().map_err(|_| AlertWorkerError::Configuration)?;
-    let row = sqlx::query(
-        "WITH candidate AS (SELECT id FROM alert_deliveries WHERE attempt < max_attempt AND ((state IN ('pending', 'failed') AND available_at <= now()) OR (state = 'leased' AND lease_expires_at <= now())) ORDER BY available_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE alert_deliveries d SET state = 'leased', attempt = d.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), failure_code = NULL, updated_at = now() FROM candidate WHERE d.id = candidate.id RETURNING d.id::text AS id, d.organization_id::text AS organization_id, d.project_id::text AS project_id, d.integration_id::text AS integration_id, d.attempt, d.max_attempt, d.lease_token::text AS lease_token, d.payload",
-    )
-    .bind(worker_id)
-    .bind(lease_token)
-    .bind(DELIVERY_LEASE_SECONDS)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| AlertWorkerError::Database)?;
-    Ok(row.map(|row| ClaimedDelivery {
-        id: row.get("id"),
-        organization_id: row.get("organization_id"),
-        project_id: row.get("project_id"),
-        integration_id: row.get("integration_id"),
-        attempt: row.get("attempt"),
-        max_attempt: row.get("max_attempt"),
-        lease_token: row.get("lease_token"),
-        payload: row.get("payload"),
-    }))
+    loop {
+        let mut transaction = pool.begin().await.map_err(|_| AlertWorkerError::Database)?;
+        let candidate = sqlx::query(
+            "SELECT id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, state, attempt, max_attempt FROM alert_deliveries WHERE ((state IN ('pending', 'failed') AND available_at <= now() AND attempt < max_attempt) OR (state = 'leased' AND lease_expires_at <= now())) ORDER BY available_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1",
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| AlertWorkerError::Database)?;
+        let Some(candidate) = candidate else {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AlertWorkerError::Database)?;
+            return Ok(None);
+        };
+        let id = candidate.get::<String, _>("id");
+        let organization_id = candidate.get::<String, _>("organization_id");
+        let project_id = candidate.get::<String, _>("project_id");
+        let attempt = candidate.get::<i32, _>("attempt");
+        let max_attempt = candidate.get::<i32, _>("max_attempt");
+        if candidate.get::<String, _>("state") == "leased" && attempt >= max_attempt {
+            let changed = sqlx::query(
+                "UPDATE alert_deliveries SET state = 'dead', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, failure_code = 'lease_expired_final', updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND state = 'leased' AND lease_expires_at <= now() AND attempt >= max_attempt",
+            )
+            .bind(&id)
+            .bind(&organization_id)
+            .bind(&project_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AlertWorkerError::Database)?
+            .rows_affected();
+            if changed != 1 {
+                return Err(AlertWorkerError::Database);
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AlertWorkerError::Database)?;
+            info!(
+                delivery_id = id,
+                project_id,
+                attempt,
+                failure_code = "lease_expired_final",
+                "expired final alert delivery reconciled"
+            );
+            continue;
+        }
+        let lease_token = random_uuid().map_err(|_| AlertWorkerError::Configuration)?;
+        let row = sqlx::query(
+            "UPDATE alert_deliveries SET state = 'leased', attempt = attempt + 1, lease_owner = $4, lease_token = $5::uuid, lease_expires_at = now() + ($6 * interval '1 second'), failure_code = NULL, updated_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND attempt < max_attempt AND ((state IN ('pending', 'failed') AND available_at <= now()) OR (state = 'leased' AND lease_expires_at <= now())) RETURNING id::text AS id, organization_id::text AS organization_id, project_id::text AS project_id, integration_id::text AS integration_id, attempt, max_attempt, lease_token::text AS lease_token, payload",
+        )
+        .bind(&id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(worker_id)
+        .bind(lease_token)
+        .bind(DELIVERY_LEASE_SECONDS)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| AlertWorkerError::Database)?
+        .ok_or(AlertWorkerError::Database)?;
+        let delivery = ClaimedDelivery {
+            id: row.get("id"),
+            organization_id: row.get("organization_id"),
+            project_id: row.get("project_id"),
+            integration_id: row.get("integration_id"),
+            attempt: row.get("attempt"),
+            max_attempt: row.get("max_attempt"),
+            lease_token: row.get("lease_token"),
+            payload: row.get("payload"),
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AlertWorkerError::Database)?;
+        return Ok(Some(delivery));
+    }
 }
 
 async fn deliver_claim(
@@ -2058,10 +2288,11 @@ async fn finish_delivery(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimedDelivery, DeliveryError, EmailDelivery, SecretCipher, SecretScope, alert_subject,
-        alert_text, claim_delivery, deliver_claim, destination_payload, evaluate_rules_once,
-        finish_delivery, public_ip, quiet_delay_seconds, random_uuid, send_request,
-        validate_customer_destination, validate_rule_fields, webhook_signature,
+        ClaimedDelivery, DeliveryError, EmailDelivery, RuleEvaluation, SecretCipher, SecretScope,
+        alert_subject, alert_text, claim_delivery, deliver_claim, destination_payload,
+        evaluate_issue_rule_pages_bounded, evaluate_rules_once, finish_delivery, public_ip,
+        quiet_delay_seconds, random_uuid, send_request, validate_customer_destination,
+        validate_rule_fields, webhook_signature,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
     use axum::{
@@ -2073,8 +2304,13 @@ mod tests {
     };
     use reqwest::{Client, Url, redirect::Policy};
     use serde_json::json;
-    use sqlx::{PgPool, postgres::PgPoolOptions};
-    use std::{error::Error, net::IpAddr, sync::Arc, time::Duration};
+    use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+    use std::{
+        error::Error,
+        net::IpAddr,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
     use time::OffsetDateTime;
     use tokio::sync::Mutex;
     use tower::ServiceExt as _;
@@ -2544,6 +2780,27 @@ mod tests {
         assert_eq!(listed["can_edit"], true);
         assert_eq!(listed["rules"].as_array().map(Vec::len), Some(7));
         assert!(listed.to_string().find("encrypted_config").is_none());
+        let volume_rule: String = sqlx::query_scalar(
+            "SELECT id::text FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid AND condition_kind = 'volume'",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("UPDATE alert_rules SET last_evaluated_at = now() WHERE id = $1::uuid")
+            .bind(&volume_rule)
+            .execute(&pool)
+            .await?;
+        let updated_rule =
+            alert_rule_update_request(&server, &project_id, &volume_rule, json!({"threshold": 2}))
+                .await?;
+        assert_eq!(updated_rule.status(), axum::http::StatusCode::OK);
+        let evaluation_reset: Option<OffsetDateTime> =
+            sqlx::query_scalar("SELECT last_evaluated_at FROM alert_rules WHERE id = $1::uuid")
+                .bind(&volume_rule)
+                .fetch_one(&pool)
+                .await?;
+        assert!(evaluation_reset.is_none());
         let created = alert_request(
             &server,
             "POST",
@@ -2615,6 +2872,422 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
+    async fn expired_final_deliveries_finish_and_concurrent_reclaimers_do_not_duplicate()
+    -> Result<(), Box<dyn Error>> {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (user_id, organization_id, project_id, _, _) =
+            seed_scope(&pool, "delivery-reclaim").await?;
+        let integration_id =
+            seed_email_integration(&pool, &organization_id, &project_id, &user_id).await?;
+        add_rule(
+            &pool,
+            &organization_id,
+            &project_id,
+            &integration_id,
+            &user_id,
+            "volume",
+            "production",
+            Some(1),
+            Some(60),
+        )
+        .await?;
+        let rule_id: String = sqlx::query_scalar(
+            "SELECT id::text FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        let final_id: String = sqlx::query_scalar(
+            "INSERT INTO alert_deliveries (organization_id, project_id, integration_id, rule_id, scope_key, generation, transition, payload, attempt, max_attempt) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'project:final', 1, 'triggered', '{}'::jsonb, 2, 3) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&integration_id)
+        .bind(&rule_id)
+        .fetch_one(&pool)
+        .await?;
+        let final_claim = claim_delivery(&pool, "final-worker")
+            .await?
+            .ok_or("final attempt was not claimed")?;
+        assert_eq!(final_claim.id, final_id);
+        assert_eq!(final_claim.attempt, 3);
+        sqlx::query(
+            "UPDATE alert_deliveries SET lease_expires_at = now() - interval '1 second' WHERE id = $1::uuid",
+        )
+        .bind(&final_id)
+        .execute(&pool)
+        .await?;
+        let (left, right) = tokio::join!(
+            claim_delivery(&pool, "final-reclaimer-left"),
+            claim_delivery(&pool, "final-reclaimer-right")
+        );
+        assert!(left?.is_none());
+        assert!(right?.is_none());
+        let final_state = sqlx::query(
+            "SELECT state, attempt, failure_code, lease_owner, lease_token::text AS lease_token, lease_expires_at FROM alert_deliveries WHERE id = $1::uuid",
+        )
+        .bind(&final_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(final_state.get::<String, _>("state"), "dead");
+        assert_eq!(final_state.get::<i32, _>("attempt"), 3);
+        assert_eq!(
+            final_state
+                .get::<Option<String>, _>("failure_code")
+                .as_deref(),
+            Some("lease_expired_final")
+        );
+        assert!(
+            final_state
+                .get::<Option<String>, _>("lease_owner")
+                .is_none()
+        );
+        assert!(
+            final_state
+                .get::<Option<String>, _>("lease_token")
+                .is_none()
+        );
+        assert!(
+            final_state
+                .get::<Option<OffsetDateTime>, _>("lease_expires_at")
+                .is_none()
+        );
+
+        let reclaim_id: String = sqlx::query_scalar(
+            "INSERT INTO alert_deliveries (organization_id, project_id, integration_id, rule_id, scope_key, generation, transition, payload, state, attempt, max_attempt, lease_owner, lease_token, lease_expires_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'project:reclaim', 1, 'triggered', '{}'::jsonb, 'leased', 2, 3, 'stale-worker', gen_random_uuid(), now() - interval '1 second') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&integration_id)
+        .bind(&rule_id)
+        .fetch_one(&pool)
+        .await?;
+        let (left, right) = tokio::join!(
+            claim_delivery(&pool, "reclaimer-left"),
+            claim_delivery(&pool, "reclaimer-right")
+        );
+        let claims = [left?, right?].into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, reclaim_id);
+        assert_eq!(claims[0].attempt, 3);
+        finish_delivery(&pool, &claims[0], Ok(())).await?;
+        let reclaimed_state: String =
+            sqlx::query_scalar("SELECT state FROM alert_deliveries WHERE id = $1::uuid")
+                .bind(&reclaim_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(reclaimed_state, "delivered");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    async fn scheduler_rotates_through_every_enabled_rule() -> Result<(), Box<dyn Error>> {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (user_id, organization_id, project_id, _, _) = seed_scope(&pool, "rule-pages").await?;
+        let integration_id =
+            seed_email_integration(&pool, &organization_id, &project_id, &user_id).await?;
+        let inserted: i64 = sqlx::query_scalar(
+            "WITH inserted AS (INSERT INTO alert_rules (organization_id, project_id, integration_id, condition_kind, environment, threshold, window_seconds, enabled, created_by_user_id) SELECT $1::uuid, $2::uuid, $3::uuid, 'volume', 'e' || lpad(n::text, 4, '0'), 1, 60, n <= 1001, $4::uuid FROM generate_series(1, 1002) values(n) RETURNING 1) SELECT count(*)::bigint FROM inserted",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&integration_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted, 1_002);
+        sqlx::query("ANALYZE alert_rules").execute(&pool).await?;
+
+        let started = Instant::now();
+        evaluate_rules_once(&pool).await?;
+        let first_tick: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid AND enabled AND last_evaluated_at IS NOT NULL",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(first_tick, 1_000);
+        evaluate_rules_once(&pool).await?;
+        let state = sqlx::query(
+            "SELECT count(*) FILTER (WHERE enabled AND last_evaluated_at IS NOT NULL)::bigint AS enabled_evaluated, count(*) FILTER (WHERE enabled AND last_evaluated_at IS NULL)::bigint AS enabled_waiting, count(*) FILTER (WHERE NOT enabled AND last_evaluated_at IS NOT NULL)::bigint AS disabled_evaluated FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state.get::<i64, _>("enabled_evaluated"), 1_001);
+        assert_eq!(state.get::<i64, _>("enabled_waiting"), 0);
+        assert_eq!(state.get::<i64, _>("disabled_evaluated"), 0);
+        assert_eq!(delivery_count(&pool, &project_id).await?, 0);
+        println!(
+            "enabled_rules=1001 ticks=2 elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
+    async fn issue_evaluation_pages_every_match_before_recovery() -> Result<(), Box<dyn Error>> {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (user_id, organization_id, project_id, key_id, release_id) =
+            seed_scope(&pool, "issue-pages").await?;
+        let integration_id =
+            seed_email_integration(&pool, &organization_id, &project_id, &user_id).await?;
+        add_rule(
+            &pool,
+            &organization_id,
+            &project_id,
+            &integration_id,
+            &user_id,
+            "regression",
+            "production",
+            None,
+            None,
+        )
+        .await?;
+        let rule_id: String = sqlx::query_scalar(
+            "SELECT id::text FROM alert_rules WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        let inserted_issues: i64 = sqlx::query_scalar(
+            "WITH inserted AS (INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, status, regression_state, first_seen_at, last_seen_at, event_count, resolved_in_release_id, resolved_at, updated_at) SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'stack', 1, md5('issue:' || n::text) || md5('fingerprint:' || n::text), 'Paged issue ' || n::text, 'open', 'regressed', now() - interval '1 hour' + n * interval '1 millisecond', now(), 1, $3::uuid, now() - interval '2 hours', now() - interval '1 hour' + n * interval '1 millisecond' FROM generate_series(1, 1001) values(n) RETURNING 1) SELECT count(*)::bigint FROM inserted",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&release_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted_issues, 1_001);
+        let inserted_events: i64 = sqlx::query_scalar(
+            "WITH targets AS MATERIALIZED (SELECT id AS issue_id, substring(title FROM 13)::integer AS n, fingerprint FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid AND title LIKE 'Paged issue %'), objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'alert-pages/' || n::text, decode(md5('object:' || n::text) || md5('checksum:' || n::text), 'hex'), 1, 'application/octet-stream' FROM targets RETURNING id, split_part(object_key, '/', 2)::integer AS n), inserted AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, crash_guid, environment, processing_state, grouping_state, fingerprint_algorithm, fingerprint_version, fingerprint, variant_fingerprint, grouping_quality, grouped_at, issue_id, received_at, updated_at) SELECT gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, o.id, 'alert-page-' || t.n::text, 'production', 'processed', 'grouped', 'stack', 1, t.fingerprint, md5('variant:' || t.n::text) || md5('other:' || t.n::text), 100, now(), t.issue_id, now(), now() FROM targets t JOIN objects o ON o.n = t.n RETURNING issue_id) SELECT count(*)::bigint FROM inserted",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&key_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted_events, 1_001);
+        sqlx::query(
+            "UPDATE issues i SET representative_event_id = e.id FROM crash_events e WHERE e.organization_id = i.organization_id AND e.project_id = i.project_id AND e.issue_id = i.id AND i.organization_id = $1::uuid AND i.project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .execute(&pool)
+        .await?;
+        let stale_issue = random_uuid()?;
+        sqlx::query(
+            "INSERT INTO alert_condition_states (organization_id, project_id, rule_id, scope_key, state, generation, payload) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'active', 1, $5)",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .bind(format!("issue:{stale_issue}"))
+        .bind(json!({
+            "condition": "regression",
+            "project_id": project_id,
+            "project_name": "issue-pages game",
+            "environment": "production",
+            "issue_id": stale_issue,
+            "issue_title": "Stale issue",
+            "count": 1,
+            "url": "http://127.0.0.1:3000/projects/test/issues/stale",
+            "transition": "triggered"
+        }))
+        .execute(&pool)
+        .await?;
+
+        let (_, other_organization, other_project, other_key, other_release) =
+            seed_scope(&pool, "other-issue-pages").await?;
+        let other_event = seed_event(
+            &pool,
+            &other_organization,
+            &other_project,
+            &other_key,
+            "processed",
+            "production",
+            "other-regression",
+        )
+        .await?;
+        let other_issue: String = sqlx::query_scalar(
+            "INSERT INTO issues (id, organization_id, project_id, fingerprint_algorithm, fingerprint_version, fingerprint, title, status, regression_state, first_seen_at, last_seen_at, event_count, representative_event_id, resolved_in_release_id, resolved_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'stack', 1, repeat('f', 64), 'Other regression', 'open', 'regressed', now() - interval '1 hour', now(), 1, $3::uuid, $4::uuid, now() - interval '2 hours') RETURNING id::text",
+        )
+        .bind(&other_organization)
+        .bind(&other_project)
+        .bind(&other_event)
+        .bind(&other_release)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE crash_events SET issue_id = $2::uuid, grouping_state = 'grouped', fingerprint_algorithm = 'stack', fingerprint_version = 1, fingerprint = repeat('f', 64), variant_fingerprint = repeat('e', 64), grouping_quality = 100, grouped_at = now() WHERE id = $1::uuid",
+        )
+        .bind(&other_event)
+        .bind(&other_issue)
+        .execute(&pool)
+        .await?;
+        sqlx::query("ANALYZE issues").execute(&pool).await?;
+
+        let started = Instant::now();
+        let rule_row = sqlx::query(
+            "SELECT r.id::text AS id, r.organization_id::text AS organization_id, r.project_id::text AS project_id, p.name AS project_name, r.integration_id::text AS integration_id, r.condition_kind, r.environment, r.threshold, r.window_seconds, r.quiet_start_minute, r.quiet_end_minute, r.created_at, r.updated_at FROM alert_rules r JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id WHERE r.id = $1::uuid AND r.organization_id = $2::uuid AND r.project_id = $3::uuid",
+        )
+        .bind(&rule_id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        let rule = RuleEvaluation {
+            id: rule_row.get("id"),
+            organization_id: rule_row.get("organization_id"),
+            project_id: rule_row.get("project_id"),
+            project_name: rule_row.get("project_name"),
+            integration_id: rule_row.get("integration_id"),
+            condition_kind: rule_row.get("condition_kind"),
+            environment: rule_row.get("environment"),
+            threshold: rule_row.get("threshold"),
+            window_seconds: rule_row.get("window_seconds"),
+            quiet_start_minute: rule_row.get("quiet_start_minute"),
+            quiet_end_minute: rule_row.get("quiet_end_minute"),
+            created_at: rule_row.get("created_at"),
+            updated_at: rule_row.get("updated_at"),
+        };
+        assert!(
+            !evaluate_issue_rule_pages_bounded(&pool, &rule, true, Some(1)).await?,
+            "one page must not be treated as a complete evaluation"
+        );
+        let interrupted_state = sqlx::query(
+            "SELECT count(*) FILTER (WHERE state = 'active')::bigint AS active, count(*) FILTER (WHERE state = 'inactive')::bigint AS inactive FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(interrupted_state.get::<i64, _>("active"), 1_001);
+        assert_eq!(interrupted_state.get::<i64, _>("inactive"), 0);
+        assert_eq!(delivery_count(&pool, &project_id).await?, 1_000);
+
+        evaluate_rules_once(&pool).await?;
+        let first_state = sqlx::query(
+            "SELECT count(*) FILTER (WHERE state = 'active')::bigint AS active, count(*) FILTER (WHERE state = 'inactive')::bigint AS inactive FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(first_state.get::<i64, _>("active"), 1_001);
+        assert_eq!(first_state.get::<i64, _>("inactive"), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM alert_condition_states WHERE organization_id = $1::uuid",
+            )
+            .bind(&other_organization)
+            .fetch_one(&pool)
+            .await?,
+            0
+        );
+        assert_eq!(delivery_count(&pool, &project_id).await?, 1_002);
+
+        let moved_issue: String = sqlx::query_scalar(
+            "UPDATE issues SET updated_at = now() + interval '1 day' WHERE id = (SELECT id FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY updated_at, id LIMIT 1) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        evaluate_rules_once(&pool).await?;
+        let moved_state: String = sqlx::query_scalar(
+            "SELECT state FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND scope_key = $4",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .bind(format!("issue:{moved_issue}"))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(moved_state, "active");
+        assert_eq!(delivery_count(&pool, &project_id).await?, 1_002);
+
+        let resolved_issue: String = sqlx::query_scalar(
+            "UPDATE issues SET status = 'resolved', regression_state = 'resolved', updated_at = now() + interval '2 days' WHERE id = (SELECT id FROM issues WHERE organization_id = $1::uuid AND project_id = $2::uuid AND id <> $3::uuid ORDER BY updated_at, id LIMIT 1) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&moved_issue)
+        .fetch_one(&pool)
+        .await?;
+        evaluate_rules_once(&pool).await?;
+        let final_state = sqlx::query(
+            "SELECT count(*) FILTER (WHERE state = 'active')::bigint AS active, count(*) FILTER (WHERE state = 'inactive')::bigint AS inactive FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(final_state.get::<i64, _>("active"), 1_000);
+        assert_eq!(final_state.get::<i64, _>("inactive"), 2);
+        let resolved_state: String = sqlx::query_scalar(
+            "SELECT state FROM alert_condition_states WHERE organization_id = $1::uuid AND project_id = $2::uuid AND rule_id = $3::uuid AND scope_key = $4",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&rule_id)
+        .bind(format!("issue:{resolved_issue}"))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(resolved_state, "inactive");
+        assert_eq!(delivery_count(&pool, &project_id).await?, 1_003);
+        println!(
+            "matching_issues=1001 pages=2 false_recoveries=0 elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
     async fn seed_scope(
         pool: &PgPool,
         prefix: &str,
@@ -2667,6 +3340,22 @@ mod tests {
         .fetch_one(pool)
         .await?;
         Ok((user_id, organization_id, project_id, key_id, release_id))
+    }
+
+    async fn seed_email_integration(
+        pool: &PgPool,
+        organization_id: &str,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<String, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO alert_integrations (organization_id, project_id, kind, name, recipient_user_id, created_by_user_id) VALUES ($1::uuid, $2::uuid, 'email', 'Scale owner email', $3::uuid, $3::uuid) RETURNING id::text",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2763,6 +3452,26 @@ mod tests {
         Ok(router("api", state.clone())
             .oneshot(request.body(body)?)
             .await?)
+    }
+
+    async fn alert_rule_update_request(
+        state: &ServerState,
+        project_id: &str,
+        rule_id: &str,
+        body: serde_json::Value,
+    ) -> Result<axum::response::Response, Box<dyn Error>> {
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/api/v1/projects/{project_id}/alert-rules/{rule_id}"
+            ))
+            .header(
+                "authorization",
+                "Bootstrap alerts-api-secret-000000000000000",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))?;
+        Ok(router("api", state.clone()).oneshot(request).await?)
     }
 
     async fn response_json(
