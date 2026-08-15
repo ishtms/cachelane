@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/359
 
-Status: Waiting for #358
+Status: Locally verified on August 15, 2026
 
 ## Context
 
@@ -58,6 +58,14 @@ The change affects grouping counts, representatives, release chronology, reproce
 The migration is additive and keeps existing rows readable by the previous worker. All delta and repair queries retain organization and project scope. Customer-controlled result arrays keep their current size and byte limits.
 
 Roll out after #358 with grouping enabled against disposable PostgreSQL data. Reconcile fixture rollups before enabling concurrent same-project claims in #361. Rollback restores the full recomputation code, leaves the additive index, and runs the repair command for issues changed by the new implementation.
+
+## Completed evidence
+
+- First grouping now applies one issue, variant, and matched-release delta. Unchanged reprocessing changes no rollup, while release reassignment removes the old membership and applies the new one with exact bounds and representatives.
+- Context facets, release candidates, and symbol waiters use one typed `UNNEST` statement per collection. A maximum fixture persisted 32 facets, 101 candidates, and 4,096 waiters exactly, including an idempotent retry, in 2.38 seconds for the complete focused test.
+- `faultlane-server repair-issue` rebuilt a deliberately drifted tenant-scoped fixture and returned `{"events":1,"variants":1,"releases":0}` through the real binary.
+- On a 100,000-event issue, the next publication completed in 134.929 ms and an unchanged retry completed in 43.827 ms. Concurrent publications and concurrent unchanged retries kept the count exact. The representative lookup used the additive index with four buffers and 0.069 ms execution time.
+- All 26 PostgreSQL-backed server tests and `./scripts/check-fast` passed on the final issue tree.
 
 ## Out of scope
 

@@ -27,3 +27,13 @@ Apply migrations and start the current API and worker with `FAULTLANE_REPROCESSI
 The flag prevents manual request creation and stops workers from selecting requests or reactivating event jobs. Progress reads remain available. Exact symbol waiters and automatic requests may still be recorded while disabled so an artifact arrival is not lost.
 
 To roll back, disable reprocessing before restoring the prior application and worker. Leave the additive schema, request rows, generations, waiters, jobs, raw objects, and immutable results in place. A prior worker understands the reused `process_crash` job and ignores the new request tables. When the current worker returns, it reconciles unfinished request events whose canonical job was completed by an older worker.
+
+## Issue rollup repair
+
+Run a full issue rollup rebuild only when operator checks find drift:
+
+```text
+faultlane-server repair-issue --organization-id <organization-uuid> --project-id <project-uuid> --issue-id <issue-uuid>
+```
+
+The command requires `DATABASE_URL`, locks one tenant-scoped issue, rebuilds its issue, variant, and release counts in one transaction, and prints only the repaired event, variant, and release counts. It scans that issue's events, so do not run it as routine publication work. A failure rolls back the complete repair.
