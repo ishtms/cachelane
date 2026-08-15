@@ -1,4 +1,7 @@
-use std::{env, fmt, time::Duration};
+use std::{
+    env, fmt,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -9,12 +12,19 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
+use tracing::info;
 
 use crate::project_setup::ServerState;
 
 const OVERAGE_BLOCK_EVENTS: i64 = 100_000;
 const OVERAGE_BLOCK_CENTS: i64 = 1_500;
 const RAW_RESERVOIR_RATE: i32 = 100;
+const RETENTION_BATCH_SIZE: i64 = 5_000;
+const RETENTION_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+const STORAGE_RECONCILE_BATCH_SIZE: i64 = 5_000;
+const RETENTION_EVENT_QUERY: &str = "SELECT e.usage_outcome, e.raw_retention_class, e.issue_id::text AS issue_id, e.release_id::text AS release_id, e.variant_fingerprint, e.raw_object_id::text AS object_id, raw.lifecycle_state AS raw_lifecycle_state, p.retain_all_raw, p.artifact_storage_limit_bytes FROM crash_events e JOIN crash_event_objects raw ON raw.id = e.raw_object_id AND raw.organization_id = e.organization_id AND raw.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid FOR UPDATE OF e, raw";
+#[cfg(test)]
+const RETENTION_EVENT_EXPLAIN_QUERY: &str = "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT e.usage_outcome, e.raw_retention_class, e.issue_id::text AS issue_id, e.release_id::text AS release_id, e.variant_fingerprint, e.raw_object_id::text AS object_id, raw.lifecycle_state AS raw_lifecycle_state, p.retain_all_raw, p.artifact_storage_limit_bytes FROM crash_events e JOIN crash_event_objects raw ON raw.id = e.raw_object_id AND raw.organization_id = e.organization_id AND raw.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid FOR UPDATE OF e, raw";
 
 #[derive(Clone, Debug)]
 struct UsagePolicy {
@@ -94,6 +104,39 @@ struct ErrorBody {
     code: &'static str,
     message: &'static str,
 }
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StorageReconciliationReport {
+    pub(crate) organization_id: String,
+    pub(crate) project_id: String,
+    pub(crate) deadlines_backfilled: i64,
+    pub(crate) missing_deadlines: i64,
+    pub(crate) previous_raw_bytes: i64,
+    pub(crate) retained_raw_bytes: i64,
+    pub(crate) raw_byte_drift: i64,
+    pub(crate) previous_symbol_bytes: i64,
+    pub(crate) retained_symbol_bytes: i64,
+    pub(crate) symbol_byte_drift: i64,
+}
+
+#[derive(Debug)]
+pub(crate) enum StorageReconcileError {
+    InvalidIdentifier,
+    NotFound,
+    Database,
+}
+
+impl fmt::Display for StorageReconcileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidIdentifier => "storage reconciliation identifier is invalid",
+            Self::NotFound => "storage reconciliation project was not found",
+            Self::Database => "storage reconciliation database operation failed",
+        })
+    }
+}
+
+impl std::error::Error for StorageReconcileError {}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UsageError {
@@ -327,6 +370,16 @@ pub(crate) async fn record_acceptance(
         .await
         .map_err(|_| UsageError::Unavailable)?;
     }
+    set_raw_delete_after(
+        transaction,
+        organization_id,
+        project_id,
+        event_id,
+        object_id,
+        policy.raw_retention_days,
+    )
+    .await?;
+    apply_storage_delta(transaction, organization_id, project_id, raw_bytes, 0).await?;
     sqlx::query(
         "UPDATE crash_events SET usage_cycle_start = $4::date, usage_policy_version = $5, usage_outcome = $6, usage_counted = true, usage_estimated = $7, usage_accepted_events = $8, raw_retention_class = CASE WHEN $6 = 'sampling' THEN 'pending' ELSE 'standard' END, raw_sampling_rate = CASE WHEN $6 = 'sampling' THEN $9 ELSE 1 END WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid",
     )
@@ -446,6 +499,7 @@ pub(crate) async fn record_symbol_stored(
         .execute(&mut **transaction)
         .await
         .map_err(|_| UsageError::Unavailable)?;
+        apply_storage_delta(transaction, organization_id, project_id, 0, byte_size).await?;
     }
     Ok(())
 }
@@ -474,29 +528,33 @@ async fn schedule_raw_retention_with_enforcement(
     event_id: &str,
     enforce: bool,
 ) -> Result<(), UsageError> {
-    let row = sqlx::query(
-        "SELECT e.usage_outcome, e.raw_retention_class, e.issue_id::text AS issue_id, e.release_id::text AS release_id, e.variant_fingerprint, e.raw_object_id::text AS object_id, raw.lifecycle_state AS raw_lifecycle_state, p.retain_all_raw, p.artifact_storage_limit_bytes, (SELECT COALESCE(sum(o.byte_size), 0)::bigint FROM crash_event_objects o WHERE o.organization_id = e.organization_id AND o.project_id = e.project_id AND o.lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = e.organization_id AND m.project_id = e.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS symbol_storage_bytes FROM crash_events e JOIN crash_event_objects raw ON raw.id = e.raw_object_id AND raw.organization_id = e.organization_id AND raw.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE e.id = $1::uuid AND e.organization_id = $2::uuid AND e.project_id = $3::uuid FOR UPDATE OF e, raw",
-    )
-    .bind(event_id)
-    .bind(organization_id)
-    .bind(project_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|_| UsageError::Unavailable)?
-    .ok_or(UsageError::NotFound)?;
+    let row = sqlx::query(RETENTION_EVENT_QUERY)
+        .bind(event_id)
+        .bind(organization_id)
+        .bind(project_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| UsageError::Unavailable)?
+        .ok_or(UsageError::NotFound)?;
     if row.get::<String, _>("raw_lifecycle_state") != "stored" {
         return Ok(());
     }
     if row.get::<String, _>("raw_retention_class") != "pending" {
         return Ok(());
     }
-    if !enforce
-        || row.get::<String, _>("usage_outcome") != "sampling"
-        || row.get::<bool, _>("retain_all_raw")
-            && row
-                .get::<i64, _>("retained_raw_bytes")
-                .saturating_add(row.get::<i64, _>("symbol_storage_bytes"))
-                <= row.get::<i64, _>("artifact_storage_limit_bytes")
+    if !enforce || row.get::<String, _>("usage_outcome") != "sampling" {
+        return set_retention_class(
+            transaction,
+            organization_id,
+            project_id,
+            event_id,
+            "standard",
+        )
+        .await;
+    }
+    if row.get::<bool, _>("retain_all_raw")
+        && retained_artifact_bytes(transaction, organization_id, project_id).await?
+            <= row.get::<i64, _>("artifact_storage_limit_bytes")
     {
         return set_retention_class(
             transaction,
@@ -674,6 +732,7 @@ pub(crate) async fn record_raw_deleted(
         .execute(&mut **transaction)
         .await
         .map_err(|_| UsageError::Unavailable)?;
+        apply_storage_delta(transaction, organization_id, project_id, -byte_size, 0).await?;
     }
     sqlx::query(
         "UPDATE crash_event_objects SET lifecycle_state = 'discarded', deleted_at = now() WHERE id = $1::uuid AND organization_id = $2::uuid AND project_id = $3::uuid AND lifecycle_state IN ('deleting', 'discarded')",
@@ -725,7 +784,13 @@ pub(crate) async fn run_scheduler() -> Result<(), SchedulerError> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = interval.tick() => schedule_expired_raw(&pool).await?,
+            _ = interval.tick() => {
+                if retention_v2_enabled() {
+                    drain_expired_raw_v2(&pool, RETENTION_DRAIN_BUDGET).await?;
+                } else {
+                    schedule_expired_raw_legacy(&pool).await?;
+                }
+            },
             shutdown = tokio::signal::ctrl_c() => {
                 shutdown.map_err(|_| SchedulerError::Configuration)?;
                 return Ok(());
@@ -734,7 +799,7 @@ pub(crate) async fn run_scheduler() -> Result<(), SchedulerError> {
     }
 }
 
-async fn schedule_expired_raw(pool: &PgPool) -> Result<(), SchedulerError> {
+async fn schedule_expired_raw_legacy(pool: &PgPool) -> Result<(), SchedulerError> {
     let mut transaction = pool.begin().await.map_err(|_| SchedulerError::Database)?;
     let rows = sqlx::query(
         "SELECT e.id::text AS event_id, e.organization_id::text AS organization_id, e.project_id::text AS project_id, e.raw_object_id::text AS object_id FROM crash_events e JOIN crash_event_objects o ON o.id = e.raw_object_id AND o.organization_id = e.organization_id AND o.project_id = e.project_id JOIN project_usage_policies p ON p.organization_id = e.organization_id AND p.project_id = e.project_id WHERE o.lifecycle_state = 'stored' AND e.received_at < now() - (p.raw_retention_days * interval '1 day') ORDER BY e.received_at, e.id FOR UPDATE OF e, o SKIP LOCKED LIMIT 100",
@@ -758,6 +823,172 @@ async fn schedule_expired_raw(pool: &PgPool) -> Result<(), SchedulerError> {
         .commit()
         .await
         .map_err(|_| SchedulerError::Database)
+}
+
+async fn drain_expired_raw_v2(pool: &PgPool, budget: Duration) -> Result<i64, SchedulerError> {
+    let started = Instant::now();
+    let unreconciled_projects: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM project_storage_counters WHERE reconciled_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SchedulerError::Database)?;
+    if unreconciled_projects != 0 {
+        info!(
+            unreconciled_projects,
+            "raw retention scheduling is waiting for storage reconciliation"
+        );
+        return Ok(0);
+    }
+    let mut scheduled = 0_i64;
+    let mut batches = 0_i64;
+    while started.elapsed() < budget {
+        let claimed = schedule_expired_raw_v2_batch(pool, RETENTION_BATCH_SIZE).await?;
+        scheduled = scheduled.saturating_add(claimed);
+        batches = batches.saturating_add(1);
+        if claimed < RETENTION_BATCH_SIZE {
+            break;
+        }
+    }
+    info!(
+        scheduled,
+        batches,
+        duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        "raw retention scheduling pass completed"
+    );
+    Ok(scheduled)
+}
+
+async fn schedule_expired_raw_v2_batch(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<i64, SchedulerError> {
+    let scheduled = sqlx::query_scalar(
+        "WITH candidates AS MATERIALIZED (SELECT o.id AS object_id, o.organization_id, o.project_id FROM crash_event_objects o WHERE o.lifecycle_state = 'stored' AND o.raw_delete_after <= now() ORDER BY o.raw_delete_after, o.id FOR UPDATE OF o SKIP LOCKED LIMIT $1), due AS MATERIALIZED (SELECT candidates.object_id, candidates.organization_id, candidates.project_id, e.id AS event_id FROM candidates JOIN project_storage_counters c ON c.organization_id = candidates.organization_id AND c.project_id = candidates.project_id AND c.reconciled_at IS NOT NULL JOIN crash_events e ON e.raw_object_id = candidates.object_id AND e.organization_id = candidates.organization_id AND e.project_id = candidates.project_id), claimed_objects AS (UPDATE crash_event_objects o SET lifecycle_state = 'deleting' FROM due d WHERE o.id = d.object_id AND o.organization_id = d.organization_id AND o.project_id = d.project_id AND o.lifecycle_state = 'stored' RETURNING o.id, o.organization_id, o.project_id), claimed_events AS (UPDATE crash_events e SET raw_retention_class = 'expired' FROM due d JOIN claimed_objects o ON o.id = d.object_id AND o.organization_id = d.organization_id AND o.project_id = d.project_id WHERE e.id = d.event_id AND e.organization_id = d.organization_id AND e.project_id = d.project_id RETURNING e.id AS event_id, e.organization_id, e.project_id, e.raw_object_id AS object_id), queued AS (INSERT INTO jobs (id, organization_id, project_id, event_id, job_type, payload, idempotency_key, priority) SELECT gen_random_uuid(), organization_id, project_id, event_id, 'delete_raw', jsonb_build_object('event_id', event_id::text, 'object_id', object_id::text), 'delete_raw:' || object_id::text, 50 FROM claimed_events ON CONFLICT (idempotency_key) DO UPDATE SET state = 'pending', attempt = 0, available_at = now(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = now() WHERE jobs.event_id = EXCLUDED.event_id AND jobs.state IN ('completed', 'failed', 'dead') RETURNING event_id) SELECT count(*)::bigint FROM claimed_events",
+    )
+    .bind(batch_size)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SchedulerError::Database)?;
+    Ok(scheduled)
+}
+
+pub(crate) async fn reconcile_storage(
+    database_url: &str,
+    organization_id: &str,
+    project_id: &str,
+) -> Result<StorageReconciliationReport, StorageReconcileError> {
+    if !crate::identifiers::valid_uuid(organization_id)
+        || !crate::identifiers::valid_uuid(project_id)
+    {
+        return Err(StorageReconcileError::InvalidIdentifier);
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(database_url)
+        .await
+        .map_err(|_| StorageReconcileError::Database)?;
+    let project_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM projects WHERE organization_id = $1::uuid AND id = $2::uuid)",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|_| StorageReconcileError::Database)?;
+    if !project_exists {
+        return Err(StorageReconcileError::NotFound);
+    }
+    let deadlines_backfilled =
+        backfill_raw_delete_after(&pool, organization_id, project_id).await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| StorageReconcileError::Database)?;
+    sqlx::query(
+        "SELECT 1 FROM project_usage_policies WHERE organization_id = $1::uuid AND project_id = $2::uuid FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| StorageReconcileError::Database)?
+    .ok_or(StorageReconcileError::NotFound)?;
+    let previous = sqlx::query(
+        "SELECT retained_raw_bytes, retained_symbol_bytes FROM project_storage_counters WHERE organization_id = $1::uuid AND project_id = $2::uuid FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| StorageReconcileError::Database)?
+    .ok_or(StorageReconcileError::NotFound)?;
+    let totals = sqlx::query(
+        "SELECT (SELECT COALESCE(sum(byte_size), 0)::bigint FROM crash_event_objects WHERE organization_id = $1::uuid AND project_id = $2::uuid AND lifecycle_state IN ('stored', 'deleting')) AS retained_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS retained_symbol_bytes, (SELECT count(*)::bigint FROM crash_event_objects WHERE organization_id = $1::uuid AND project_id = $2::uuid AND raw_delete_after IS NULL) AS missing_deadlines",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| StorageReconcileError::Database)?;
+    let missing_deadlines = totals.get::<i64, _>("missing_deadlines");
+    if missing_deadlines != 0 {
+        return Err(StorageReconcileError::Database);
+    }
+    let retained_raw_bytes = totals.get::<i64, _>("retained_raw_bytes");
+    let retained_symbol_bytes = totals.get::<i64, _>("retained_symbol_bytes");
+    sqlx::query(
+        "UPDATE project_storage_counters SET retained_raw_bytes = $3, retained_symbol_bytes = $4, reconciled_at = now(), updated_at = now() WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .bind(retained_raw_bytes)
+    .bind(retained_symbol_bytes)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| StorageReconcileError::Database)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StorageReconcileError::Database)?;
+    let previous_raw_bytes = previous.get::<i64, _>("retained_raw_bytes");
+    let previous_symbol_bytes = previous.get::<i64, _>("retained_symbol_bytes");
+    Ok(StorageReconciliationReport {
+        organization_id: organization_id.to_owned(),
+        project_id: project_id.to_owned(),
+        deadlines_backfilled,
+        missing_deadlines,
+        previous_raw_bytes,
+        retained_raw_bytes,
+        raw_byte_drift: retained_raw_bytes.saturating_sub(previous_raw_bytes),
+        previous_symbol_bytes,
+        retained_symbol_bytes,
+        symbol_byte_drift: retained_symbol_bytes.saturating_sub(previous_symbol_bytes),
+    })
+}
+
+async fn backfill_raw_delete_after(
+    pool: &PgPool,
+    organization_id: &str,
+    project_id: &str,
+) -> Result<i64, StorageReconcileError> {
+    let mut total = 0_i64;
+    loop {
+        let updated: i64 = sqlx::query_scalar(
+            "WITH batch AS MATERIALIZED (SELECT o.id, e.received_at, p.raw_retention_days FROM crash_event_objects o JOIN crash_events e ON e.raw_object_id = o.id AND e.organization_id = o.organization_id AND e.project_id = o.project_id JOIN project_usage_policy_versions p ON p.organization_id = e.organization_id AND p.project_id = e.project_id AND p.version = e.usage_policy_version WHERE o.organization_id = $1::uuid AND o.project_id = $2::uuid AND o.raw_delete_after IS NULL ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT $3), updated AS (UPDATE crash_event_objects o SET raw_delete_after = batch.received_at + (batch.raw_retention_days * interval '1 day') FROM batch WHERE o.id = batch.id AND o.organization_id = $1::uuid AND o.project_id = $2::uuid RETURNING 1) SELECT count(*)::bigint FROM updated",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .bind(STORAGE_RECONCILE_BATCH_SIZE)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| StorageReconcileError::Database)?;
+        total = total.saturating_add(updated);
+        if updated < STORAGE_RECONCILE_BATCH_SIZE {
+            return Ok(total);
+        }
+    }
 }
 
 async fn load_usage_view(
@@ -907,7 +1138,15 @@ pub(crate) fn enforcement_enabled() -> bool {
     )
 }
 
+pub(crate) fn retention_v2_enabled() -> bool {
+    retention_v2_from_env(env::var("FAULTLANE_RETENTION_V2_ENABLED").ok().as_deref())
+}
+
 fn enforcement_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn retention_v2_from_env(value: Option<&str>) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
@@ -950,6 +1189,54 @@ fn reservoir_selected(event_id: &str) -> bool {
     let digest = Sha256::digest(event_id.as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) % u16::try_from(RAW_RESERVOIR_RATE).unwrap_or(100)
         == 0
+}
+
+async fn set_raw_delete_after(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    project_id: &str,
+    event_id: &str,
+    object_id: &str,
+    retention_days: i32,
+) -> Result<(), UsageError> {
+    let updated = sqlx::query(
+        "UPDATE crash_event_objects o SET raw_delete_after = e.received_at + ($5::integer * interval '1 day') FROM crash_events e WHERE o.id = $1::uuid AND o.organization_id = $2::uuid AND o.project_id = $3::uuid AND e.id = $4::uuid AND e.organization_id = o.organization_id AND e.project_id = o.project_id AND e.raw_object_id = o.id AND o.raw_delete_after IS NULL",
+    )
+    .bind(object_id)
+    .bind(organization_id)
+    .bind(project_id)
+    .bind(event_id)
+    .bind(retention_days)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| UsageError::Unavailable)?;
+    if updated.rows_affected() != 1 {
+        return Err(UsageError::Unavailable);
+    }
+    Ok(())
+}
+
+async fn apply_storage_delta(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    project_id: &str,
+    raw_delta: i64,
+    symbol_delta: i64,
+) -> Result<(), UsageError> {
+    let updated = sqlx::query(
+        "UPDATE project_storage_counters SET retained_raw_bytes = CASE WHEN reconciled_at IS NULL THEN retained_raw_bytes ELSE retained_raw_bytes + $3 END, retained_symbol_bytes = CASE WHEN reconciled_at IS NULL THEN retained_symbol_bytes ELSE retained_symbol_bytes + $4 END, updated_at = CASE WHEN reconciled_at IS NULL THEN updated_at ELSE now() END WHERE organization_id = $1::uuid AND project_id = $2::uuid AND (reconciled_at IS NULL OR retained_raw_bytes + $3 >= 0 AND retained_symbol_bytes + $4 >= 0)",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .bind(raw_delta)
+    .bind(symbol_delta)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| UsageError::Unavailable)?;
+    if updated.rows_affected() != 1 {
+        return Err(UsageError::Unavailable);
+    }
+    Ok(())
 }
 
 async fn set_retention_class(
@@ -1011,6 +1298,17 @@ async fn retained_artifact_bytes(
     organization_id: &str,
     project_id: &str,
 ) -> Result<i64, UsageError> {
+    if retention_v2_enabled() {
+        return sqlx::query_scalar(
+            "SELECT retained_raw_bytes + retained_symbol_bytes FROM project_storage_counters WHERE organization_id = $1::uuid AND project_id = $2::uuid AND reconciled_at IS NOT NULL",
+        )
+        .bind(organization_id)
+        .bind(project_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| UsageError::Internal)?
+        .ok_or(UsageError::Unavailable);
+    }
     sqlx::query_scalar(
         "SELECT (SELECT COALESCE(sum(byte_size), 0)::bigint FROM crash_event_objects WHERE organization_id = $1::uuid AND project_id = $2::uuid AND lifecycle_state IN ('stored', 'deleting')) + (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = $1::uuid AND m.project_id = $2::uuid AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects)",
     )
@@ -1048,7 +1346,7 @@ fn no_store(status: StatusCode, value: &impl Serialize) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, time::Instant};
 
     use axum::{
         body::{Body, to_bytes},
@@ -1059,9 +1357,10 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        UsagePolicy, admission_outcome, courtesy_limit, enforcement_from_env, policy_outcome,
-        record_raw_deleted, record_symbol_stored, reservoir_selected,
-        schedule_raw_retention_with_enforcement, threshold,
+        RETENTION_EVENT_EXPLAIN_QUERY, UsagePolicy, admission_outcome, courtesy_limit,
+        enforcement_from_env, policy_outcome, reconcile_storage, record_acceptance,
+        record_raw_deleted, record_symbol_stored, reservoir_selected, retention_v2_from_env,
+        schedule_expired_raw_v2_batch, schedule_raw_retention_with_enforcement, threshold,
     };
     use crate::project_setup::{DATABASE_TEST_LOCK, ServerState, migrate, router};
 
@@ -1107,6 +1406,9 @@ mod tests {
         assert!(!enforcement_from_env(None));
         assert!(!enforcement_from_env(Some("false")));
         assert!(enforcement_from_env(Some("TRUE")));
+        assert!(!retention_v2_from_env(None));
+        assert!(!retention_v2_from_env(Some("false")));
+        assert!(retention_v2_from_env(Some("TRUE")));
     }
 
     #[test]
@@ -1381,6 +1683,7 @@ mod tests {
                 .bind(&repeated_event_id)
                 .fetch_one(&pool)
                 .await?;
+        reconcile_storage(&database_url, &organization_id, &project_id).await?;
         let mut transaction = pool.begin().await?;
         for _ in 0..2 {
             record_raw_deleted(
@@ -1443,6 +1746,566 @@ mod tests {
                 && row.get::<String, _>("lifecycle_state") == "discarded"
         }));
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::too_many_lines)]
+    async fn storage_counters_and_deadlines_reconcile_without_drift() -> Result<(), Box<dyn Error>>
+    {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (user_id, organization_id, project_id) = seed_project(&pool).await?;
+        let ingest_key_id: String = sqlx::query_scalar(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, '22222222') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(vec![2_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let object_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'retention/current', $3, 100, 'application/octet-stream') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(vec![3_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let event_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, crash_guid, environment, received_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'retention-current', 'production', '2026-08-01T00:00:00Z') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&ingest_key_id)
+        .bind(&object_id)
+        .fetch_one(&pool)
+        .await?;
+        let mut transaction = pool.begin().await?;
+        record_acceptance(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &event_id,
+            &object_id,
+            100,
+            false,
+        )
+        .await
+        .map_err(|_| "raw acceptance must update storage")?;
+        transaction.commit().await?;
+
+        let upload_token_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_upload_tokens (organization_id, project_id, created_by_user_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, '33333333') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&user_id)
+        .bind(vec![4_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let release_id: String = sqlx::query_scalar(
+            "INSERT INTO releases (organization_id, project_id, version, platform, architecture, configuration) VALUES ($1::uuid, $2::uuid, 'retention-1', 'windows', 'x86_64', 'shipping') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        let artifact_object_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_objects (organization_id, object_key, checksum, byte_size) VALUES ($1::uuid, 'retention/symbol', $2, 500) RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(vec![5_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let debug_image_id: String = sqlx::query_scalar(
+            "INSERT INTO artifact_debug_images (organization_id, object_id, artifact_type, module_name, architecture, debug_id) VALUES ($1::uuid, $2::uuid, 'pdb', 'Game.pdb', 'x86_64', 'RETENTION1') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&artifact_object_id)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, debug_image_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, 500, 'pdb', 'Game.pdb', 'x86_64', 'RETENTION1', 'Game.pdb', 'test', 'available', now())",
+        )
+        .bind(&release_id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&debug_image_id)
+        .bind(&user_id)
+        .bind(&upload_token_id)
+        .bind(vec![5_u8; 32])
+        .execute(&pool)
+        .await?;
+        let mut transaction = pool.begin().await?;
+        for _ in 0..2 {
+            record_symbol_stored(
+                &mut transaction,
+                &organization_id,
+                &project_id,
+                &artifact_object_id,
+                500,
+            )
+            .await
+            .map_err(|_| "symbol storage must update once")?;
+        }
+        transaction.commit().await?;
+
+        let initial = sqlx::query(
+            "SELECT retained_raw_bytes, retained_symbol_bytes, reconciled_at IS NOT NULL AS reconciled FROM project_storage_counters WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(initial.get::<i64, _>("retained_raw_bytes"), 100);
+        assert_eq!(initial.get::<i64, _>("retained_symbol_bytes"), 500);
+        assert!(initial.get::<bool, _>("reconciled"));
+        let initial_deadline: String = sqlx::query_scalar(
+            "SELECT to_char(raw_delete_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM crash_event_objects WHERE id = $1::uuid",
+        )
+        .bind(&object_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(initial_deadline, "2026-08-08T00:00:00Z");
+
+        sqlx::query(
+            "UPDATE project_usage_policies SET raw_retention_days = 1 WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .execute(&pool)
+        .await?;
+        let legacy_object_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'retention/legacy', $3, 200, 'application/octet-stream') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(vec![6_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, crash_guid, environment, received_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'retention-legacy', 'production', '2026-08-02T00:00:00Z')",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&ingest_key_id)
+        .bind(&legacy_object_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE project_storage_counters SET retained_raw_bytes = 1, retained_symbol_bytes = 1, reconciled_at = NULL WHERE organization_id = $1::uuid AND project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .execute(&pool)
+        .await?;
+        assert_eq!(
+            super::drain_expired_raw_v2(&pool, std::time::Duration::from_millis(10)).await?,
+            0
+        );
+        let jobs_before_reconcile: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE job_type = 'delete_raw'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(jobs_before_reconcile, 0);
+        let report = reconcile_storage(&database_url, &organization_id, &project_id).await?;
+        assert_eq!(report.deadlines_backfilled, 1);
+        assert_eq!(report.missing_deadlines, 0);
+        assert_eq!(report.previous_raw_bytes, 1);
+        assert_eq!(report.retained_raw_bytes, 300);
+        assert_eq!(report.raw_byte_drift, 299);
+        assert_eq!(report.previous_symbol_bytes, 1);
+        assert_eq!(report.retained_symbol_bytes, 500);
+        assert_eq!(report.symbol_byte_drift, 499);
+        let deadlines = sqlx::query(
+            "SELECT object_key, to_char(raw_delete_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS deadline FROM crash_event_objects WHERE project_id = $1::uuid ORDER BY object_key",
+        )
+        .bind(&project_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(deadlines[0].get::<String, _>("deadline"), initial_deadline);
+        assert_eq!(
+            deadlines[1].get::<String, _>("deadline"),
+            "2026-08-09T00:00:00Z"
+        );
+
+        sqlx::query(
+            "UPDATE crash_event_objects SET lifecycle_state = 'deleting' WHERE id = $1::uuid",
+        )
+        .bind(&object_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE crash_events SET raw_retention_class = 'expired' WHERE id = $1::uuid")
+            .bind(&event_id)
+            .execute(&pool)
+            .await?;
+        let mut gate = pool.begin().await?;
+        sqlx::query(
+            "SELECT 1 FROM project_storage_counters WHERE organization_id = $1::uuid AND project_id = $2::uuid FOR UPDATE",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&mut *gate)
+        .await?;
+
+        let deletion_pool = pool.clone();
+        let deletion_organization_id = organization_id.clone();
+        let deletion_project_id = project_id.clone();
+        let deletion_event_id = event_id.clone();
+        let deletion_object_id = object_id.clone();
+        let deletion = tokio::spawn(async move {
+            let mut transaction = deletion_pool
+                .begin()
+                .await
+                .map_err(|_| "raw deletion transaction must start")?;
+            for _ in 0..2 {
+                record_raw_deleted(
+                    &mut transaction,
+                    &deletion_organization_id,
+                    &deletion_project_id,
+                    &deletion_event_id,
+                    &deletion_object_id,
+                    100,
+                )
+                .await
+                .map_err(|_| "raw deletion must update once")?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|_| "raw deletion transaction must commit")?;
+            Ok::<(), &'static str>(())
+        });
+
+        let symbol_pool = pool.clone();
+        let symbol_organization_id = organization_id.clone();
+        let symbol_project_id = project_id.clone();
+        let symbol_user_id = user_id.clone();
+        let symbol_release_id = release_id.clone();
+        let symbol_upload_token_id = upload_token_id.clone();
+        let symbol = tokio::spawn(async move {
+            let mut transaction = symbol_pool
+                .begin()
+                .await
+                .map_err(|_| "symbol transaction must start")?;
+            let object_id: String = sqlx::query_scalar(
+                "INSERT INTO artifact_objects (organization_id, object_key, checksum, byte_size) VALUES ($1::uuid, 'retention/symbol-concurrent', $2, 500) RETURNING id::text",
+            )
+            .bind(&symbol_organization_id)
+            .bind(vec![7_u8; 32])
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| "concurrent symbol object must store")?;
+            let debug_image_id: String = sqlx::query_scalar(
+                "INSERT INTO artifact_debug_images (organization_id, object_id, artifact_type, module_name, architecture, debug_id) VALUES ($1::uuid, $2::uuid, 'pdb', 'Game2.pdb', 'x86_64', 'RETENTION2') RETURNING id::text",
+            )
+            .bind(&symbol_organization_id)
+            .bind(&object_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| "concurrent debug image must store")?;
+            sqlx::query(
+                "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, debug_image_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, 500, 'pdb', 'Game2.pdb', 'x86_64', 'RETENTION2', 'Game2.pdb', 'test', 'available', now())",
+            )
+            .bind(&symbol_release_id)
+            .bind(&symbol_organization_id)
+            .bind(&symbol_project_id)
+            .bind(&debug_image_id)
+            .bind(&symbol_user_id)
+            .bind(&symbol_upload_token_id)
+            .bind(vec![7_u8; 32])
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| "concurrent manifest must store")?;
+            record_symbol_stored(
+                &mut transaction,
+                &symbol_organization_id,
+                &symbol_project_id,
+                &object_id,
+                500,
+            )
+            .await
+            .map_err(|_| "concurrent symbol counter must update")?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| "symbol transaction must commit")?;
+            Ok::<(), &'static str>(())
+        });
+
+        let reconcile_database_url = database_url.clone();
+        let reconcile_organization_id = organization_id.clone();
+        let reconcile_project_id = project_id.clone();
+        let concurrent_reconcile = tokio::spawn(async move {
+            reconcile_storage(
+                &reconcile_database_url,
+                &reconcile_organization_id,
+                &reconcile_project_id,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        gate.commit().await?;
+        deletion.await??;
+        symbol.await??;
+        concurrent_reconcile.await??;
+        let final_totals = sqlx::query(
+            "SELECT c.retained_raw_bytes, c.retained_symbol_bytes, (SELECT COALESCE(sum(byte_size), 0)::bigint FROM crash_event_objects WHERE organization_id = c.organization_id AND project_id = c.project_id AND lifecycle_state IN ('stored', 'deleting')) AS exact_raw_bytes, (SELECT COALESCE(sum(objects.byte_size), 0)::bigint FROM (SELECT DISTINCT ao.id, ao.byte_size FROM release_manifest_artifacts m JOIN artifact_debug_images d ON d.id = m.debug_image_id AND d.organization_id = m.organization_id JOIN artifact_objects ao ON ao.id = d.object_id AND ao.organization_id = d.organization_id WHERE m.organization_id = c.organization_id AND m.project_id = c.project_id AND m.state = 'available' AND ao.lifecycle_state = 'stored') objects) AS exact_symbol_bytes FROM project_storage_counters c WHERE c.organization_id = $1::uuid AND c.project_id = $2::uuid",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(final_totals.get::<i64, _>("retained_raw_bytes"), 200);
+        assert_eq!(final_totals.get::<i64, _>("exact_raw_bytes"), 200);
+        assert_eq!(final_totals.get::<i64, _>("retained_symbol_bytes"), 1_000);
+        assert_eq!(final_totals.get::<i64, _>("exact_symbol_bytes"), 1_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    async fn default_retention_path_is_constant_at_one_million_raw_objects()
+    -> Result<(), Box<dyn Error>> {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (_, organization_id, project_id) = seed_project(&pool).await?;
+        let ingest_key_id: String = sqlx::query_scalar(
+            "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, '44444444') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(vec![8_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let object_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'retention-million/target', $3, 1, 'application/octet-stream') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(vec![9_u8; 32])
+        .fetch_one(&pool)
+        .await?;
+        let event_id: String = sqlx::query_scalar(
+            "INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'production') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&ingest_key_id)
+        .bind(&object_id)
+        .fetch_one(&pool)
+        .await?;
+        let inserted: i64 = sqlx::query_scalar(
+            "WITH generated AS MATERIALIZED (SELECT gen_random_uuid() AS object_id, gen_random_uuid() AS event_id, n FROM generate_series(1, 999999) AS values(n)), objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type) SELECT object_id, $1::uuid, $2::uuid, 'retention-million/' || n::text, decode(lpad(to_hex(n), 64, '0'), 'hex'), 1, 'application/octet-stream' FROM generated RETURNING id), events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment) SELECT generated.event_id, $1::uuid, $2::uuid, $3::uuid, generated.object_id, 'production' FROM generated JOIN objects ON objects.id = generated.object_id RETURNING 1) SELECT count(*)::bigint FROM events",
+        )
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&ingest_key_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted, 999_999);
+        sqlx::query("ANALYZE crash_event_objects, crash_events")
+            .execute(&pool)
+            .await?;
+        let plan_rows = sqlx::query(RETENTION_EVENT_EXPLAIN_QUERY)
+            .bind(&event_id)
+            .bind(&organization_id)
+            .bind(&project_id)
+            .fetch_all(&pool)
+            .await?;
+        let plan = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>("QUERY PLAN"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("crash_events_"), "{plan}");
+        assert!(plan.contains("crash_event_objects_"), "{plan}");
+        assert!(!plan.contains("Aggregate"), "{plan}");
+        assert!(!plan.contains("Seq Scan on crash_event_objects"), "{plan}");
+        assert!(!plan.contains("artifact_objects"), "{plan}");
+        let mut transaction = pool.begin().await?;
+        schedule_raw_retention_with_enforcement(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &event_id,
+            false,
+        )
+        .await
+        .map_err(|_| "default retention path must complete")?;
+        transaction.commit().await?;
+        let class: String =
+            sqlx::query_scalar("SELECT raw_retention_class FROM crash_events WHERE id = $1::uuid")
+                .bind(&event_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(class, "standard");
+        println!("objects=1000000 plan=indexed default_path=standard\n{plan}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::too_many_lines)]
+    async fn concurrent_schedulers_drain_more_than_two_hundred_thousand_due_objects()
+    -> Result<(), Box<dyn Error>> {
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
+        let _guard = DATABASE_TEST_LOCK.lock().await;
+        migrate(&database_url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(12)
+            .connect(&database_url)
+            .await?;
+        sqlx::query("TRUNCATE users, organizations CASCADE")
+            .execute(&pool)
+            .await?;
+        let (_, organization_id, first_project_id) = seed_project(&pool).await?;
+        let second_project_id: String = sqlx::query_scalar(
+            "INSERT INTO projects (organization_id, name, slug) VALUES ($1::uuid, 'Retention scale second', 'retention-scale-second') RETURNING id::text",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await?;
+        for (index, project_id) in [&first_project_id, &second_project_id]
+            .into_iter()
+            .enumerate()
+        {
+            let ingest_key_id: String = sqlx::query_scalar(
+                "INSERT INTO project_ingest_keys (organization_id, project_id, secret_hash, display_suffix) VALUES ($1::uuid, $2::uuid, $3, $4) RETURNING id::text",
+            )
+            .bind(&organization_id)
+            .bind(project_id)
+            .bind(vec![u8::try_from(index + 10)?; 32])
+            .bind(format!("{index:08}"))
+            .fetch_one(&pool)
+            .await?;
+            let inserted: i64 = sqlx::query_scalar(
+                "WITH generated AS MATERIALIZED (SELECT gen_random_uuid() AS object_id, gen_random_uuid() AS event_id, n FROM generate_series(1, 100001) AS values(n)), objects AS (INSERT INTO crash_event_objects (id, organization_id, project_id, object_key, checksum, byte_size, media_type, raw_delete_after) SELECT object_id, $1::uuid, $2::uuid, 'retention-scale/' || $2::text || '/' || n::text, decode(lpad(to_hex(n), 64, '0'), 'hex'), 1, 'application/octet-stream', now() - interval '1 minute' FROM generated RETURNING id), events AS (INSERT INTO crash_events (id, organization_id, project_id, ingest_key_id, raw_object_id, environment, received_at) SELECT generated.event_id, $1::uuid, $2::uuid, $3::uuid, generated.object_id, 'production', now() - interval '8 days' FROM generated JOIN objects ON objects.id = generated.object_id RETURNING 1) SELECT count(*)::bigint FROM events",
+            )
+            .bind(&organization_id)
+            .bind(project_id)
+            .bind(&ingest_key_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(inserted, 100_001);
+            let report = reconcile_storage(&database_url, &organization_id, project_id).await?;
+            assert_eq!(report.retained_raw_bytes, 100_001);
+            assert_eq!(report.missing_deadlines, 0);
+        }
+        sqlx::query("ANALYZE crash_event_objects, crash_events")
+            .execute(&pool)
+            .await?;
+        let target_event_id: String = sqlx::query_scalar(
+            "SELECT id::text FROM crash_events WHERE organization_id = $1::uuid AND project_id = $2::uuid ORDER BY id LIMIT 1",
+        )
+        .bind(&organization_id)
+        .bind(&first_project_id)
+        .fetch_one(&pool)
+        .await?;
+        let publication_plan_rows = sqlx::query(RETENTION_EVENT_EXPLAIN_QUERY)
+            .bind(&target_event_id)
+            .bind(&organization_id)
+            .bind(&first_project_id)
+            .fetch_all(&pool)
+            .await?;
+        let publication_plan = publication_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>("QUERY PLAN"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(publication_plan.contains("crash_events_"));
+        assert!(publication_plan.contains("crash_event_objects_"));
+        assert!(!publication_plan.contains("Aggregate"));
+        assert!(!publication_plan.contains("Seq Scan on crash_event_objects"));
+        assert!(!publication_plan.contains("artifact_objects"));
+        let explain_rows = sqlx::query(
+            "EXPLAIN (FORMAT TEXT) SELECT o.id FROM crash_event_objects o WHERE o.lifecycle_state = 'stored' AND o.raw_delete_after <= now() ORDER BY o.raw_delete_after, o.id FOR UPDATE OF o SKIP LOCKED LIMIT 5000",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let explain = explain_rows
+            .iter()
+            .map(|row| row.get::<String, _>("QUERY PLAN"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(explain.contains("crash_event_objects_raw_due"), "{explain}");
+
+        let started = Instant::now();
+        let (first, second, third, fourth) = tokio::join!(
+            drain_due_batches(pool.clone()),
+            drain_due_batches(pool.clone()),
+            drain_due_batches(pool.clone()),
+            drain_due_batches(pool.clone())
+        );
+        let mut scheduled = first? + second? + third? + fourth?;
+        loop {
+            let remaining = schedule_expired_raw_v2_batch(&pool, 5_000).await?;
+            scheduled = scheduled.saturating_add(remaining);
+            if remaining == 0 {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(scheduled, 200_002);
+        let elapsed_millis = i64::try_from(elapsed.as_millis())?.max(1);
+        let throughput_per_second = scheduled.saturating_mul(1_000) / elapsed_millis;
+        println!(
+            "scheduled={scheduled} elapsed_ms={} throughput_per_second={throughput_per_second} plan=crash_event_objects_raw_due",
+            elapsed.as_millis()
+        );
+        assert!(throughput_per_second > 2, "{throughput_per_second}");
+        let state = sqlx::query(
+            "SELECT (SELECT count(*) FROM crash_event_objects WHERE lifecycle_state = 'deleting') AS deleting_objects, (SELECT count(*) FROM crash_events WHERE raw_retention_class = 'expired') AS expired_events, (SELECT count(*) FROM jobs WHERE job_type = 'delete_raw') AS deletion_jobs, (SELECT count(DISTINCT idempotency_key) FROM jobs WHERE job_type = 'delete_raw') AS distinct_jobs, (SELECT COALESCE(sum(retained_raw_bytes), 0)::bigint FROM project_storage_counters WHERE organization_id = $1::uuid) AS retained_raw_bytes",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state.get::<i64, _>("deleting_objects"), 200_002);
+        assert_eq!(state.get::<i64, _>("expired_events"), 200_002);
+        assert_eq!(state.get::<i64, _>("deletion_jobs"), 200_002);
+        assert_eq!(state.get::<i64, _>("distinct_jobs"), 200_002);
+        assert_eq!(state.get::<i64, _>("retained_raw_bytes"), 200_002);
+        for project_id in [&first_project_id, &second_project_id] {
+            let report = reconcile_storage(&database_url, &organization_id, project_id).await?;
+            assert_eq!(report.raw_byte_drift, 0);
+            assert_eq!(report.retained_raw_bytes, 100_001);
+        }
+        Ok(())
+    }
+
+    async fn drain_due_batches(pool: PgPool) -> Result<i64, super::SchedulerError> {
+        let mut total = 0_i64;
+        loop {
+            let claimed = schedule_expired_raw_v2_batch(&pool, 5_000).await?;
+            total = total.saturating_add(claimed);
+            if claimed == 0 {
+                return Ok(total);
+            }
+        }
     }
 
     async fn seed_project(pool: &PgPool) -> Result<(String, String, String), Box<dyn Error>> {

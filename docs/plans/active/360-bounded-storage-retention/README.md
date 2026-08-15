@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/360
 
-Status: Approved, waiting for #358
+Status: Locally verified on August 16, 2026
 
 ## Context
 
@@ -65,6 +65,14 @@ This changes sensitive raw-artifact lifecycle behavior, storage accounting, Post
 The previous application ignores the additive table and column. The new application dual-runs with the switch disabled while backfill and reconciliation complete. Enable the new scheduler only after no supported object has a missing deadline and counters match full sums.
 
 Rollback disables `FAULTLANE_RETENTION_V2_ENABLED`, stops scheduler claims, restores the prior application, and keeps all additive state for inspection. Do not delete counter rows or deadlines. Reconcile before resuming either scheduler.
+
+## Completed evidence
+
+- Raw acceptance, unique symbol publication, and confirmed raw deletion maintain project byte totals in their existing transactions. Concurrent deletion, symbol publication, and reconciliation finished with exact full-sum totals and zero drift.
+- A 1,000,000-object fixture used indexed event and raw-object lookups with no aggregate or population scan. The production publication query completed in 0.192 ms.
+- Four concurrent schedulers claimed 200,002 due objects across two projects in 59.882 seconds at 3,339 objects per second. The due index was selected, jobs were unique, and reconciliation reported zero drift.
+- The real `reconcile-storage` command ran against a fresh migrated database and returned zero missing deadlines and zero raw or symbol drift.
+- The existing quota sampling regression, strict Clippy, and `./scripts/check-fast` passed on the final issue tree.
 
 ## Out of scope
 

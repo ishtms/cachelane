@@ -42,6 +42,12 @@ enum Command {
         #[arg(long)]
         issue_id: String,
     },
+    ReconcileStorage {
+        #[arg(long)]
+        organization_id: String,
+        #[arg(long)]
+        project_id: String,
+    },
 }
 
 #[tokio::main]
@@ -88,6 +94,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &organization_id,
                 &project_id,
                 &issue_id,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Command::ReconcileStorage {
+            organization_id,
+            project_id,
+        } => {
+            let report = usage::reconcile_storage(
+                &required_env("DATABASE_URL")?,
+                &organization_id,
+                &project_id,
             )
             .await?;
             println!("{}", serde_json::to_string(&report)?);
