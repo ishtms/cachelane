@@ -138,12 +138,13 @@ fn cursors_text_bounds_and_commands_are_safe() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+#[allow(clippy::expect_used)]
 #[allow(clippy::too_many_lines)]
 async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
 -> Result<(), Box<dyn Error>> {
-    let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-        return Ok(());
-    };
+    let database_url =
+        env::var("FAULTLANE_TEST_DATABASE_URL").expect("FAULTLANE_TEST_DATABASE_URL is required");
     let _guard = DATABASE_TEST_LOCK.lock().await;
     assert_isolated_database(&database_url);
     migrate(&database_url).await?;

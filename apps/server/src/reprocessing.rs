@@ -636,11 +636,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn manual_request_api_is_idempotent_bounded_and_tenant_scoped_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await
@@ -757,11 +758,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn waiter_catchup_serializes_with_artifact_publication_when_configured() {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url)
             .await

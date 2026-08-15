@@ -22,16 +22,38 @@ check_port() {
   local name="$1"
   local port="$2"
 
-  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  set +e
+  node - "$port" <<'NODE' >/dev/null 2>&1
+const net = require("node:net");
+const port = Number(process.argv[2]);
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  process.exit(12);
+}
+const server = net.createServer();
+server.once("error", error => {
+  process.exit(error.code === "EADDRINUSE" ? 10 : 11);
+});
+server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+  server.close(() => process.exit(0));
+});
+NODE
+  local status="$?"
+  set -e
+
+  if [[ "$status" -eq 10 ]]; then
     echo "in use: $name port $port"
-  else
+  elif [[ "$status" -eq 0 ]]; then
     echo "available: $name port $port"
+  else
+    echo "invalid: $name port $port" >&2
+    failures=$((failures + 1))
   fi
 }
 
 check_command cargo "install Rust with rustup"
 check_command corepack "install Node.js 24"
 check_command curl "install curl"
+check_command cargo-fuzz "run cargo install cargo-fuzz --version 0.13.2 --locked"
 check_command docker "install Docker Desktop or Docker Engine"
 check_command git "install Git"
 check_command node "install Node.js 24"
@@ -55,6 +77,13 @@ echo "node: $(node --version)"
 echo "pnpm: $(corepack pnpm --version)"
 echo "docker: $(docker --version)"
 
+if ! rustup run nightly-2026-08-14 rustc --version >/dev/null 2>&1; then
+  echo "missing: Rust nightly-2026-08-14 (run rustup toolchain install nightly-2026-08-14 --profile minimal)" >&2
+  failures=$((failures + 1))
+else
+  echo "ok: Rust nightly-2026-08-14"
+fi
+
 if ! docker info >/dev/null 2>&1; then
   echo "unavailable: Docker daemon (start Docker Desktop or Docker Engine)" >&2
   failures=$((failures + 1))
@@ -67,6 +96,10 @@ if ! docker compose --env-file .env -f deploy/docker-compose/compose.yml config 
   failures=$((failures + 1))
 else
   echo "ok: Docker Compose configuration"
+fi
+
+if ! ./scripts/check-playwright; then
+  failures=$((failures + 1))
 fi
 
 check_port api "${FAULTLANE_API_PORT:-8080}"

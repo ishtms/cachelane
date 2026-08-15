@@ -2,7 +2,7 @@
 
 Issue: [#299](https://github.com/ishtms/faultlane/issues/299)
 
-Status: Approved for implementation.
+Status: Completed through PR #350 on August 14, 2026. No production deployment was performed.
 
 ## Outcome
 

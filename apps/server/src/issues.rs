@@ -977,12 +977,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn issue_routes_are_bounded_tenant_scoped_and_manage_resolution()
     -> Result<(), Box<dyn Error>> {
-        let Ok(database_url) = env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return Ok(());
-        };
+        let database_url = env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         migrate(&database_url).await?;
         let pool = PgPoolOptions::new()

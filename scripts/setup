@@ -12,6 +12,11 @@ for command in cargo corepack docker git node rustup; do
 done
 
 rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+rustup toolchain install nightly-2026-08-14 --profile minimal
+
+if ! cargo fuzz --version 2>/dev/null | grep -Fq '0.13.2'; then
+  cargo install cargo-fuzz --version 0.13.2 --locked
+fi
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
@@ -20,6 +25,11 @@ fi
 
 corepack pnpm install --frozen-lockfile
 cargo fetch --locked
+
+if ! ./scripts/check-playwright >/dev/null 2>&1; then
+  corepack pnpm --filter @faultlane/web exec playwright install chrome
+fi
+
 docker compose --env-file .env -f deploy/docker-compose/compose.yml config --quiet
 
 echo "setup complete"

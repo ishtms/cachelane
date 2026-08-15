@@ -8,11 +8,18 @@ required_files=(
   README.md
   Cargo.toml
   package.json
+  .github/scripts/start-windows-check-services.ps1
+  docs/workflow/README.md
   deploy/docker-compose/compose.yml
   openapi/faultlane.yaml
   scripts/setup
   scripts/doctor
+  scripts/check-playwright
   scripts/dev
+  scripts/with-test-database
+  scripts/check-fuzz
+  scripts/prove-browser
+  scripts/test-browser-proof-cleanup
   scripts/check-fast
   scripts/check
   scripts/smoke
@@ -28,6 +35,10 @@ done
 for script in scripts/*; do
   if [[ -f "$script" ]]; then
     bash -n "$script"
+    if [[ ! -x "$script" ]]; then
+      echo "repository script is not executable: $script" >&2
+      exit 1
+    fi
   fi
 done
 
@@ -57,6 +68,64 @@ for yaml_file in \
   .github/workflows/security.yml; do
   node -e 'require("yaml").parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$yaml_file"
 done
+
+set +e
+missing_database_command_output="$(./scripts/with-test-database 2>&1)"
+missing_database_command_status="$?"
+invalid_fuzz_seconds_output="$(FAULTLANE_FUZZ_SECONDS=0 ./scripts/check-fuzz 2>&1)"
+invalid_fuzz_seconds_status="$?"
+missing_package_output="$(
+  FAULTLANE_DOCTOR_PLAYWRIGHT_PACKAGE=@faultlane/missing-playwright-package \
+    ./scripts/check-playwright 2>&1
+)"
+missing_package_status="$?"
+missing_browser_output="$(
+  FAULTLANE_DOCTOR_PLAYWRIGHT_CHANNEL=faultlane-missing-browser \
+    ./scripts/check-playwright 2>&1
+)"
+missing_browser_status="$?"
+set -e
+
+if [[ "$missing_database_command_status" -ne 2 \
+  || "$missing_database_command_output" != "usage: ./scripts/with-test-database <command> [args...]" ]]; then
+  echo "test database wrapper did not reject a missing command" >&2
+  exit 1
+fi
+
+if [[ "$invalid_fuzz_seconds_status" -ne 2 \
+  || "$invalid_fuzz_seconds_output" != "FAULTLANE_FUZZ_SECONDS must be a positive integer" ]]; then
+  echo "fuzz proof did not reject an invalid duration" >&2
+  exit 1
+fi
+
+if [[ "$missing_package_status" -eq 0 \
+  || "$missing_package_output" != "missing: Playwright package (run corepack pnpm install --frozen-lockfile)" ]]; then
+  echo "Playwright package check did not fail safely" >&2
+  exit 1
+fi
+
+expected_browser_output=$'ok: Playwright package\nmissing: Chrome for Playwright (install Google Chrome or run corepack pnpm --filter @faultlane/web exec playwright install chrome)'
+if [[ "$missing_browser_status" -eq 0 || "$missing_browser_output" != "$expected_browser_output" ]]; then
+  echo "Playwright browser check did not fail safely" >&2
+  exit 1
+fi
+
+if grep -R -Fq 'let Ok(database_url)' apps/server/src; then
+  echo "database tests must not silently return when FAULTLANE_TEST_DATABASE_URL is absent" >&2
+  exit 1
+fi
+
+database_test_count="$(grep -R -F 'requires FAULTLANE_TEST_DATABASE_URL' apps/server/src --include='*.rs' | wc -l | tr -d ' ')"
+database_url_count="$(grep -R -F 'var("FAULTLANE_TEST_DATABASE_URL")' apps/server/src --include='*.rs' | wc -l | tr -d ' ')"
+if [[ "$database_test_count" -eq 0 || "$database_test_count" -ne "$database_url_count" ]]; then
+  echo "every PostgreSQL test must be explicitly ignored outside certification" >&2
+  exit 1
+fi
+
+if ! grep -Fq './scripts/with-test-database cargo test --workspace --all-targets -- --ignored' scripts/check; then
+  echo "complete check must run the explicitly ignored PostgreSQL tests" >&2
+  exit 1
+fi
 
 forbidden_dash=$'\xE2\x80\x94'
 found_dash=0

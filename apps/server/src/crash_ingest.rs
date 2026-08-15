@@ -1366,12 +1366,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires FAULTLANE_TEST_DATABASE_URL"]
+    #[allow(clippy::expect_used)]
     #[allow(clippy::too_many_lines)]
     async fn persists_one_object_and_job_for_duplicate_requests_when_configured()
     -> Result<(), Box<dyn Error>> {
-        let Ok(database_url) = std::env::var("FAULTLANE_TEST_DATABASE_URL") else {
-            return Ok(());
-        };
+        let database_url = std::env::var("FAULTLANE_TEST_DATABASE_URL")
+            .expect("FAULTLANE_TEST_DATABASE_URL is required");
         let _guard = DATABASE_TEST_LOCK.lock().await;
         assert_isolated_database(&database_url);
         migrate(&database_url).await?;

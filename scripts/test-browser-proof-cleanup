@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+proof_id="cleanup-$$"
+compose_project="faultlane-browser-$proof_id"
+
+set +e
+output="$(
+  FAULTLANE_BROWSER_PROOF_ID="$proof_id" \
+    FAULTLANE_BROWSER_PROOF_FORCE_FAILURE=true \
+    ./scripts/prove-browser 2>&1
+)"
+status="$?"
+set -e
+
+if [[ "$status" -ne 97 || "$output" != *"forced browser proof failure"* ]]; then
+  echo "browser proof did not expose the forced failure" >&2
+  exit 1
+fi
+
+if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$compose_project")" \
+  || -n "$(docker network ls -q --filter "label=com.docker.compose.project=$compose_project")" \
+  || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$compose_project")" ]]; then
+  echo "forced browser proof failure left Docker resources" >&2
+  exit 1
+fi
+
+for url in \
+  "http://127.0.0.1:${FAULTLANE_BROWSER_API_PORT:-58092}/health/live" \
+  "http://127.0.0.1:${FAULTLANE_BROWSER_INGEST_PORT:-58093}/health/live" \
+  "http://127.0.0.1:${FAULTLANE_BROWSER_WEB_PORT:-53092}/setup"; do
+  if curl --fail --silent "$url" >/dev/null 2>&1; then
+    echo "forced browser proof failure left a service process" >&2
+    exit 1
+  fi
+done
+
+echo "browser proof failure cleanup passed"

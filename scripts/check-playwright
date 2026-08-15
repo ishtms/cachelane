@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+package="${FAULTLANE_DOCTOR_PLAYWRIGHT_PACKAGE:-@playwright/test}"
+channel="${FAULTLANE_DOCTOR_PLAYWRIGHT_CHANNEL:-chrome}"
+
+if ! corepack pnpm --filter @faultlane/web exec node - "$package" <<'NODE' >/dev/null 2>&1
+require.resolve(process.argv[2]);
+NODE
+then
+  echo "missing: Playwright package (run corepack pnpm install --frozen-lockfile)" >&2
+  exit 1
+fi
+
+echo "ok: Playwright package"
+
+if ! corepack pnpm --filter @faultlane/web exec node - "$package" "$channel" <<'NODE' >/dev/null 2>&1
+const { chromium } = require(process.argv[2]);
+chromium
+  .launch({ channel: process.argv[3], headless: true })
+  .then(browser => browser.close())
+  .catch(() => process.exit(1));
+NODE
+then
+  echo "missing: Chrome for Playwright (install Google Chrome or run corepack pnpm --filter @faultlane/web exec playwright install chrome)" >&2
+  exit 1
+fi
+
+echo "ok: Chrome for Playwright"

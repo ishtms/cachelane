@@ -26,7 +26,7 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
     page.getByText("DataRouterUrl=", { exact: false }),
   ).toBeVisible();
 
-  await page.getByRole("link", { name: "Open project setup" }).click();
+  await page.getByRole("link", { name: "Manage project setup" }).click();
   await expect(
     page.getByRole("heading", { name: "UE 5.8 Game" }),
   ).toBeVisible();
@@ -43,7 +43,7 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
 
   for (const key of [firstKey, secondKey]) {
     const response = await page.request.post(`${ingestUrl}/u/${key}`);
-    expect(response.status()).toBe(503);
+    expect(response.status()).toBe(400);
   }
 
   const projectId = new URL(page.url()).searchParams.get("project");
@@ -53,7 +53,7 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
   );
   expect(controlResponse.status()).toBe(401);
 
-  await page.getByRole("link", { name: "Open project setup" }).click();
+  await page.getByRole("link", { name: "Manage project setup" }).click();
   const rows = page.locator(".key-row");
   await expect(rows).toHaveCount(2);
   await rows.first().getByRole("button", { name: "Revoke" }).click();
@@ -64,5 +64,5 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
   const revokedResponse = await page.request.post(`${ingestUrl}/u/${firstKey}`);
   expect(revokedResponse.status()).toBe(404);
   const activeResponse = await page.request.post(`${ingestUrl}/u/${secondKey}`);
-  expect(activeResponse.status()).toBe(503);
+  expect(activeResponse.status()).toBe(400);
 });
