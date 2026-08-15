@@ -2185,7 +2185,7 @@ async fn claim_job_with_project_limit(
     let lease_token = random_uuid().map_err(|_| ())?;
     let mut transaction = pool.begin().await.map_err(|_| ())?;
     let row = sqlx::query(
-        "WITH candidate AS (SELECT j.id, active.job_count AS prior_project_active_jobs FROM jobs j JOIN projects p ON p.id = j.project_id AND p.organization_id = j.organization_id CROSS JOIN LATERAL (SELECT count(*)::bigint AS job_count FROM jobs active WHERE active.organization_id = j.organization_id AND active.project_id = j.project_id AND active.id <> j.id AND active.state = 'leased' AND active.lease_expires_at > now()) active WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) AND active.job_count < $4 ORDER BY j.priority, j.available_at, j.created_at, j.id FOR UPDATE OF p, j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token, COALESCE((SELECT e.requested_reprocessing_generation FROM crash_events e WHERE e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id), 0) AS target_generation, candidate.prior_project_active_jobs + 1 AS project_active_jobs, GREATEST(0, EXTRACT(EPOCH FROM now() - j.created_at)::bigint) AS queue_age_seconds",
+        "WITH candidate_project AS MATERIALIZED (SELECT p.id, p.organization_id, active.job_count AS prior_project_active_jobs FROM jobs seed JOIN projects p ON p.id = seed.project_id AND p.organization_id = seed.organization_id CROSS JOIN LATERAL (SELECT count(*)::bigint AS job_count FROM jobs active WHERE active.organization_id = seed.organization_id AND active.project_id = seed.project_id AND active.state = 'leased' AND active.lease_expires_at > now()) active WHERE ((seed.state = 'pending' AND seed.available_at <= now() AND (seed.attempt < seed.max_attempt OR (seed.attempt = seed.max_attempt AND seed.resource_failures = 1))) OR (seed.state = 'leased' AND seed.lease_expires_at <= now())) AND active.job_count < $4 ORDER BY seed.priority, seed.available_at, seed.created_at, seed.id FOR UPDATE OF p SKIP LOCKED LIMIT 1), candidate AS MATERIALIZED (SELECT j.id, project.prior_project_active_jobs FROM jobs j JOIN candidate_project project ON project.id = j.project_id AND project.organization_id = j.organization_id WHERE ((j.state = 'pending' AND j.available_at <= now() AND (j.attempt < j.max_attempt OR (j.attempt = j.max_attempt AND j.resource_failures = 1))) OR (j.state = 'leased' AND j.lease_expires_at <= now())) ORDER BY j.priority, j.available_at, j.created_at, j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1) UPDATE jobs j SET state = 'leased', attempt = j.attempt + 1, lease_owner = $1, lease_token = $2::uuid, lease_expires_at = now() + ($3 * interval '1 second'), heartbeat_at = now(), updated_at = now() FROM candidate WHERE j.id = candidate.id RETURNING j.id::text AS id, j.organization_id::text AS organization_id, j.project_id::text AS project_id, j.event_id::text AS event_id, j.artifact_upload_id::text AS artifact_upload_id, j.derived_cache_id::text AS derived_cache_id, j.job_type, j.attempt, j.max_attempt, j.resource_failures, j.lease_token::text AS lease_token, COALESCE((SELECT e.requested_reprocessing_generation FROM crash_events e WHERE e.id = j.event_id AND e.organization_id = j.organization_id AND e.project_id = j.project_id), 0) AS target_generation, candidate.prior_project_active_jobs + 1 AS project_active_jobs, GREATEST(0, EXTRACT(EPOCH FROM now() - j.created_at)::bigint) AS queue_age_seconds",
     )
     .bind(worker_id)
     .bind(&lease_token)
@@ -6413,17 +6413,30 @@ mod tests {
         let _ = insert_event_job(&pool, &organization_id, &first_project, "first-b").await;
         let _ = insert_event_job(&pool, &organization_id, &second_project, "second-a").await;
 
-        let (left, right) = tokio::join!(
-            claim_job(&pool, "worker-left"),
-            claim_job(&pool, "worker-right")
-        );
-        let left = left
-            .unwrap_or_else(|()| panic!("left claim must succeed"))
-            .unwrap_or_else(|| panic!("left claim must find work"));
-        let right = right
-            .unwrap_or_else(|()| panic!("right claim must succeed"))
-            .unwrap_or_else(|| panic!("right claim must find work"));
-        assert_ne!(left.project_id, right.project_id);
+        let mut claim_round = 0_u8;
+        let (left, right) = loop {
+            let (left, right) = tokio::join!(
+                claim_job(&pool, "worker-left"),
+                claim_job(&pool, "worker-right")
+            );
+            let left = left
+                .unwrap_or_else(|()| panic!("left claim must succeed"))
+                .unwrap_or_else(|| panic!("left claim must find work"));
+            let right = right
+                .unwrap_or_else(|()| panic!("right claim must succeed"))
+                .unwrap_or_else(|| panic!("right claim must find work"));
+            assert_ne!(left.project_id, right.project_id);
+            claim_round = claim_round.saturating_add(1);
+            if claim_round == 32 {
+                break (left, right);
+            }
+            sqlx::query(
+                "UPDATE jobs SET state = 'pending', attempt = 0, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL WHERE state = 'leased'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("claims must reset: {error}"));
+        };
 
         let (stale, stale_owner) = if left.project_id == first_project {
             (left, "worker-left")

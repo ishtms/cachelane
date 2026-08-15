@@ -73,6 +73,7 @@ Rollback sets both bounds to one or restores the prior worker. Existing jobs, at
 - `./scripts/prove-isolated-processing` passed with two real worker processes and same-project concurrency two. It also verified the processor boundary, resource limits, storage and database outage recovery, lease fencing, owned cleanup, publication, and runtime smoke behavior.
 - The runtime configuration permits at most four processors using four CPUs, 8 GiB memory, and 256 MiB scratch. The disposable Docker host reported 24 CPUs and about 16 GiB memory.
 - `./scripts/check-fast` passed on the final issue tree.
+- A later milestone check exposed a simultaneous default-claim race where two workers could select the same project. Claim selection now locks the project in a materialized first stage before locking its job. Thirty-two repeated concurrent claim rounds passed, and the 10,100-job proof passed again at 82 jobs per second with the cold project advancing in 168 milliseconds and hot-project concurrency capped at four.
 - No hosted or production rollout was performed. Rollback remains resetting both concurrency settings to one after active leases finish or expire.
 
 ## Out of scope
