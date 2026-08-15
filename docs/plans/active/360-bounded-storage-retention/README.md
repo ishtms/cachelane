@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/360
 
-Status: Waiting for approval and #358
+Status: Approved, waiting for #358
 
 ## Context
 
@@ -76,4 +76,4 @@ Rollback disables `FAULTLANE_RETENTION_V2_ENABLED`, stops scheduler claims, rest
 
 ## Approval
 
-Approval is required for immutable prospective deadlines, counter authority, scheduler concurrency, the rollout switch, staging proof, and rollback.
+Ishtmeet Singh approved this plan on August 15, 2026, including immutable prospective deadlines, counter authority, scheduler concurrency, the rollout switch, staging proof, and rollback.
