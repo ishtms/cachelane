@@ -1,6 +1,8 @@
 import "server-only";
 
-import { cookies } from "next/headers";
+import { isIP } from "node:net";
+
+import { cookies, headers as requestHeaders } from "next/headers";
 
 export const SESSION_COOKIE = "faultlane_session";
 
@@ -349,6 +351,85 @@ export type RegressionState =
 export type SymbolicationState =
   "readable" | "partial" | "missing" | "failed" | "processing";
 
+export type PublicDemoInfo = {
+  title: string;
+  engine: string;
+  synthetic: true;
+  read_only: true;
+  issue_count: number;
+  last_seen_at: string | null;
+};
+
+export type PublicDemoIssueSummary = {
+  key: string;
+  path: string;
+  title: string;
+  fingerprint: string;
+  fingerprint_version: number;
+  status: IssueStatus;
+  regression_state: RegressionState;
+  first_seen_at: string;
+  last_seen_at: string;
+  event_count: number;
+  affected_release_count: number;
+  symbolication_state: SymbolicationState;
+  crash_type: string | null;
+  reprocessed: boolean;
+};
+
+export type PublicDemoIssueList = {
+  synthetic: true;
+  read_only: true;
+  items: PublicDemoIssueSummary[];
+  truncated: boolean;
+};
+
+export type PublicDemoIssueDetail = PublicDemoIssueSummary & {
+  synthetic: true;
+  read_only: true;
+  variants: Array<{
+    fingerprint: string;
+    first_seen_at: string;
+    last_seen_at: string;
+    event_count: number;
+  }>;
+  variants_truncated: boolean;
+  releases: Array<{
+    version: string;
+    platform: string;
+    architecture: string;
+    configuration: string;
+    first_seen_at: string;
+    last_seen_at: string;
+    event_count: number;
+  }>;
+  releases_truncated: boolean;
+  threads: Array<{
+    thread_id: number;
+    faulting: boolean;
+    frames: Array<{
+      module: string | null;
+      function: string | null;
+      source_file: string | null;
+      source_line: number | null;
+      inlines: Array<{
+        function: string;
+        source_file: string | null;
+        source_line: number | null;
+      }>;
+      inlines_truncated: boolean;
+    }>;
+    frames_truncated: boolean;
+  }>;
+  threads_truncated: boolean;
+  missing_symbols: Array<{
+    required_artifact: string;
+    module: string;
+    architecture: string;
+  }>;
+  missing_symbols_truncated: boolean;
+};
+
 export type IssueSummary = {
   issue_id: string;
   path: string;
@@ -677,6 +758,11 @@ export async function faultlanePublicApi<T>(
   const text = await response.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
+}
+
+export async function publicDemoRequestHeaders(): Promise<HeadersInit> {
+  const source = (await requestHeaders()).get("cf-connecting-ip");
+  return source && isIP(source) ? { "x-forwarded-for": source } : {};
 }
 
 export async function faultlaneApi<T>(

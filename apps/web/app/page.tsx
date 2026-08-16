@@ -49,6 +49,9 @@ export default function Home() {
           <a className="primary" href="/setup">
             Local setup
           </a>
+          <a className="primary" href="/demo">
+            Public demo
+          </a>
           <a className="primary" href="https://github.com/ishtms/faultlane">
             View repository
           </a>

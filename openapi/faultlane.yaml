@@ -40,6 +40,125 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Health"
+  /api/v1/demo:
+    get:
+      operationId: getPublicDemo
+      summary: Describe the configured synthetic read-only demo
+      responses:
+        "200":
+          description: Public demo summary
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            RateLimit-Limit:
+              $ref: "#/components/headers/RateLimitLimit"
+            RateLimit-Remaining:
+              $ref: "#/components/headers/RateLimitRemaining"
+            RateLimit-Reset:
+              $ref: "#/components/headers/RateLimitReset"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicDemoInfo"
+        "429":
+          description: Public demo request limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/demo/health:
+    get:
+      operationId: getPublicDemoHealth
+      summary: Check whether the configured synthetic demo project is available
+      responses:
+        "200":
+          description: Public demo is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - status
+                properties:
+                  status:
+                    type: string
+                    const: ready
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/demo/issues:
+    get:
+      operationId: listPublicDemoIssues
+      summary: List bounded issues from the configured synthetic demo project
+      responses:
+        "200":
+          description: Bounded public demo issues
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            RateLimit-Limit:
+              $ref: "#/components/headers/RateLimitLimit"
+            RateLimit-Remaining:
+              $ref: "#/components/headers/RateLimitRemaining"
+            RateLimit-Reset:
+              $ref: "#/components/headers/RateLimitReset"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicDemoIssueList"
+        "429":
+          description: Public demo request limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/demo/issues/{issue_key}:
+    parameters:
+      - name: issue_key
+        in: path
+        required: true
+        description: Public fingerprint identity without an internal issue identifier
+        schema:
+          type: string
+          pattern: ^[1-9][0-9]*-[a-f0-9]{64}$
+    get:
+      operationId: getPublicDemoIssue
+      summary: Read a safe issue projection from the synthetic demo project
+      responses:
+        "200":
+          description: Public demo issue detail
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            RateLimit-Limit:
+              $ref: "#/components/headers/RateLimitLimit"
+            RateLimit-Remaining:
+              $ref: "#/components/headers/RateLimitRemaining"
+            RateLimit-Reset:
+              $ref: "#/components/headers/RateLimitReset"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicDemoIssueDetail"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          description: Public demo request limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/setup:
     post:
       operationId: createInitialProject
@@ -1938,6 +2057,330 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    PublicDemoInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - title
+        - engine
+        - synthetic
+        - read_only
+        - issue_count
+        - last_seen_at
+      properties:
+        title:
+          type: string
+        engine:
+          type: string
+        synthetic:
+          type: boolean
+          const: true
+        read_only:
+          type: boolean
+          const: true
+        issue_count:
+          type: integer
+          minimum: 0
+        last_seen_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+    PublicDemoIssueSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - key
+        - path
+        - title
+        - fingerprint
+        - fingerprint_version
+        - status
+        - regression_state
+        - first_seen_at
+        - last_seen_at
+        - event_count
+        - affected_release_count
+        - symbolication_state
+        - crash_type
+        - reprocessed
+      properties:
+        key:
+          type: string
+          pattern: ^[1-9][0-9]*-[a-f0-9]{64}$
+        path:
+          type: string
+          pattern: ^/demo/issues/[1-9][0-9]*-[a-f0-9]{64}$
+        title:
+          type: string
+          maxLength: 200
+        fingerprint:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        fingerprint_version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum:
+            - open
+            - resolved
+        regression_state:
+          type: string
+          enum:
+            - new
+            - ongoing
+            - resolved
+            - regressed
+            - unknown
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+        affected_release_count:
+          type: integer
+          minimum: 0
+        symbolication_state:
+          type: string
+          enum:
+            - readable
+            - partial
+            - missing
+            - failed
+            - processing
+        crash_type:
+          type:
+            - string
+            - "null"
+        reprocessed:
+          type: boolean
+    PublicDemoIssueList:
+      type: object
+      additionalProperties: false
+      required:
+        - synthetic
+        - read_only
+        - items
+        - truncated
+      properties:
+        synthetic:
+          type: boolean
+          const: true
+        read_only:
+          type: boolean
+          const: true
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/PublicDemoIssueSummary"
+        truncated:
+          type: boolean
+    PublicDemoVariant:
+      type: object
+      additionalProperties: false
+      required:
+        - fingerprint
+        - first_seen_at
+        - last_seen_at
+        - event_count
+      properties:
+        fingerprint:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+    PublicDemoRelease:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - platform
+        - architecture
+        - configuration
+        - first_seen_at
+        - last_seen_at
+        - event_count
+      properties:
+        version:
+          type: string
+          maxLength: 128
+        platform:
+          type: string
+          maxLength: 32
+        architecture:
+          type: string
+          maxLength: 32
+        configuration:
+          type: string
+          maxLength: 32
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        event_count:
+          type: integer
+          minimum: 1
+    PublicDemoInline:
+      type: object
+      additionalProperties: false
+      required:
+        - function
+        - source_file
+        - source_line
+      properties:
+        function:
+          type: string
+          maxLength: 256
+        source_file:
+          type:
+            - string
+            - "null"
+          maxLength: 128
+        source_line:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+    PublicDemoFrame:
+      type: object
+      additionalProperties: false
+      required:
+        - module
+        - function
+        - source_file
+        - source_line
+        - inlines
+        - inlines_truncated
+      properties:
+        module:
+          type:
+            - string
+            - "null"
+          maxLength: 128
+        function:
+          type:
+            - string
+            - "null"
+          maxLength: 256
+        source_file:
+          type:
+            - string
+            - "null"
+          maxLength: 128
+        source_line:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        inlines:
+          type: array
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/PublicDemoInline"
+        inlines_truncated:
+          type: boolean
+    PublicDemoThread:
+      type: object
+      additionalProperties: false
+      required:
+        - thread_id
+        - faulting
+        - frames
+        - frames_truncated
+      properties:
+        thread_id:
+          type: integer
+        faulting:
+          type: boolean
+        frames:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/PublicDemoFrame"
+        frames_truncated:
+          type: boolean
+    PublicDemoMissingSymbol:
+      type: object
+      additionalProperties: false
+      required:
+        - required_artifact
+        - module
+        - architecture
+      properties:
+        required_artifact:
+          type: string
+        module:
+          type: string
+          maxLength: 128
+        architecture:
+          type: string
+          maxLength: 32
+    PublicDemoIssueDetail:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/PublicDemoIssueSummary"
+        - type: object
+          required:
+            - synthetic
+            - read_only
+            - variants
+            - variants_truncated
+            - releases
+            - releases_truncated
+            - threads
+            - threads_truncated
+            - missing_symbols
+            - missing_symbols_truncated
+          properties:
+            synthetic:
+              type: boolean
+              const: true
+            read_only:
+              type: boolean
+              const: true
+            variants:
+              type: array
+              maxItems: 32
+              items:
+                $ref: "#/components/schemas/PublicDemoVariant"
+            variants_truncated:
+              type: boolean
+            releases:
+              type: array
+              maxItems: 32
+              items:
+                $ref: "#/components/schemas/PublicDemoRelease"
+            releases_truncated:
+              type: boolean
+            threads:
+              type: array
+              maxItems: 16
+              items:
+                $ref: "#/components/schemas/PublicDemoThread"
+            threads_truncated:
+              type: boolean
+            missing_symbols:
+              type: array
+              maxItems: 32
+              items:
+                $ref: "#/components/schemas/PublicDemoMissingSymbol"
+            missing_symbols_truncated:
+              type: boolean
     AuthProviders:
       type: object
       additionalProperties: false

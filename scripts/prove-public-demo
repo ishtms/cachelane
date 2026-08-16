@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ ! -f .env ]]; then
+  echo "missing .env; run ./scripts/setup" >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker is required for the public demo proof" >&2
+  exit 1
+fi
+
+set -a
+source .env
+set +a
+
+proof_id="${FAULTLANE_PUBLIC_DEMO_PROOF_ID:-local-$$}"
+if [[ ! "$proof_id" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then
+  echo "invalid public demo proof identifier" >&2
+  exit 2
+fi
+
+compose_project="faultlane-demo-proof-$proof_id"
+proof_directory="$(mktemp -d -t faultlane-public-demo-proof.XXXXXX)"
+proof_directory="$(cd "$proof_directory" && pwd -P)"
+proof_parent="$(dirname "$proof_directory")"
+proof_name="$(basename "$proof_directory")"
+next_env_backup="$proof_directory/next-env.d.ts"
+cp apps/web/next-env.d.ts "$next_env_backup"
+
+export POSTGRES_DB="faultlane_demo_${proof_id//-/_}"
+export FAULTLANE_POSTGRES_PORT="${FAULTLANE_PUBLIC_DEMO_POSTGRES_PORT:-55444}"
+export FAULTLANE_MINIO_PORT="${FAULTLANE_PUBLIC_DEMO_MINIO_PORT:-59030}"
+export FAULTLANE_MINIO_CONSOLE_PORT="${FAULTLANE_PUBLIC_DEMO_MINIO_CONSOLE_PORT:-59031}"
+export FAULTLANE_API_PORT="${FAULTLANE_PUBLIC_DEMO_API_PORT:-58094}"
+export FAULTLANE_INGEST_PORT="${FAULTLANE_PUBLIC_DEMO_INGEST_PORT:-58095}"
+export FAULTLANE_WEB_PORT="${FAULTLANE_PUBLIC_DEMO_WEB_PORT:-3304}"
+export DATABASE_URL="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$FAULTLANE_POSTGRES_PORT/$POSTGRES_DB"
+export OBJECT_STORE_ENDPOINT="http://127.0.0.1:$FAULTLANE_MINIO_PORT"
+export OBJECT_STORE_BUCKET="faultlane-demo-proof-$proof_id"
+export FAULTLANE_API_URL="http://127.0.0.1:$FAULTLANE_API_PORT"
+export FAULTLANE_INGEST_URL="http://127.0.0.1:$FAULTLANE_INGEST_PORT"
+export INGEST_BASE_URL="$FAULTLANE_INGEST_URL"
+export FAULTLANE_WEB_URL="http://127.0.0.1:$FAULTLANE_WEB_PORT"
+export PUBLIC_BASE_URL="$FAULTLANE_WEB_URL"
+export FAULTLANE_INGEST_SPOOL_DIR="$proof_directory/ingest-spool"
+export FAULTLANE_WORKER_SCRATCH_DIR="$proof_directory/worker-scratch"
+export FAULTLANE_BOOTSTRAP_ENABLED=true
+export FAULTLANE_BOOTSTRAP_SECRET="faultlane-public-demo-bootstrap-$proof_id"
+export FAULTLANE_RATE_LIMIT_SECRET="faultlane-public-demo-rate-secret-$proof_id"
+export FAULTLANE_TRUSTED_PROXY_CIDRS=""
+export FAULTLANE_SYMBOL_UPLOAD_ENABLED=true
+export FAULTLANE_ISOLATED_PROCESSING_ENABLED=true
+export FAULTLANE_WORKER_CONCURRENCY=1
+export FAULTLANE_PROJECT_CONCURRENCY=1
+export FAULTLANE_GROUPING_ENABLED=true
+export FAULTLANE_REPROCESSING_ENABLED=true
+export FAULTLANE_DASHBOARD_ENABLED=true
+export FAULTLANE_ONBOARDING_ENABLED=true
+export FAULTLANE_DASHBOARD_ROLLUPS_ENABLED=true
+export FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED=false
+export FAULTLANE_PUBLIC_DEMO_ENABLED=false
+export FAULTLANE_PUBLIC_DEMO_WEB_ONLY=true
+export FAULTLANE_PUBLIC_DEMO_RATE_LIMIT_PER_MINUTE=600
+export FAULTLANE_ALERTS_ENABLED=false
+export FAULTLANE_PLAYWRIGHT_OUTPUT_DIR="$proof_directory/playwright"
+
+server_executable="$repo_root/target/debug/faultlane-server"
+cli_executable="$repo_root/target/debug/faultlane"
+node_executable="$(command -v node)"
+next_executable="$repo_root/apps/web/node_modules/next/dist/bin/next"
+windows=false
+if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+  windows=true
+  server_executable="$server_executable.exe"
+  cli_executable="$cli_executable.exe"
+  node_executable="$(command -v node.exe || command -v node)"
+fi
+
+api_pid=""
+ingest_pid=""
+worker_pid=""
+scheduler_pid=""
+web_pid=""
+started_pid=""
+
+start_role() {
+  local role="$1"
+  local label="${2:-$role}"
+  local stdout_log="$proof_directory/$label.log"
+  local stderr_log="$proof_directory/$label-error.log"
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    local stdout_path
+    local stderr_path
+    local pid_path
+    executable_path="$(cygpath -w "$server_executable")"
+    stdout_path="$(cygpath -w "$stdout_log")"
+    stderr_path="$(cygpath -w "$stderr_log")"
+    pid_path="$(cygpath -w "$proof_directory/$label.pid")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Start-Process -FilePath '$executable_path' -ArgumentList '$role' -RedirectStandardOutput '$stdout_path' -RedirectStandardError '$stderr_path' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_path', \$process.Id.ToString())" \
+      >/dev/null
+    started_pid="$(tr -d '\r\n' <"$proof_directory/$label.pid")"
+  else
+    "$server_executable" "$role" >"$stdout_log" 2>"$stderr_log" &
+    started_pid="$!"
+  fi
+  if [[ ! "$started_pid" =~ ^[0-9]+$ ]]; then
+    echo "failed to start $label" >&2
+    exit 1
+  fi
+}
+
+start_web() {
+  local stdout_log="$proof_directory/web.log"
+  local stderr_log="$proof_directory/web-error.log"
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    local next_path
+    local work_path
+    local stdout_path
+    local stderr_path
+    local pid_path
+    executable_path="$(cygpath -w "$node_executable")"
+    next_path="$(cygpath -w "$next_executable")"
+    work_path="$(cygpath -w "$repo_root/apps/web")"
+    stdout_path="$(cygpath -w "$stdout_log")"
+    stderr_path="$(cygpath -w "$stderr_log")"
+    pid_path="$(cygpath -w "$proof_directory/web.pid")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Start-Process -FilePath '$executable_path' -ArgumentList '$next_path', 'start', '--hostname', '127.0.0.1', '--port', '$FAULTLANE_WEB_PORT' -WorkingDirectory '$work_path' -RedirectStandardOutput '$stdout_path' -RedirectStandardError '$stderr_path' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$pid_path', \$process.Id.ToString())" \
+      >/dev/null
+    web_pid="$(tr -d '\r\n' <"$proof_directory/web.pid")"
+  else
+    (
+      cd apps/web
+      exec "$node_executable" "$next_executable" start \
+        --hostname 127.0.0.1 \
+        --port "$FAULTLANE_WEB_PORT"
+    ) >"$stdout_log" 2>"$stderr_log" &
+    web_pid="$!"
+  fi
+}
+
+stop_process() {
+  local pid="$1"
+  local executable="$2"
+  if [[ -z "$pid" ]]; then
+    return
+  fi
+  if [[ "$windows" == true ]]; then
+    local executable_path
+    executable_path="$(cygpath -w "$executable")"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$process = Get-Process -Id $pid -ErrorAction SilentlyContinue; if (\$null -ne \$process) { if ([IO.Path]::GetFullPath(\$process.Path) -ne [IO.Path]::GetFullPath('$executable_path')) { exit 1 }; Stop-Process -Id $pid -Force; Wait-Process -Id $pid -Timeout 10 -ErrorAction SilentlyContinue }" \
+      >/dev/null
+    return
+  fi
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup() {
+  local status="$?"
+  local cleanup_failed=0
+  trap - EXIT INT TERM
+  stop_process "$api_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$ingest_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$worker_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$scheduler_pid" "$server_executable" || cleanup_failed=1
+  stop_process "$web_pid" "$node_executable" || cleanup_failed=1
+  docker compose \
+    --project-name "$compose_project" \
+    --env-file .env \
+    -f deploy/docker-compose/compose.yml \
+    down --volumes --remove-orphans >/dev/null 2>&1 || cleanup_failed=1
+  if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$compose_project")" \
+    || -n "$(docker network ls -q --filter "label=com.docker.compose.project=$compose_project")" \
+    || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$compose_project")" ]]; then
+    cleanup_failed=1
+  fi
+  cp "$next_env_backup" apps/web/next-env.d.ts || cleanup_failed=1
+  if [[ "$status" -ne 0 ]]; then
+    for log in "$proof_directory"/*.log; do
+      if [[ -f "$log" ]]; then
+        echo "==> $(basename "$log")" >&2
+        tail -n 120 "$log" >&2
+      fi
+    done
+  fi
+  if [[ "$proof_name" =~ ^faultlane-public-demo-proof\.[A-Za-z0-9]+$ \
+    && "$proof_directory" == "$proof_parent/$proof_name" ]]; then
+    rm -rf -- "$proof_directory" || cleanup_failed=1
+  else
+    cleanup_failed=1
+  fi
+  if [[ "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+wait_for_url() {
+  local url="$1"
+  for _ in $(seq 1 120); do
+    if curl --fail --silent "$url" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.5
+  done
+  echo "$url did not become ready" >&2
+  return 1
+}
+
+json_field() {
+  local path="$1"
+  node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const value = process.argv[1].split(".").reduce((current, field) => current[field], JSON.parse(input));
+      process.stdout.write(String(value));
+    });
+  ' "$path"
+}
+
+echo "public demo proof: starting isolated dependencies"
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait postgres minio
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  run --rm minio-init >/dev/null
+
+if ! docker image inspect "$FAULTLANE_PROCESSOR_IMAGE" >/dev/null 2>&1; then
+  docker build -f deploy/processor/Dockerfile -t "$FAULTLANE_PROCESSOR_IMAGE" .
+fi
+
+echo "public demo proof: building services"
+cargo build --package faultlane-server --package faultlane-cli
+corepack pnpm --filter @faultlane/web build
+"$server_executable" migrate
+
+start_role api
+api_pid="$started_pid"
+start_role ingest
+ingest_pid="$started_pid"
+start_role worker
+worker_pid="$started_pid"
+start_role scheduler
+scheduler_pid="$started_pid"
+start_web
+wait_for_url "$FAULTLANE_API_URL/health/ready"
+wait_for_url "$FAULTLANE_INGEST_URL/health/ready"
+wait_for_url "$FAULTLANE_WEB_URL/demo"
+
+setup_response="$(curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  -H "Content-Type: application/json" \
+  --data '{"owner_email":"demo@example.com","organization_name":"Synthetic Demo Proof","organization_slug":"synthetic-demo-proof","project_name":"Synthetic UE Game","project_slug":"synthetic-demo-game"}' \
+  "$FAULTLANE_API_URL/api/v1/setup")"
+export FAULTLANE_PUBLIC_DEMO_ORGANIZATION_ID="$(json_field setup.organization.id <<<"$setup_response")"
+export FAULTLANE_PUBLIC_DEMO_PROJECT_ID="$(json_field setup.project.id <<<"$setup_response")"
+ingest_key="$(json_field ingest_key.value <<<"$setup_response")"
+token_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$FAULTLANE_PUBLIC_DEMO_PROJECT_ID/artifact-upload-tokens")"
+upload_token_id="$(json_field id <<<"$token_response")"
+upload_token="$(json_field token <<<"$token_response")"
+
+stop_process "$api_pid" "$server_executable"
+api_pid=""
+export FAULTLANE_PUBLIC_DEMO_ENABLED=true
+start_role api public-api
+api_pid="$started_pid"
+wait_for_url "$FAULTLANE_API_URL/api/v1/demo/health"
+
+export FAULTLANE_DEMO_API_URL="$FAULTLANE_API_URL"
+export FAULTLANE_DEMO_INGEST_URL="$FAULTLANE_INGEST_URL"
+export FAULTLANE_DEMO_PROJECT_ID="$FAULTLANE_PUBLIC_DEMO_PROJECT_ID"
+export FAULTLANE_DEMO_PROJECT_SLUG=synthetic-demo-game
+export FAULTLANE_DEMO_INGEST_KEY="$ingest_key"
+export FAULTLANE_DEMO_UPLOAD_TOKEN="$upload_token"
+export FAULTLANE_DEMO_OPERATOR_AUTHORIZATION="Bootstrap $FAULTLANE_BOOTSTRAP_SECRET"
+export FAULTLANE_DEMO_PUBLIC_URL="$FAULTLANE_WEB_URL"
+export FAULTLANE_DEMO_CLI="$cli_executable"
+
+echo "public demo proof: refreshing the synthetic dataset twice"
+first_refresh="$(bash scripts/refresh-public-demo)"
+second_refresh="$(bash scripts/refresh-public-demo)"
+if [[ "$first_refresh" != "$second_refresh" ]]; then
+  echo "repeat refresh changed the bounded dataset" >&2
+  exit 1
+fi
+
+wait_for_url "$FAULTLANE_WEB_URL/demo"
+corepack pnpm --filter @faultlane/web exec playwright test e2e/demo.spec.ts --workers=1
+
+echo "public demo proof: testing restart and kill switch"
+stop_process "$api_pid" "$server_executable"
+api_pid=""
+start_role api restarted-api
+api_pid="$started_pid"
+wait_for_url "$FAULTLANE_API_URL/api/v1/demo/health"
+
+stop_process "$api_pid" "$server_executable"
+api_pid=""
+export FAULTLANE_PUBLIC_DEMO_ENABLED=false
+start_role api disabled-api
+api_pid="$started_pid"
+wait_for_url "$FAULTLANE_API_URL/health/ready"
+disabled_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "$FAULTLANE_API_URL/api/v1/demo/health")"
+if [[ "$disabled_status" != 503 ]]; then
+  echo "public demo kill switch returned $disabled_status" >&2
+  exit 1
+fi
+curl --fail --silent --show-error \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$FAULTLANE_PUBLIC_DEMO_PROJECT_ID/setup" >/dev/null
+
+stop_process "$api_pid" "$server_executable"
+api_pid=""
+export FAULTLANE_PUBLIC_DEMO_ENABLED=true
+start_role api enabled-api
+api_pid="$started_pid"
+wait_for_url "$FAULTLANE_API_URL/api/v1/demo/health"
+
+echo "public demo proof: rotating the upload credential"
+new_token_response="$(curl --fail --silent --show-error \
+  -X POST \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$FAULTLANE_PUBLIC_DEMO_PROJECT_ID/artifact-upload-tokens")"
+new_upload_token="$(json_field token <<<"$new_token_response")"
+curl --fail --silent --show-error \
+  -X DELETE \
+  -H "Authorization: Bootstrap $FAULTLANE_BOOTSTRAP_SECRET" \
+  "$FAULTLANE_API_URL/api/v1/projects/$FAULTLANE_PUBLIC_DEMO_PROJECT_ID/artifact-upload-tokens/$upload_token_id" >/dev/null
+old_token_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H "Authorization: Bearer $upload_token" \
+  -H "Content-Type: application/json" \
+  --data '{}' \
+  "$FAULTLANE_API_URL/api/v1/projects/synthetic-demo-game/artifact-uploads")"
+if [[ "$old_token_status" != 401 ]]; then
+  echo "revoked upload token returned $old_token_status" >&2
+  exit 1
+fi
+export FAULTLANE_DEMO_UPLOAD_TOKEN="$new_upload_token"
+
+echo "public demo proof: testing database health failure"
+stop_process "$worker_pid" "$server_executable"
+worker_pid=""
+stop_process "$scheduler_pid" "$server_executable"
+scheduler_pid=""
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  stop postgres >/dev/null
+database_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "$FAULTLANE_API_URL/api/v1/demo/health")"
+if [[ "$database_status" != 503 ]]; then
+  echo "database outage returned $database_status" >&2
+  exit 1
+fi
+docker compose \
+  --project-name "$compose_project" \
+  --env-file .env \
+  -f deploy/docker-compose/compose.yml \
+  up -d --wait postgres >/dev/null
+wait_for_url "$FAULTLANE_API_URL/api/v1/demo/health"
+start_role worker recovered-worker
+worker_pid="$started_pid"
+start_role scheduler recovered-scheduler
+scheduler_pid="$started_pid"
+
+echo "public demo proof passed: $first_refresh"

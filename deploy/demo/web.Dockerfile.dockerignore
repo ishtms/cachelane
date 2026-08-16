@@ -1,0 +1,10 @@
+*
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/
+!apps/web/
+!apps/web/**
+apps/web/.next
+apps/web/node_modules
+apps/web/tsconfig.tsbuildinfo

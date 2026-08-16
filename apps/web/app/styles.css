@@ -538,6 +538,27 @@ button:disabled {
   line-height: 1.6;
 }
 
+.demo-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.demo-date {
+  font-size: clamp(18px, 2vw, 28px) !important;
+  letter-spacing: -0.02em !important;
+  text-transform: capitalize;
+}
+
+.demo-thread + .demo-thread {
+  margin-top: 26px;
+}
+
+.demo-outcome {
+  margin-left: 6px;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -585,6 +606,7 @@ button:disabled {
 }
 
 .dashboard-panel {
+  min-width: 0;
   padding: 26px;
 }
 
@@ -694,6 +716,8 @@ button:disabled {
 }
 
 .table-scroll {
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
 }
 
@@ -1032,7 +1056,8 @@ button:disabled {
   margin: 28px 0 34px;
 }
 
-.issue-title-row h1 {
+.issue-title-row h1,
+.issue-header h1 {
   overflow-wrap: anywhere;
 }
 
