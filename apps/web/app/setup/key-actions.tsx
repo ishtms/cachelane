@@ -12,12 +12,23 @@ import { CreatedSetupResult } from "./created-setup";
 
 const initialState: SetupActionState = {};
 
-export function RotateKey({ projectId }: { projectId: string }) {
+export function RotateKey({
+  projectId,
+  onboardingEnabled,
+}: {
+  projectId: string;
+  onboardingEnabled: boolean;
+}) {
   const action = rotateIngestKey.bind(null, projectId);
   const [state, formAction, pending] = useActionState(action, initialState);
 
   if (state.created) {
-    return <CreatedSetupResult created={state.created} />;
+    return (
+      <CreatedSetupResult
+        created={state.created}
+        onboardingEnabled={onboardingEnabled}
+      />
+    );
   }
 
   return (

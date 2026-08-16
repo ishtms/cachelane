@@ -3,22 +3,36 @@ import Link from "next/link";
 
 import {
   type ExistingSetup,
+  type ProjectOnboarding,
   setupApi,
   setupErrorMessage,
 } from "../../lib/faultlane";
 import { RevokeKey, RotateKey } from "./key-actions";
 import { SetupForm } from "./setup-form";
+import { OnboardingGuide } from "./onboarding-guide";
 
 export const metadata: Metadata = {
   title: "Project setup | FaultLane",
 };
 
-async function ExistingProject({ projectId }: { projectId: string }) {
+async function ExistingProject({
+  projectId,
+  onboardingEnabled,
+}: {
+  projectId: string;
+  onboardingEnabled: boolean;
+}) {
   let existing: ExistingSetup;
+  let onboarding: ProjectOnboarding | null = null;
   try {
     existing = await setupApi<ExistingSetup>(
       `/api/v1/projects/${encodeURIComponent(projectId)}/setup`,
     );
+    if (onboardingEnabled) {
+      onboarding = await setupApi<ProjectOnboarding>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/onboarding`,
+      );
+    }
   } catch (error) {
     return <p className="form-error">{setupErrorMessage(error)}</p>;
   }
@@ -52,8 +66,14 @@ async function ExistingProject({ projectId }: { projectId: string }) {
         >
           Open project dashboard
         </Link>
-        <RotateKey projectId={setup.project.id} />
+        <RotateKey
+          projectId={setup.project.id}
+          onboardingEnabled={onboardingEnabled}
+        />
       </div>
+      {onboarding ? (
+        <OnboardingGuide projectId={setup.project.id} initial={onboarding} />
+      ) : null}
     </section>
   );
 }
@@ -64,6 +84,8 @@ export default async function SetupPage({
   searchParams: Promise<{ project?: string }>;
 }) {
   const { project } = await searchParams;
+  const onboardingEnabled =
+    process.env.FAULTLANE_ONBOARDING_ENABLED?.toLowerCase() === "true";
 
   return (
     <main>
@@ -86,7 +108,14 @@ export default async function SetupPage({
             crash ingest key.
           </p>
         </div>
-        {project ? <ExistingProject projectId={project} /> : <SetupForm />}
+        {project ? (
+          <ExistingProject
+            projectId={project}
+            onboardingEnabled={onboardingEnabled}
+          />
+        ) : (
+          <SetupForm onboardingEnabled={onboardingEnabled} />
+        )}
       </section>
     </main>
   );

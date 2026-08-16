@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/303
 
-Status: Awaiting human approval
+Status: Approved by Ishtmeet Singh on August 16, 2026
 
 ## Context
 
@@ -127,4 +127,4 @@ Rollback disables the flag, restores the prior API, web, and CLI builds, revokes
 
 ## Approval
 
-R3 implementation starts only after Ishtmeet Singh approves this revised plan, including secret handling, polling, the bounded projection, the configuration checker, the explicit crash flag, isolated local staging, manual inspection handoff, cleanup, and rollback.
+Ishtmeet Singh approved this revised plan on August 16, 2026, including secret handling, polling, the bounded projection, the configuration checker, the explicit crash flag, isolated local staging, manual inspection handoff, cleanup, and rollback.

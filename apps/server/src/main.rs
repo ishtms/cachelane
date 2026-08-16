@@ -11,6 +11,7 @@ mod dashboard;
 mod data_rules;
 mod identifiers;
 mod issues;
+mod onboarding;
 mod processor_runner;
 mod project_rollups;
 mod project_setup;

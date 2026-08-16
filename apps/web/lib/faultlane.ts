@@ -110,6 +110,57 @@ export type ExistingSetup = {
   setup: ProjectSetup;
 };
 
+export type ProjectOnboarding = {
+  state:
+    | "waiting"
+    | "received"
+    | "processing"
+    | "missing_symbols"
+    | "readable_issue"
+    | "failed"
+    | "quarantined";
+  event: {
+    id: string;
+    received_at: string;
+    processing_state: string;
+  } | null;
+  release: {
+    id: string | null;
+    version: string;
+    platform: string | null;
+    architecture: string | null;
+    configuration: string | null;
+  } | null;
+  missing_symbols: Array<{
+    required_artifact: "pe" | "pdb";
+    module: string;
+    architecture: string;
+    debug_id: string;
+    code_id: string | null;
+  }>;
+  missing_symbols_truncated: boolean;
+  commands: {
+    check: string;
+    scan: string;
+    token_environment: string;
+    upload: string | null;
+  };
+  issue_path: string | null;
+  diagnostic: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  } | null;
+};
+
+export type ArtifactUploadToken = {
+  id: string;
+  project_id: string;
+  token: string;
+  display_suffix: string;
+  created_at: string;
+};
+
 export type ProjectDataRules = {
   version: number;
   redaction_patterns: string[];

@@ -37,6 +37,7 @@ pub(crate) struct ServerState {
     ingest_base_url: String,
     crash_ingest: crate::crash_ingest::CrashIngest,
     dashboard_enabled: bool,
+    onboarding_enabled: bool,
     dashboard_rollups_enabled: bool,
     raw_artifact_download_enabled: bool,
     reprocessing_enabled: bool,
@@ -98,6 +99,8 @@ impl ServerState {
             crash_ingest: crate::crash_ingest::CrashIngest::postgres(pool, role)?,
             dashboard_enabled: env::var("FAULTLANE_DASHBOARD_ENABLED")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            onboarding_enabled: env::var("FAULTLANE_ONBOARDING_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             dashboard_rollups_enabled: env::var("FAULTLANE_DASHBOARD_ROLLUPS_ENABLED")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             raw_artifact_download_enabled: env::var("FAULTLANE_RAW_ARTIFACT_DOWNLOAD_ENABLED")
@@ -121,6 +124,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
             dashboard_enabled: false,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: false,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: false,
@@ -143,6 +147,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest,
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -165,6 +170,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::memory(),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -183,6 +189,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -201,6 +208,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -219,6 +227,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: true,
             reprocessing_enabled: true,
@@ -244,6 +253,7 @@ impl ServerState {
                 objects,
             ),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: true,
             reprocessing_enabled: true,
@@ -269,6 +279,7 @@ impl ServerState {
                 objects,
             ),
             dashboard_enabled: true,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: true,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -287,6 +298,7 @@ impl ServerState {
             ingest_base_url: "http://127.0.0.1:8081".to_owned(),
             crash_ingest: crate::crash_ingest::CrashIngest::control_test(pool.clone()),
             dashboard_enabled: false,
+            onboarding_enabled: true,
             dashboard_rollups_enabled: false,
             raw_artifact_download_enabled: false,
             reprocessing_enabled: true,
@@ -326,6 +338,10 @@ impl ServerState {
 
     pub(crate) fn dashboard_enabled(&self) -> bool {
         self.dashboard_enabled
+    }
+
+    pub(crate) fn onboarding_enabled(&self) -> bool {
+        self.onboarding_enabled
     }
 
     pub(crate) fn dashboard_rollups_enabled(&self) -> bool {
@@ -432,6 +448,10 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
             .merge(crate::auth::router())
             .route("/api/v1/setup", post(create_setup))
             .route("/api/v1/projects/{project_id}/setup", get(get_setup))
+            .route(
+                "/api/v1/projects/{project_id}/onboarding",
+                get(crate::onboarding::get_onboarding),
+            )
             .route(
                 "/api/v1/projects/{project_id}/ingest-keys",
                 post(rotate_ingest_key).layer(DefaultBodyLimit::max(4 * 1024)),

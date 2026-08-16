@@ -438,6 +438,33 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{project_id}/onboarding:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectOnboarding
+      summary: Get the bounded first-crash onboarding state
+      security:
+        - bootstrapAuthorization: []
+        - sessionAuthorization: []
+      responses:
+        "200":
+          description: Current first-crash onboarding state
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectOnboarding"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/projects/{project_id}/ingest-keys:
     parameters:
       - $ref: "#/components/parameters/ProjectId"
@@ -2353,6 +2380,166 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/IngestKey"
+    ProjectOnboarding:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - event
+        - release
+        - missing_symbols
+        - missing_symbols_truncated
+        - commands
+        - issue_path
+        - diagnostic
+      properties:
+        state:
+          type: string
+          enum:
+            - waiting
+            - received
+            - processing
+            - missing_symbols
+            - readable_issue
+            - failed
+            - quarantined
+        event:
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingEvent"
+            - type: "null"
+        release:
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingRelease"
+            - type: "null"
+        missing_symbols:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/OnboardingMissingSymbol"
+        missing_symbols_truncated:
+          type: boolean
+        commands:
+          $ref: "#/components/schemas/OnboardingCommands"
+        issue_path:
+          type:
+            - string
+            - "null"
+        diagnostic:
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingDiagnostic"
+            - type: "null"
+    OnboardingEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - received_at
+        - processing_state
+      properties:
+        id:
+          type: string
+          format: uuid
+        received_at:
+          type: string
+          format: date-time
+        processing_state:
+          $ref: "#/components/schemas/ProcessingState"
+    OnboardingRelease:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - version
+        - platform
+        - architecture
+        - configuration
+      properties:
+        id:
+          type:
+            - string
+            - "null"
+          format: uuid
+        version:
+          type: string
+          maxLength: 128
+        platform:
+          type:
+            - string
+            - "null"
+          maxLength: 32
+        architecture:
+          type:
+            - string
+            - "null"
+          maxLength: 32
+        configuration:
+          type:
+            - string
+            - "null"
+          maxLength: 32
+    OnboardingMissingSymbol:
+      type: object
+      additionalProperties: false
+      required:
+        - required_artifact
+        - module
+        - architecture
+        - debug_id
+        - code_id
+      properties:
+        required_artifact:
+          type: string
+          enum:
+            - pe
+            - pdb
+        module:
+          type: string
+          maxLength: 256
+        architecture:
+          type: string
+          maxLength: 32
+        debug_id:
+          type: string
+          maxLength: 128
+        code_id:
+          type:
+            - string
+            - "null"
+          maxLength: 128
+    OnboardingCommands:
+      type: object
+      additionalProperties: false
+      required:
+        - check
+        - scan
+        - token_environment
+        - upload
+      properties:
+        check:
+          type: string
+        scan:
+          type: string
+        token_environment:
+          type: string
+        upload:
+          type:
+            - string
+            - "null"
+    OnboardingDiagnostic:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          pattern: ^[a-z0-9][a-z0-9_]{0,63}$
+        message:
+          type: string
+        retryable:
+          type: boolean
     UpdateProjectDataRules:
       type: object
       additionalProperties: false

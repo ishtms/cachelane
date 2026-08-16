@@ -491,7 +491,9 @@ impl<'input> CrashContext<'input> {
             build_version: field_value(runtime, "BuildVersion"),
             engine_version: field_value(runtime, "EngineVersion"),
             platform,
-            architecture: first_field_value(runtime, &["Architecture", "PlatformArchitecture"]),
+            architecture: first_field_value(runtime, &["Architecture", "PlatformArchitecture"])
+                .or_else(|| field_value(platform_properties, "HostArchitecture"))
+                .map(|value| normalized_architecture(&value)),
             build_configuration: field_value(runtime, "BuildConfiguration"),
             command_line: options
                 .include_command_line
@@ -581,6 +583,15 @@ fn first_field_value(
     names: &[&str],
 ) -> Option<String> {
     names.iter().find_map(|name| field_value(section, name))
+}
+
+fn normalized_architecture(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "x64" | "amd64" | "x86_64" => "x86_64".to_owned(),
+        "x86" | "i386" | "i686" => "x86".to_owned(),
+        "aarch64" | "arm64" => "arm64".to_owned(),
+        _ => value.trim().to_owned(),
+    }
 }
 
 fn property(field: CrashContextField<'_, '_>) -> CrashContextProperty {
@@ -943,6 +954,23 @@ C:\Engine\Core.DLL</Modules>
             }]
         );
         assert!(data.unknown_fields.is_empty());
+    }
+
+    #[test]
+    fn uses_the_ue_58_host_architecture_when_runtime_architecture_is_absent() {
+        let data = parse(
+            r"<FGenericCrashContext>
+  <RuntimeProperties>
+    <PlatformName>Windows</PlatformName>
+  </RuntimeProperties>
+  <PlatformProperties>
+    <HostArchitecture>x64</HostArchitecture>
+  </PlatformProperties>
+</FGenericCrashContext>",
+        )
+        .extract(CrashContextExtractionOptions::default());
+
+        assert_eq!(data.architecture.as_deref(), Some("x86_64"));
     }
 
     #[test]

@@ -7,14 +7,23 @@ import { CreatedSetupResult } from "./created-setup";
 
 const initialState: SetupActionState = {};
 
-export function SetupForm() {
+export function SetupForm({
+  onboardingEnabled,
+}: {
+  onboardingEnabled: boolean;
+}) {
   const [state, formAction, pending] = useActionState(
     createSetup,
     initialState,
   );
 
   if (state.created) {
-    return <CreatedSetupResult created={state.created} />;
+    return (
+      <CreatedSetupResult
+        created={state.created}
+        onboardingEnabled={onboardingEnabled}
+      />
+    );
   }
 
   return (

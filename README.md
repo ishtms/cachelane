@@ -46,6 +46,40 @@ Run the command-line application locally with:
 cargo run -p faultlane-cli -- --help
 ```
 
+## First readable Unreal crash
+
+Start the full local stack with `./scripts/dev`, then open `http://127.0.0.1:3000/setup`. The setup page creates the first project and shows the write key once. It also shows the exact generated `DataRouterUrl`, both required Unreal configuration snippets, and live progress from crash receipt through symbolication.
+
+The tracked UE 5.8 sample is under `samples/unreal-5.8-crasher`. It exits normally unless the packaged game receives the exact `-FaultLaneCrash` flag. Package a disposable copy outside the repository from Git Bash:
+
+```bash
+export FAULTLANE_SAMPLE_DATA_ROUTER_URL='http://127.0.0.1:8081/u/<write-key>'
+export FAULTLANE_SAMPLE_OUTPUT='/c/Users/<you>/AppData/Local/Temp/faultlane-first-crash'
+./scripts/package-unreal-sample
+```
+
+The packaging command uses the installed `C:\Program Files\Epic Games\UE_5.8` build by default, writes the injected private configuration and all generated artifacts only to `FAULTLANE_SAMPLE_OUTPUT`, and runs the same bounded configuration check shown in the web guide. Its final JSON reports the disposable project, package, and symbol roots. Set `UNREAL_ENGINE_ROOT` only when UE 5.8 is installed elsewhere.
+
+The check can also be run directly:
+
+```bash
+cargo run --package faultlane-cli -- unreal check '<project-root>' --package '<packaged-build-root>'
+```
+
+Run `package/Windows/FaultLaneCrasher/Binaries/Win64/FaultLaneCrasher-Win64-Shipping.exe` once without the flag to confirm it stays running, then run it with `-unattended -nullrhi -FaultLaneCrash`. The setup page moves through waiting, received, processing, and matching-symbol states. Use the reported `symbols` directory as `<symbol-root>`, copy the scan command, create a one-time artifact upload token, and copy the generated token and upload commands. The upload command includes the detected project, release, architecture, and configuration. Matching PE and PDB uploads trigger reprocessing automatically. The final state links to the readable grouped issue. Add `-FaultLaneCrashSecondary` only alongside the primary flag to produce the separate secondary sample crash.
+
+Keep `./scripts/dev` running while inspecting the issue. Press Ctrl+C in that terminal to stop the application roles. To stop local PostgreSQL and MinIO while keeping their data, run:
+
+```bash
+docker compose --project-name "${FAULTLANE_COMPOSE_PROJECT:-faultlane}" --env-file .env -f deploy/docker-compose/compose.yml stop postgres minio
+```
+
+To remove the disposable packaged project, delete the exact `FAULTLANE_SAMPLE_OUTPUT` directory you selected. To also remove this worktree's local database and object-store volumes, run the following only after checking the Compose project name:
+
+```bash
+docker compose --project-name "${FAULTLANE_COMPOSE_PROJECT:-faultlane}" --env-file .env -f deploy/docker-compose/compose.yml down --volumes --remove-orphans
+```
+
 After creating a project-scoped artifact upload token through the control API, upload a Windows release with:
 
 ```bash

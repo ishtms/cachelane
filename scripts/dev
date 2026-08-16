@@ -13,6 +13,21 @@ set -a
 source .env
 set +a
 
+if [[ -z "${FAULTLANE_WORKER_SCRATCH_DIR:-}" ]]; then
+  worker_scope="${FAULTLANE_COMPOSE_PROJECT:-faultlane}"
+  if [[ ! "$worker_scope" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
+    echo "invalid Compose project name for worker scratch" >&2
+    exit 2
+  fi
+  worker_temp_root="${TEMP:-${TMPDIR:-/tmp}}"
+  if command -v cygpath >/dev/null 2>&1; then
+    worker_temp_root="$(cygpath -u "$worker_temp_root")"
+    export FAULTLANE_WORKER_SCRATCH_DIR="$(cygpath -w "$worker_temp_root/faultlane-worker-$worker_scope")"
+  else
+    export FAULTLANE_WORKER_SCRATCH_DIR="$worker_temp_root/faultlane-worker-$worker_scope"
+  fi
+fi
+
 docker compose \
   --project-name "${FAULTLANE_COMPOSE_PROJECT:-faultlane}" \
   --env-file .env \

@@ -1,0 +1,13 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Samples",
+  "Description": "Packaged crash sample for the FaultLane local onboarding flow.",
+  "Modules": [
+    {
+      "Name": "FaultLaneCrasher",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
