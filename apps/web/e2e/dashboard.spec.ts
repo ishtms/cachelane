@@ -35,7 +35,17 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await expect(
     page.getByRole("heading", { name: "Windows Game", exact: true }),
   ).toBeVisible();
+  const favicon = await page.request.get("/favicon.ico");
+  expect(favicon.status()).toBe(200);
+  expect(favicon.headers()["content-type"]).toContain("image/svg+xml");
   await expect(page.getByText("Authoritative billing cycle")).toBeVisible();
+  await expect(page.locator(".issue-table tbody .status").first()).toHaveText(
+    "open",
+  );
+  const timelineDays = await page
+    .locator(".event-chart tbody tr td:first-child")
+    .allTextContents();
+  expect(timelineDays).toEqual([...timelineDays].sort().reverse());
   await expect(page.getByRole("link", { name: "Next page" })).toBeVisible();
   await page.getByRole("link", { name: "Next page" }).click();
   await expect(page).toHaveURL(/cursor=/);
@@ -151,13 +161,22 @@ test("triages readable and missing-symbol crashes without leaking sensitive acce
   await page
     .getByLabel("Literal redaction patterns, one per line")
     .fill("browser-proof-secret");
+  await expect(
+    page.getByLabel("Literal redaction patterns, one per line"),
+  ).toHaveCSS("background-color", "rgb(8, 11, 16)");
+  await expect(
+    page.getByLabel("Literal redaction patterns, one per line"),
+  ).toHaveCSS("border-left-width", "1px");
   await page.getByLabel("Indexed GameData keys, one per line").fill("MapName");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Save data rules" }).click();
   await expect(page.locator(".data-rules-form .action-status")).toContainText(
     "Existing events are queued for reprocessing.",
   );
-  await page.getByLabel("Raw retention days").fill("6");
+  const rawRetention = page.getByLabel("Raw retention days");
+  await expect(rawRetention).toHaveCSS("background-color", "rgb(8, 11, 16)");
+  await expect(rawRetention).toHaveCSS("border-left-width", "1px");
+  await rawRetention.fill("6");
   await page.getByRole("button", { name: "Save usage settings" }).click();
   await expect(
     page.locator(".usage-settings-form .action-status"),

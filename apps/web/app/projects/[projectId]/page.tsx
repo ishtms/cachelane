@@ -225,6 +225,7 @@ export default async function ProjectPage({
     1,
     ...overview.events_over_time.map((bucket) => bucket.count),
   );
+  const recentEvents = [...overview.events_over_time].reverse();
 
   return (
     <main className="dashboard-main">
@@ -416,10 +417,8 @@ export default async function ProjectPage({
                       <code>{issue.issue_id}</code>
                     </td>
                     <td>
-                      <span
-                        className={`status status-${issue.regression_state}`}
-                      >
-                        {issue.regression_state}
+                      <span className={`status status-${issue.status}`}>
+                        {issue.status}
                       </span>
                     </td>
                     <td>{formatNumber(issue.event_count)}</td>
@@ -459,7 +458,7 @@ export default async function ProjectPage({
                 </tr>
               </thead>
               <tbody>
-                {overview.events_over_time.map((bucket) => (
+                {recentEvents.map((bucket) => (
                   <tr key={bucket.day}>
                     <td>{bucket.day}</td>
                     <td>{formatNumber(bucket.count)}</td>

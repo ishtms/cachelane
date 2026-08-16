@@ -5,6 +5,9 @@ import "./styles.css";
 export const metadata: Metadata = {
   title: "FaultLane",
   description: "Unreal-native crash analytics and symbolication",
+  icons: {
+    icon: "/favicon.ico",
+  },
 };
 
 export const viewport: Viewport = {

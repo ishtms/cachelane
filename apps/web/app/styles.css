@@ -753,6 +753,24 @@ button:disabled {
   font-size: 13px;
 }
 
+.data-rules-form textarea,
+.usage-settings-form input[type="number"] {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid #303946;
+  border-radius: 7px;
+  outline: none;
+  background: #080b10;
+  color: var(--text);
+  font: inherit;
+}
+
+.data-rules-form textarea:focus,
+.usage-settings-form input[type="number"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgb(124 246 199 / 10%);
+}
+
 .data-rules-form textarea {
   min-height: 150px;
   resize: vertical;
