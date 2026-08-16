@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+control_file="${FAULTLANE_DEMO_CONTROL_FILE:-}"
+if [[ -z "$control_file" || ! -f "$control_file" ]]; then
+  echo "FAULTLANE_DEMO_CONTROL_FILE must name the protected control environment" >&2
+  exit 2
+fi
+control_file="$(cd "$(dirname "$control_file")" && pwd -P)/$(basename "$control_file")"
+
+set -a
+source "$control_file"
+set +a
+
+if [[ -z "${FAULTLANE_DEMO_ENV_FILE:-}" || ! -f "$FAULTLANE_DEMO_ENV_FILE" ]]; then
+  echo "FAULTLANE_DEMO_ENV_FILE must name the protected application environment" >&2
+  exit 2
+fi
+application_file="$(cd "$(dirname "$FAULTLANE_DEMO_ENV_FILE")" && pwd -P)/$(basename "$FAULTLANE_DEMO_ENV_FILE")"
+export FAULTLANE_DEMO_ENV_FILE="$application_file"
+
+set -a
+source "$application_file"
+set +a
+
+project="${FAULTLANE_DEMO_COMPOSE_PROJECT:-}"
+scratch="${FAULTLANE_DEMO_PROCESSOR_SCRATCH:-}"
+if [[ ! "$project" =~ ^faultlane-demo-[a-z0-9-]+$ ]]; then
+  echo "FAULTLANE_DEMO_COMPOSE_PROJECT is invalid" >&2
+  exit 2
+fi
+if [[ ! "$scratch" =~ ^/var/lib/faultlane-demo/[a-z0-9/_-]+$ ]]; then
+  echo "FAULTLANE_DEMO_PROCESSOR_SCRATCH is outside the dedicated demo path" >&2
+  exit 2
+fi
+
+for name in \
+  FAULTLANE_DEMO_SERVER_IMAGE \
+  FAULTLANE_DEMO_WEB_IMAGE \
+  FAULTLANE_DEMO_POSTGRES_IMAGE \
+  FAULTLANE_DEMO_MINIO_IMAGE \
+  FAULTLANE_DEMO_CLOUDFLARED_IMAGE \
+  FAULTLANE_PROCESSOR_IMAGE; do
+  value="${!name:-}"
+  if [[ ! "$value" =~ @sha256:[a-f0-9]{64}$ ]]; then
+    echo "$name must use an immutable sha256 digest" >&2
+    exit 2
+  fi
+done
+
+if [[ ! "${FAULTLANE_DEMO_DOCKER_GID:-}" =~ ^[0-9]+$ ]]; then
+  echo "FAULTLANE_DEMO_DOCKER_GID is invalid" >&2
+  exit 2
+fi
+if [[ ! "${POSTGRES_DB:-}" =~ ^[a-z][a-z0-9_]{0,62}$ \
+  || ! "${POSTGRES_USER:-}" =~ ^[a-z][a-z0-9_]{0,62}$ \
+  || ! "${POSTGRES_PASSWORD:-}" =~ ^[A-Za-z0-9_-]{32,128}$ ]]; then
+  echo "PostgreSQL demo credentials are invalid" >&2
+  exit 2
+fi
+minio_password="${MINIO_ROOT_PASSWORD:-}"
+rate_secret="${FAULTLANE_RATE_LIMIT_SECRET:-}"
+bootstrap_secret="${FAULTLANE_BOOTSTRAP_SECRET:-}"
+if [[ -z "${MINIO_ROOT_USER:-}" \
+  || ${#minio_password} -lt 32 \
+  || "${AWS_ACCESS_KEY_ID:-}" != "$MINIO_ROOT_USER" \
+  || "${AWS_SECRET_ACCESS_KEY:-}" != "$minio_password" ]]; then
+  echo "MinIO demo credentials are invalid or inconsistent" >&2
+  exit 2
+fi
+if [[ ${#rate_secret} -lt 32 \
+  || ${#bootstrap_secret} -lt 32 \
+  || -z "${TUNNEL_TOKEN:-}" ]]; then
+  echo "demo application and tunnel secrets are required" >&2
+  exit 2
+fi
+
+mkdir -p -- "$scratch"
+chown 65532:65532 "$scratch"
+chmod 0700 "$scratch"
+compose=(docker compose --project-name "$project" -f deploy/demo/compose.yml)
+
+"${compose[@]}" config --quiet
+"${compose[@]}" pull
+docker image inspect "$FAULTLANE_PROCESSOR_IMAGE" >/dev/null
+"${compose[@]}" --profile tools run --rm minio-init
+"${compose[@]}" --profile tools run --rm migrate
+"${compose[@]}" up -d --wait api ingest worker scheduler web cloudflared
+
+api_port="${FAULTLANE_DEMO_OPERATOR_API_PORT:-8080}"
+ingest_port="${FAULTLANE_DEMO_OPERATOR_INGEST_PORT:-8081}"
+curl --fail --silent --show-error "http://127.0.0.1:$api_port/health/ready" >/dev/null
+curl --fail --silent --show-error "http://127.0.0.1:$ingest_port/health/ready" >/dev/null
+
+if [[ "${FAULTLANE_PUBLIC_DEMO_ENABLED:-false}" == true ]]; then
+  curl --fail --silent --show-error "http://127.0.0.1:$api_port/api/v1/demo/health" >/dev/null
+fi
+
+echo "demo services are healthy for $project"

@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+required() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ -z "$value" ]]; then
+    echo "$name is required" >&2
+    exit 2
+  fi
+  printf '%s' "$value"
+}
+
+api_url="$(required FAULTLANE_DEMO_API_URL)"
+ingest_url="$(required FAULTLANE_DEMO_INGEST_URL)"
+project_id="$(required FAULTLANE_DEMO_PROJECT_ID)"
+project_slug="$(required FAULTLANE_DEMO_PROJECT_SLUG)"
+ingest_key="$(required FAULTLANE_DEMO_INGEST_KEY)"
+upload_token="$(required FAULTLANE_DEMO_UPLOAD_TOKEN)"
+operator_authorization="$(required FAULTLANE_DEMO_OPERATOR_AUTHORIZATION)"
+
+if [[ ! "$api_url" =~ ^https?://[^/]+$ || ! "$ingest_url" =~ ^https?://[^/]+$ ]]; then
+  echo "demo URLs must be absolute origins without paths" >&2
+  exit 2
+fi
+if [[ ! "$project_id" =~ ^[a-f0-9-]{36}$ \
+  || ! "$project_slug" =~ ^synthetic-demo-[a-z0-9-]+$ \
+  || ! "$ingest_key" =~ ^clpk_[a-f0-9]{64}$ \
+  || ! "$upload_token" =~ ^clsu_[a-f0-9]{64}$ ]]; then
+  echo "demo credentials or project identity are invalid" >&2
+  exit 2
+fi
+if [[ "$api_url" =~ ^http:// && "$api_url" != http://127.0.0.1:* \
+  && "${FAULTLANE_DEMO_ALLOW_HTTP:-false}" != true ]]; then
+  echo "remote demo API must use HTTPS" >&2
+  exit 2
+fi
+if [[ "$ingest_url" =~ ^http:// && "$ingest_url" != http://127.0.0.1:* \
+  && "${FAULTLANE_DEMO_ALLOW_HTTP:-false}" != true ]]; then
+  echo "remote demo ingest must use HTTPS" >&2
+  exit 2
+fi
+
+cli="${FAULTLANE_DEMO_CLI:-$repo_root/target/release/faultlane}"
+if [[ ! -x "$cli" && -x "$cli.exe" ]]; then
+  cli="$cli.exe"
+fi
+if [[ ! -x "$cli" ]]; then
+  echo "FaultLane CLI is required at $cli" >&2
+  exit 1
+fi
+
+fixture_root="$repo_root/apps/cli/tests/fixtures/windows-symbolication"
+for fixture in \
+  faultlane-symbolication.dmp \
+  faultlane-symbolication.exe \
+  faultlane-symbolication.pdb; do
+  if [[ ! -f "$fixture_root/$fixture" ]]; then
+    echo "missing synthetic fixture: $fixture" >&2
+    exit 1
+  fi
+done
+
+refresh_directory="$(mktemp -d -t faultlane-public-demo.XXXXXX)"
+refresh_directory="$(cd "$refresh_directory" && pwd -P)"
+refresh_parent="$(dirname "$refresh_directory")"
+refresh_name="$(basename "$refresh_directory")"
+
+cleanup() {
+  local status="$?"
+  trap - EXIT INT TERM
+  if [[ "$refresh_name" =~ ^faultlane-public-demo\.[A-Za-z0-9]+$ \
+    && "$refresh_directory" == "$refresh_parent/$refresh_name" ]]; then
+    rm -rf -- "$refresh_directory" || status=1
+  else
+    echo "public demo temporary directory was not removed" >&2
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+json_field() {
+  local path="$1"
+  node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const path = process.argv[1].split(".");
+      const value = path.reduce((current, field) => current[field], JSON.parse(input));
+      process.stdout.write(value === null || value === undefined ? "" : String(value));
+    });
+  ' "$path"
+}
+
+wait_for_state() {
+  local event_id="$1"
+  local expected="$2"
+  local response=""
+  local state=""
+  for _ in $(seq 1 240); do
+    response="$(curl --fail --silent --show-error \
+      -H "Authorization: $operator_authorization" \
+      "$api_url/api/v1/projects/$project_id/events/$event_id")"
+    state="$(json_field state <<<"$response")"
+    if [[ "$state" == "$expected" ]]; then
+      printf '%s' "$response"
+      return 0
+    fi
+    if [[ "$state" =~ ^(failed|quarantined)$ ]]; then
+      echo "event $event_id entered $state" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "event $event_id did not reach $expected" >&2
+  return 1
+}
+
+wait_for_state_match() {
+  local event_id="$1"
+  local expected="$2"
+  local response=""
+  local state=""
+  for _ in $(seq 1 240); do
+    response="$(curl --fail --silent --show-error \
+      -H "Authorization: $operator_authorization" \
+      "$api_url/api/v1/projects/$project_id/events/$event_id")"
+    state="$(json_field state <<<"$response")"
+    if [[ "$state" =~ $expected ]]; then
+      printf '%s' "$response"
+      return 0
+    fi
+    if [[ "$state" =~ ^(failed|quarantined)$ ]]; then
+      echo "event $event_id entered $state" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "event $event_id did not reach $expected" >&2
+  return 1
+}
+
+upload_release() {
+  local release="$1"
+  local timestamp="$2"
+  local artifact_root="${3:-$fixture_root}"
+  FAULTLANE_TOKEN="$upload_token" "$cli" symbols upload \
+    "$artifact_root" \
+    --project "$project_slug" \
+    --release "$release" \
+    --configuration shipping \
+    --revision synthetic-demo \
+    --channel staging \
+    --build-timestamp "$timestamp" \
+    --ci-job public-demo-refresh \
+    --api-url "$api_url"
+}
+
+negotiate_without_upload() {
+  local release="$1"
+  local timestamp="$2"
+  local artifact_root="${3:-$fixture_root}"
+  local node_artifact_root="$artifact_root"
+  local scan=""
+  local request=""
+  if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+    node_artifact_root="$(cygpath -w "$artifact_root")"
+  fi
+  scan="$("$cli" symbols scan "$artifact_root")"
+  request="$(
+    SCAN="$scan" \
+      RELEASE="$release" \
+      BUILD_TIMESTAMP="$timestamp" \
+      ARTIFACT_ROOT="$node_artifact_root" \
+      node -e '
+        const crypto = require("node:crypto");
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const scan = JSON.parse(process.env.SCAN);
+        const artifacts = scan.artifacts.map(artifact => ({
+          path: artifact.path,
+          module: artifact.module,
+          artifact_type: artifact.artifact_type,
+          architecture: artifact.architecture,
+          byte_size: artifact.size,
+          sha256: crypto.createHash("sha256")
+            .update(fs.readFileSync(path.join(process.env.ARTIFACT_ROOT, artifact.path)))
+            .digest("hex"),
+          debug_id: artifact.debug_id,
+          code_id: artifact.code_id,
+        }));
+        process.stdout.write(JSON.stringify({
+          release: {
+            version: process.env.RELEASE,
+            platform: "windows",
+            architecture: "x86_64",
+            configuration: "shipping",
+            revision: "synthetic-demo",
+            channel: "staging",
+            build_timestamp: process.env.BUILD_TIMESTAMP,
+          },
+          artifacts,
+          cli_version: "0.1.0",
+          ci_job: "public-demo-refresh",
+        }));
+      '
+  )"
+  curl --fail --silent --show-error \
+    -H "Authorization: Bearer $upload_token" \
+    -H "Content-Type: application/json" \
+    --data "$request" \
+    "$api_url/api/v1/projects/$project_slug/artifact-uploads" >/dev/null
+}
+
+submit_bundle() {
+  local path="$1"
+  local release="$2"
+  local response=""
+  response="$(curl --fail --silent --show-error \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$path" \
+    "$ingest_url/u/$ingest_key?AppID=SyntheticDemo&AppVersion=$release&AppEnvironment=demo&UploadType=crashreports&UserID=")"
+  printf '%s' "$response"
+}
+
+wait_for_release_ready() {
+  local release_id="$1"
+  local coverage=""
+  for _ in $(seq 1 240); do
+    coverage="$(curl --fail --silent --show-error \
+      -H "Authorization: Bearer $upload_token" \
+      "$api_url/api/v1/releases/$release_id/coverage")"
+    if [[ "$(json_field coverage.ready <<<"$coverage")" == true ]]; then
+      return
+    fi
+    sleep 1
+  done
+  echo "release $release_id did not become ready" >&2
+  return 1
+}
+
+readable_release="demo-readable-1"
+reprocessed_release="demo-reprocessed-1"
+missing_release="demo-missing-1"
+existing_issue_list="$(curl --fail --silent --show-error \
+  -H "Authorization: $operator_authorization" \
+  "$api_url/api/v1/projects/$project_id/issues")"
+existing_issue_count="$(
+  ISSUE_LIST="$existing_issue_list" node -e '
+    const value = JSON.parse(process.env.ISSUE_LIST);
+    process.stdout.write(String(value.items.length));
+  '
+)"
+dataset_complete=false
+if [[ "$existing_issue_count" =~ ^[0-9]+$ && "$existing_issue_count" -ge 4 ]]; then
+  dataset_complete=true
+fi
+reprocessed_root="$refresh_directory/reprocessed-symbols"
+missing_root="$refresh_directory/missing-symbols"
+mkdir "$reprocessed_root" "$missing_root"
+for artifact_root in "$reprocessed_root" "$missing_root"; do
+  cp "$fixture_root/faultlane-symbolication.exe" "$artifact_root/"
+  cp "$fixture_root/faultlane-symbolication.pdb" "$artifact_root/"
+done
+printf '\0' >>"$reprocessed_root/faultlane-symbolication.exe"
+printf '\0' >>"$reprocessed_root/faultlane-symbolication.pdb"
+printf '\0\0' >>"$missing_root/faultlane-symbolication.exe"
+printf '\0\0' >>"$missing_root/faultlane-symbolication.pdb"
+if [[ "$dataset_complete" == false ]]; then
+  upload_release "$readable_release" "2026-08-16T00:00:00Z" >/dev/null
+fi
+
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const zlib = require("node:zlib");
+  const dump = fs.readFileSync(process.argv[1]);
+  const destination = process.argv[2];
+  const integer = value => {
+    const output = Buffer.alloc(4);
+    output.writeInt32LE(value);
+    return output;
+  };
+  const field = value => {
+    const output = Buffer.alloc(264);
+    output.writeInt32LE(260);
+    output.write(value, 4, "ascii");
+    return output;
+  };
+  const create = (name, guid, release, crashType, message) => {
+    const xml = Buffer.from(`
+      <FGenericCrashContext><RuntimeProperties>
+        <CrashGUID>${guid}</CrashGUID>
+        <CrashType>${crashType}</CrashType>
+        <ErrorMessage>${message}</ErrorMessage>
+        <BuildVersion>${release}</BuildVersion>
+        <EngineVersion>5.8.1</EngineVersion>
+        <PlatformName>Win64</PlatformName>
+        <PlatformArchitecture>x86_64</PlatformArchitecture>
+        <BuildConfiguration>Shipping</BuildConfiguration>
+        <UserDescription>Synthetic public demo crash</UserDescription>
+      </RuntimeProperties><PlatformProperties>
+        <PlatformIsRunningWindows>1</PlatformIsRunningWindows>
+      </PlatformProperties><GameData>
+        <MapName>SyntheticArena</MapName>
+      </GameData></FGenericCrashContext>
+    `);
+    const log = Buffer.from("LogFaultLane: synthetic public demo crash\n");
+    const parts = [
+      Buffer.from("CR1"),
+      field(guid),
+      field(`${guid}.uecrash`),
+      integer(0),
+      integer(3),
+      integer(0),
+      field("CrashContext.runtime-xml"),
+      integer(xml.length),
+      xml,
+      integer(1),
+      field("UEMinidump.dmp"),
+      integer(dump.length),
+      dump,
+      integer(2),
+      field("Project.log"),
+      integer(log.length),
+      log,
+    ];
+    const expanded = Buffer.concat(parts);
+    expanded.writeInt32LE(expanded.length, 531);
+    fs.writeFileSync(path.join(destination, `${name}.bundle`), zlib.deflateSync(expanded));
+  };
+  create("readable-a", "UECC-Synthetic-Demo-364-Readable-A", "demo-readable-1", "Crash", "Synthetic arena access violation");
+  create("readable-b", "UECC-Synthetic-Demo-364-Readable-B", "demo-readable-1", "Crash", "Synthetic arena access violation");
+  create("distinct", "UECC-Synthetic-Demo-364-Distinct", "demo-readable-1", "Assert", "Synthetic distinct assertion");
+  create("reprocessed", "UECC-Synthetic-Demo-364-Reprocessed", "demo-reprocessed-1", "Crash", "Synthetic symbol refresh");
+  create("missing", "UECC-Synthetic-Demo-364-Missing", "demo-missing-1", "Assert", "Synthetic missing symbols");
+' "$fixture_root/faultlane-symbolication.dmp" "$refresh_directory"
+
+readable_a_response="$(submit_bundle "$refresh_directory/readable-a.bundle" "$readable_release")"
+readable_b_response="$(submit_bundle "$refresh_directory/readable-b.bundle" "$readable_release")"
+distinct_response="$(submit_bundle "$refresh_directory/distinct.bundle" "$readable_release")"
+reprocessed_response="$(submit_bundle "$refresh_directory/reprocessed.bundle" "$reprocessed_release")"
+missing_response="$(submit_bundle "$refresh_directory/missing.bundle" "$missing_release")"
+
+readable_a="$(json_field event_id <<<"$readable_a_response")"
+readable_b="$(json_field event_id <<<"$readable_b_response")"
+distinct="$(json_field event_id <<<"$distinct_response")"
+reprocessed="$(json_field event_id <<<"$reprocessed_response")"
+missing="$(json_field event_id <<<"$missing_response")"
+reprocessed_existing="$(json_field deduplicated <<<"$reprocessed_response")"
+missing_existing="$(json_field deduplicated <<<"$missing_response")"
+
+if [[ "$dataset_complete" == false && "$reprocessed_existing" == false ]]; then
+  negotiate_without_upload "$reprocessed_release" "2026-08-17T00:00:00Z" "$reprocessed_root"
+fi
+if [[ "$dataset_complete" == false && "$missing_existing" == false ]]; then
+  negotiate_without_upload "$missing_release" "2026-08-18T00:00:00Z" "$missing_root"
+fi
+
+readable_a_state="$(wait_for_state "$readable_a" processed)"
+readable_b_state="$(wait_for_state "$readable_b" processed)"
+distinct_state="$(wait_for_state "$distinct" processed)"
+wait_for_state_match "$reprocessed" '^(awaiting_symbols|processed)$' >/dev/null
+wait_for_state "$missing" awaiting_symbols >/dev/null
+
+readable_issue="$(json_field issue_id <<<"$readable_a_state")"
+repeat_issue="$(json_field issue_id <<<"$readable_b_state")"
+distinct_issue="$(json_field issue_id <<<"$distinct_state")"
+if [[ -z "$readable_issue" || "$readable_issue" != "$repeat_issue" \
+  || "$readable_issue" == "$distinct_issue" ]]; then
+  echo "synthetic grouping proof failed" >&2
+  exit 1
+fi
+
+if [[ "$dataset_complete" == false && "$reprocessed_existing" == false ]]; then
+  reprocessed_upload="$(
+    upload_release "$reprocessed_release" "2026-08-17T00:00:00Z" "$reprocessed_root"
+  )"
+  reprocessed_release_id="$(json_field release.id <<<"$reprocessed_upload")"
+  wait_for_release_ready "$reprocessed_release_id"
+  curl --fail --silent --show-error \
+    -H "Authorization: $operator_authorization" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: public-demo-reprocessed-364" \
+    --data "{\"scope\":{\"kind\":\"event\",\"event_id\":\"$reprocessed\"},\"limit\":1}" \
+    "$api_url/api/v1/projects/$project_id/reprocessing" >/dev/null
+fi
+wait_for_state "$reprocessed" processed >/dev/null
+
+issue_list="$(curl --fail --silent --show-error \
+  -H "Authorization: $operator_authorization" \
+  "$api_url/api/v1/projects/$project_id/issues")"
+issue_count="$(
+  ISSUE_LIST="$issue_list" node -e '
+    const value = JSON.parse(process.env.ISSUE_LIST);
+    process.stdout.write(String(value.items.length));
+  '
+)"
+if [[ ! "$issue_count" =~ ^[0-9]+$ || "$issue_count" -lt 3 ]]; then
+  echo "synthetic demo did not produce the expected issue set" >&2
+  exit 1
+fi
+
+if [[ -n "${FAULTLANE_DEMO_PUBLIC_URL:-}" ]]; then
+  public_url="$FAULTLANE_DEMO_PUBLIC_URL"
+  if [[ ! "$public_url" =~ ^https?://[^/]+$ ]]; then
+    echo "FAULTLANE_DEMO_PUBLIC_URL must be an absolute origin" >&2
+    exit 2
+  fi
+  if [[ "$public_url" =~ ^http:// && "$public_url" != http://127.0.0.1:* \
+    && "${FAULTLANE_DEMO_ALLOW_HTTP:-false}" != true ]]; then
+    echo "remote public demo must use HTTPS" >&2
+    exit 2
+  fi
+  public_page="$(curl --fail --silent --show-error "$public_url/demo")"
+  if [[ "$public_page" != *"Synthetic UE 5.8 data"* \
+    || "$public_page" != *"Read-only"* ]]; then
+    echo "public demo page is not marked synthetic and read-only" >&2
+    exit 1
+  fi
+fi
+
+echo "public demo refresh passed: issues=$issue_count events=5"

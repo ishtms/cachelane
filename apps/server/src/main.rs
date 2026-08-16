@@ -15,6 +15,7 @@ mod onboarding;
 mod processor_runner;
 mod project_rollups;
 mod project_setup;
+mod public_demo;
 mod reprocessing;
 mod symbol_upload;
 mod usage;

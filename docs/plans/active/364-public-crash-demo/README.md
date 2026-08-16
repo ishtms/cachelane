@@ -2,7 +2,7 @@
 
 Issue: https://github.com/ishtms/faultlane/issues/364
 
-Status: Blocked on #303, local measurements, provider decision, and human approval
+Status: In progress. Local implementation and certification are complete; external deployment is blocked on dedicated provider and Cloudflare credentials.
 
 ## Context
 
@@ -42,6 +42,12 @@ The blast radius is one isolated nonproduction demo environment, dedicated synth
 - The isolated processor requires a Docker-capable runtime with no network and strict resource limits.
 - The repository has local PostgreSQL and MinIO composition but no approved hosted target, deployment workflow, public URL, managed database, or production credentials.
 - #303 owns the interactive local workflow and runtime measurements. #307 owns the later complete self-hosted release, backup, restore, upgrades, signed artifacts, SBOM, and licensing work.
+- The verified local roles used about 0.67 GB at idle: application processes used 530,550,784 bytes, PostgreSQL used 52.95 MiB, and MinIO used 85.21 MiB.
+- The local PostgreSQL data used 67,992 KiB, MinIO used 880 KiB, and the processor image used 34,562,756 bytes. Processor isolation remains one CPU, 2 GiB memory, 64 MiB scratch, and 150 seconds wall time.
+- The #303 workflow is present at milestone commit `32cebb0`.
+- The local public demo proof passed on August 17, 2026, including deterministic refresh, read-only SQL enforcement, mutation denial, tenant isolation, browser confinement, restart, credential rotation, kill switch, and database failure behavior.
+- `./scripts/check-fast` and the complete `./scripts/check` passed on August 17, 2026. The complete check took 1,108.9 seconds and included all configured PostgreSQL integration tests, release builds, repository checks, fuzz smoke tests, and browser proof.
+- The locally built `faultlane-demo-web:review` image ID is `sha256:47d1919aab97df68aa36a82e22f2a9e7e5ed9ea1fcd0ec7e56ae7b35eaa2ab1f`, and the `faultlane-demo-server:review` image ID is `sha256:1b0b60a18424949b300d423d70e0f73e60bb340992eac532a805bdffc4762d4a`. Published registry digests still need to be recorded after external credentials are available.
 
 ## Proposed design
 
@@ -57,19 +63,25 @@ The public web view calls only the dedicated demo reads. It contains no token, s
 
 Use an idempotent operator proof that exercises public APIs with dedicated credentials. Create separate synthetic releases or crashes so the final dataset retains both missing-symbol and readable examples after reprocessing. Include repeated equivalent crashes and one materially distinct crash. Do not seed through SQL or copy private fixtures into the environment.
 
-### Deployment candidate and provider decision
+### Deployment target and provider decision
 
-The default candidate is one small Linux VM running the same containerized roles, PostgreSQL, and MinIO on encrypted persistent volumes, with Cloudflare providing DNS, TLS proxying, basic edge protection, and traffic visibility. This matches the self-hosted architecture, supports the Docker processor boundary, and minimizes idle managed-service cost for a no-user demo.
+Use one Hetzner CX33-class VM in Germany with four shared vCPUs, 8 GB RAM, and 80 GB local storage. The [listed price after June 15, 2026](https://docs.hetzner.com/general/infrastructure-and-availability/price-adjustment/) is EUR 8.49 per month before IPv4 and VAT. This leaves room for the measured 0.67 GB idle footprint and the existing 2 GiB processor boundary without adding managed services. Take one provider snapshot before an application upgrade and retain the prior immutable image digests as the application rollback target.
 
-Do not select a VM provider or size until #303 records peak and idle CPU, memory, disk, object growth, and processor duration. At that point compare current providers on total monthly cost, region, Docker support, persistent disk, backup options, network limits, recovery, and exit path. Record the selected provider and rejected alternatives in an architecture decision before creating resources.
+DigitalOcean was rejected because its [current 4 GB, two vCPU Droplet](https://www.digitalocean.com/pricing/droplets) is USD 24 per month. AWS Lightsail was rejected because its [4 GB, two vCPU Linux bundle](https://aws.amazon.com/lightsail/pricing/) is USD 40 per month. Both offer less memory at a higher idle price for this isolated demo. Managed PostgreSQL and object storage remain out of scope because local PostgreSQL and MinIO use little storage and the demo has no reliability or capacity evidence requiring another service boundary.
 
-Managed PostgreSQL or object storage requires measured reliability or capacity need. It is not the default for the demo because it adds cost and operational boundaries. The application must retain its S3-compatible abstraction so a later move remains possible.
+Use a remotely managed Cloudflare Tunnel for the public hostname. Route only the web container through the outbound tunnel, keep the API and ingest operator ports bound to VM loopback, and block inbound VM traffic. Cloudflare documents [Tunnel firewall behavior](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/) as an outbound-only connector on TCP or UDP port 7844. The protected tunnel token stays in the deployment environment, and the deployed image uses `--no-autoupdate` with an immutable image digest. Configure the public hostname to `http://web:3000`, add the required final catch-all route in the managed tunnel, and apply public edge rate controls. The origin remains unreachable by public IP.
+
+The selected public hostname is still pending the Cloudflare account and zone available to the operator. No provider, Cloudflare, DNS, or production credentials were present in the local or GitHub Actions environment on August 16, 2026, so no external resources have been created.
 
 ### Operations
 
 Build immutable application and processor artifacts from the verified milestone commit. Inject dedicated secrets outside source control. Restrict administrative access, expose only required TLS origins, set disk and container limits, monitor health and queue age, and cap public traffic.
 
 Provide a kill switch that removes anonymous demo access without stopping private ingest and processing. Provide an exact teardown inventory so only the dedicated DNS, VM, volumes, credentials, and synthetic project are removed.
+
+The deployment package uses one exact Compose project, two exact named data volumes, a dedicated processor scratch directory, loopback-only operator ports, fixed container limits, and immutable image references. `scripts/demo-up` validates digests, initializes dependencies, applies migrations, and checks health. `scripts/demo-down` preserves data by default and requires the exact project confirmation before deleting the two verified volumes. The protected application environment controls the public demo flag, fixed organization and project, rate limit, and dedicated application credentials. The separate protected control environment holds the tunnel token and immutable deployment inputs. PostgreSQL, MinIO, web, and Cloudflare Tunnel receive only their required environment values.
+
+The external teardown inventory is the public hostname route and DNS record, one remotely managed tunnel and token, one CX33 VM, its firewall and optional pre-upgrade snapshot, the two named Docker volumes, the processor scratch directory, the dedicated organization and project credentials, and no other account resources. Disable the public flag and remove the hostname route first, revoke the tunnel and application credentials, retain evidence, then delete the verified VM resources.
 
 ## Security analysis
 
@@ -131,10 +143,9 @@ Teardown removes only the resolved resources listed in the approved inventory. R
 
 ## Unresolved decisions
 
-- VM provider, region, size, persistent disk, and backup approach after #303 measurements
-- Domain and subdomain after provider selection
+- Domain and subdomain after the Cloudflare account and zone are available
 - Exact public retention window after the MegaGrant review period
 
 ## Approval
 
-The issue split and local-first order were approved by Ishtmeet Singh on August 16, 2026. External resource creation, DNS changes, public exposure, and the final provider decision require a second explicit approval after #303 measurements and the provider comparison are available.
+The issue split and local-first order were approved by Ishtmeet Singh on August 16, 2026. On August 16, 2026, Ishtmeet Singh also approved the Hetzner and Cloudflare decision, dedicated resource creation, DNS and TLS changes, public exposure, the kill switch, staging, rollback, and exact teardown. The approval is recorded on issue #364. External work can begin once the dedicated provider and Cloudflare credentials are available.

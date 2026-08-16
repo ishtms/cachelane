@@ -1,0 +1,185 @@
+name: ${FAULTLANE_DEMO_COMPOSE_PROJECT:?set FAULTLANE_DEMO_COMPOSE_PROJECT}
+
+x-server: &server
+  image: ${FAULTLANE_DEMO_SERVER_IMAGE:?set FAULTLANE_DEMO_SERVER_IMAGE}
+  restart: unless-stopped
+  env_file:
+    - ${FAULTLANE_DEMO_ENV_FILE:?set FAULTLANE_DEMO_ENV_FILE}
+  environment:
+    DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    OBJECT_STORE_ENDPOINT: http://minio:9000
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  networks:
+    - internal
+
+services:
+  postgres:
+    image: ${FAULTLANE_DEMO_POSTGRES_IMAGE:?set FAULTLANE_DEMO_POSTGRES_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1536m
+    cpus: 1.0
+    networks:
+      - internal
+
+  minio:
+    image: ${FAULTLANE_DEMO_MINIO_IMAGE:?set FAULTLANE_DEMO_MINIO_IMAGE}
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1024m
+    cpus: 0.75
+    networks:
+      - internal
+
+  minio-init:
+    image: ${FAULTLANE_DEMO_MINIO_IMAGE:?set FAULTLANE_DEMO_MINIO_IMAGE}
+    restart: "no"
+    profiles: ["tools"]
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing "local/$${OBJECT_STORE_BUCKET}"
+    networks:
+      - internal
+
+  migrate:
+    <<: *server
+    restart: "no"
+    profiles: ["tools"]
+    command: ["migrate"]
+
+  api:
+    <<: *server
+    command: ["api"]
+    ports:
+      - 127.0.0.1:${FAULTLANE_DEMO_OPERATOR_API_PORT:-8080}:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    mem_limit: 768m
+    cpus: 0.75
+
+  ingest:
+    <<: *server
+    command: ["ingest"]
+    ports:
+      - 127.0.0.1:${FAULTLANE_DEMO_OPERATOR_INGEST_PORT:-8081}:8081
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.5
+
+  worker:
+    <<: *server
+    command: ["worker"]
+    group_add:
+      - ${FAULTLANE_DEMO_DOCKER_GID:?set FAULTLANE_DEMO_DOCKER_GID}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      OBJECT_STORE_ENDPOINT: http://minio:9000
+      FAULTLANE_WORKER_SCRATCH_DIR: ${FAULTLANE_DEMO_PROCESSOR_SCRATCH:?set FAULTLANE_DEMO_PROCESSOR_SCRATCH}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${FAULTLANE_DEMO_PROCESSOR_SCRATCH:?set FAULTLANE_DEMO_PROCESSOR_SCRATCH}:${FAULTLANE_DEMO_PROCESSOR_SCRATCH:?set FAULTLANE_DEMO_PROCESSOR_SCRATCH}
+    mem_limit: 512m
+    cpus: 0.5
+
+  scheduler:
+    <<: *server
+    command: ["scheduler"]
+    mem_limit: 256m
+    cpus: 0.25
+
+  web:
+    image: ${FAULTLANE_DEMO_WEB_IMAGE:?set FAULTLANE_DEMO_WEB_IMAGE}
+    restart: unless-stopped
+    environment:
+      FAULTLANE_API_URL: http://api:8080
+      FAULTLANE_PUBLIC_DEMO_WEB_ONLY: "true"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/demo').then(r=>{if(!r.ok)process.exit(1)})",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.5
+    networks:
+      - internal
+      - edge
+
+  cloudflared:
+    image: ${FAULTLANE_DEMO_CLOUDFLARED_IMAGE:?set FAULTLANE_DEMO_CLOUDFLARED_IMAGE}
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    command: tunnel --no-autoupdate run
+    depends_on:
+      web:
+        condition: service_healthy
+    mem_limit: 128m
+    cpus: 0.25
+    networks:
+      - edge
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.29.11.0/24
+  internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.10.0/24
+
+volumes:
+  minio-data:
+    name: ${FAULTLANE_DEMO_COMPOSE_PROJECT}_minio-data
+  postgres-data:
+    name: ${FAULTLANE_DEMO_COMPOSE_PROJECT}_postgres-data

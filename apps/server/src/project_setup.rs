@@ -44,6 +44,7 @@ pub(crate) struct ServerState {
     symbol_uploads: crate::symbol_upload::SymbolUploads,
     auth: crate::auth::Auth,
     alerts: crate::alerts::Alerts,
+    public_demo: crate::public_demo::PublicDemo,
 }
 
 impl ServerState {
@@ -91,6 +92,8 @@ impl ServerState {
             crate::symbol_upload::SymbolUploads::postgres(pool.clone(), role, host)?;
         let auth = crate::auth::Auth::for_role(pool.clone(), host, role)?;
         let alerts = crate::alerts::Alerts::for_role(role)?;
+        let public_demo = crate::public_demo::PublicDemo::from_environment(role)
+            .map_err(StartupError::InvalidConfiguration)?;
 
         Ok(Self {
             store: ProjectStore::Postgres(pool.clone()),
@@ -110,6 +113,7 @@ impl ServerState {
             symbol_uploads,
             auth,
             alerts,
+            public_demo,
         })
     }
 
@@ -131,6 +135,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::disabled(),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -154,6 +159,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -177,6 +183,7 @@ impl ServerState {
             symbol_uploads,
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -196,6 +203,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -215,6 +223,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::test(key),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -234,6 +243,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test_providers(pool, provider_base_url),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -260,6 +270,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -286,6 +297,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -305,6 +317,7 @@ impl ServerState {
             symbol_uploads: crate::symbol_upload::SymbolUploads::disabled(),
             auth: crate::auth::Auth::test(pool),
             alerts: crate::alerts::Alerts::disabled(),
+            public_demo: crate::public_demo::PublicDemo::default(),
         }
     }
 
@@ -330,6 +343,22 @@ impl ServerState {
 
     pub(crate) fn alerts(&self) -> &crate::alerts::Alerts {
         &self.alerts
+    }
+
+    pub(crate) fn public_demo(&self) -> &crate::public_demo::PublicDemo {
+        &self.public_demo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_public_demo(
+        mut self,
+        organization_id: &str,
+        project_id: &str,
+        rate_limit: u32,
+    ) -> Self {
+        self.public_demo =
+            crate::public_demo::PublicDemo::test(organization_id, project_id, rate_limit);
+        self
     }
 
     pub(crate) fn crash_ingest(&self) -> &crate::crash_ingest::CrashIngest {
@@ -446,6 +475,13 @@ pub(crate) fn router(role: &'static str, state: ServerState) -> Router {
     match role {
         "api" => health
             .merge(crate::auth::router())
+            .route("/api/v1/demo", get(crate::public_demo::get_demo))
+            .route("/api/v1/demo/health", get(crate::public_demo::health))
+            .route("/api/v1/demo/issues", get(crate::public_demo::list_issues))
+            .route(
+                "/api/v1/demo/issues/{issue_key}",
+                get(crate::public_demo::get_issue),
+            )
             .route("/api/v1/setup", post(create_setup))
             .route("/api/v1/projects/{project_id}/setup", get(get_setup))
             .route(
