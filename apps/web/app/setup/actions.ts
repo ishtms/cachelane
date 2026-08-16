@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 
 import {
+  type ArtifactUploadToken,
   type CreatedSetup,
   setupApi,
   setupErrorMessage,
@@ -12,6 +13,7 @@ export type SetupActionState = {
   error?: string;
   created?: CreatedSetup;
   revoked?: boolean;
+  artifactToken?: ArtifactUploadToken;
 };
 
 export async function createSetup(
@@ -30,6 +32,22 @@ export async function createSetup(
       }),
     });
     return { created };
+  } catch (error) {
+    return { error: setupErrorMessage(error) };
+  }
+}
+
+export async function createArtifactUploadToken(
+  projectId: string,
+  _previous: SetupActionState,
+): Promise<SetupActionState> {
+  void _previous;
+  try {
+    const artifactToken = await setupApi<ArtifactUploadToken>(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/artifact-upload-tokens`,
+      { method: "POST" },
+    );
+    return { artifactToken };
   } catch (error) {
     return { error: setupErrorMessage(error) };
   }

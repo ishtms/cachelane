@@ -406,6 +406,47 @@ button:disabled {
   margin-top: 28px;
 }
 
+.onboarding-guide {
+  display: grid;
+  gap: 16px;
+  margin-top: 34px;
+  padding-top: 30px;
+  border-top: 1px solid var(--line);
+}
+
+.onboarding-guide h3 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.onboarding-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.onboarding-command code,
+.one-time-token code {
+  overflow-x: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #080b10;
+  white-space: nowrap;
+}
+
+.one-time-token {
+  display: grid;
+  gap: 10px;
+  color: var(--accent);
+}
+
+.missing-symbols {
+  margin: 0;
+  color: var(--muted);
+}
+
 .form-error {
   color: #ff9c9c;
   font-size: 14px;

@@ -179,6 +179,58 @@ async fn dashboard_routes_are_bounded_scoped_and_stream_exact_artifacts()
         ServerState::dashboard_test(pool.clone(), objects.clone(), SECRET),
     );
 
+    let onboarding_response = app
+        .clone()
+        .oneshot(
+            authorized(
+                Request::builder().uri(format!("/api/v1/projects/{}/onboarding", owned.project)),
+            )
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(onboarding_response.status(), StatusCode::OK);
+    assert_no_store(&onboarding_response);
+    let onboarding = json_body(onboarding_response).await?;
+    assert_eq!(onboarding["state"], "readable_issue");
+    assert_eq!(onboarding["event"]["id"], issue.older_event_id);
+    assert_eq!(
+        onboarding["issue_path"],
+        format!("/projects/{}/issues/{}", owned.project, issue.issue_id)
+    );
+    assert_eq!(onboarding["release"]["version"], "1.0.0");
+    assert!(
+        onboarding["commands"]["upload"]
+            .as_str()
+            .is_some_and(|command| command.contains("--project 'owned-project'"))
+    );
+    assert!(!onboarding.to_string().contains("raw-result-secret"));
+
+    let waiting_response = app
+        .clone()
+        .oneshot(
+            authorized(
+                Request::builder().uri(format!("/api/v1/projects/{empty_project}/onboarding")),
+            )
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(waiting_response.status(), StatusCode::OK);
+    let waiting = json_body(waiting_response).await?;
+    assert_eq!(waiting["state"], "waiting");
+    assert_eq!(waiting["event"], Value::Null);
+    assert_eq!(waiting["commands"]["upload"], Value::Null);
+
+    let outside_onboarding = app
+        .clone()
+        .oneshot(
+            authorized(
+                Request::builder().uri(format!("/api/v1/projects/{}/onboarding", outside.project)),
+            )
+            .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(outside_onboarding.status(), StatusCode::NOT_FOUND);
+
     let overview_response = app
         .clone()
         .oneshot(

@@ -3,6 +3,71 @@ import { expect, test } from "@playwright/test";
 test("creates a project and manages one-time ingest keys", async ({ page }) => {
   const apiUrl = process.env.FAULTLANE_API_URL ?? "http://127.0.0.1:8080";
   const ingestUrl = process.env.FAULTLANE_INGEST_URL ?? "http://127.0.0.1:8081";
+  let onboardingPoll = 0;
+  let readable = false;
+  await page.route("**/api/projects/*/onboarding", async (route) => {
+    onboardingPoll += 1;
+    const state = readable
+      ? "readable_issue"
+      : onboardingPoll === 1
+        ? "received"
+        : onboardingPoll === 2
+          ? "processing"
+          : "missing_symbols";
+    await route.fulfill({
+      contentType: "application/json",
+      headers: { "cache-control": "no-store" },
+      body: JSON.stringify({
+        state,
+        event: {
+          id: "11111111-1111-4111-8111-111111111111",
+          received_at: "2026-08-16T00:00:00Z",
+          processing_state: state === "readable_issue" ? "processed" : state,
+        },
+        release: {
+          id: "22222222-2222-4222-8222-222222222222",
+          version: "1.0.0",
+          platform: "windows",
+          architecture: "x86_64",
+          configuration: "shipping",
+        },
+        missing_symbols:
+          state === "missing_symbols"
+            ? [
+                {
+                  required_artifact: "pdb",
+                  module: "Game.exe",
+                  architecture: "x86_64",
+                  debug_id: "ABC1",
+                  code_id: "DEF1",
+                },
+              ]
+            : [],
+        missing_symbols_truncated: false,
+        commands: {
+          check:
+            "faultlane unreal check '<project-root>' --package '<packaged-build-root>'",
+          scan: "faultlane symbols scan '<symbol-root>'",
+          token_environment: "$env:FAULTLANE_TOKEN = '<one-time-upload-token>'",
+          upload:
+            "faultlane symbols upload '<symbol-root>' --project 'ue58-game' --release '1.0.0' --architecture 'x86_64' --configuration 'shipping'",
+        },
+        issue_path:
+          state === "readable_issue"
+            ? "/projects/33333333-3333-4333-8333-333333333333/issues/44444444-4444-4444-8444-444444444444"
+            : null,
+        diagnostic:
+          state === "missing_symbols"
+            ? {
+                code: "matching_symbols_missing",
+                message:
+                  "Upload the matching PE and PDB files for this release.",
+                retryable: true,
+              }
+            : null,
+      }),
+    });
+  });
 
   await page.goto("/setup");
   await page.getByLabel("Owner email").fill("owner@example.com");
@@ -25,6 +90,41 @@ test("creates a project and manages one-time ingest keys", async ({ page }) => {
   await expect(
     page.getByText("DataRouterUrl=", { exact: false }),
   ).toBeVisible();
+  await expect(page.getByTestId("data-router-url")).toContainText(
+    `${ingestUrl}/u/${firstKey}`,
+  );
+  await expect(
+    page.getByRole("heading", { name: "Waiting for a packaged crash" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Crash received" }),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(
+    page.getByRole("heading", { name: "Processing crash" }),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(
+    page.getByRole("heading", { name: "Matching symbols required" }),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(
+    page.getByText("Game.exe needs pdb", { exact: false }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Copy symbol upload" }).click();
+  await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
+  await page
+    .getByRole("button", { name: "Create one-time upload token" })
+    .click();
+  const artifactToken = await page
+    .getByTestId("artifact-upload-token")
+    .textContent();
+  expect(artifactToken).toMatch(/^clsu_[a-f0-9]{64}$/);
+  await page.getByRole("button", { name: "Copy upload token" }).click();
+  await expect(
+    page.locator(".one-time-token").getByRole("button", { name: "Copied" }),
+  ).toBeVisible();
+  readable = true;
+  await expect(
+    page.getByRole("link", { name: "Open readable issue" }),
+  ).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("link", { name: "Manage project setup" }).click();
   await expect(

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source_project="$repo_root/samples/unreal-5.8-crasher"
+data_router_url="${FAULTLANE_SAMPLE_DATA_ROUTER_URL:?FAULTLANE_SAMPLE_DATA_ROUTER_URL is required}"
+
+if [[ ! "$data_router_url" =~ ^http://127\.0\.0\.1:[0-9]{1,5}/u/clpk_[a-f0-9]{64}$ ]]; then
+  echo "sample crash endpoint must be a loopback FaultLane write URL" >&2
+  exit 2
+fi
+
+output_root="${FAULTLANE_SAMPLE_OUTPUT:-}"
+if [[ -z "$output_root" ]]; then
+  output_root="$(mktemp -d -t faultlane-unreal-sample.XXXXXX)"
+else
+  mkdir -p "$output_root"
+fi
+output_root="$(cd "$output_root" && pwd -P)"
+case "$output_root/" in
+  "$repo_root/"*)
+    echo "sample output must be outside the repository" >&2
+    exit 2
+    ;;
+esac
+
+engine_root="${UNREAL_ENGINE_ROOT:-C:\Program Files\Epic Games\UE_5.8}"
+if command -v cygpath >/dev/null 2>&1; then
+  engine_root="$(cygpath -u "$engine_root")"
+fi
+run_uat="$engine_root/Engine/Build/BatchFiles/RunUAT.bat"
+if [[ ! -f "$run_uat" ]]; then
+  echo "Unreal Engine 5.8 RunUAT.bat was not found" >&2
+  exit 1
+fi
+
+project_copy="$output_root/project"
+package_root="$output_root/package"
+symbols_root="$output_root/symbols"
+if [[ -e "$project_copy" || -e "$package_root" || -e "$symbols_root" ]]; then
+  echo "sample output directory must be empty" >&2
+  exit 2
+fi
+cp -R "$source_project" "$project_copy"
+
+export FAULTLANE_SAMPLE_ENGINE_INI="$project_copy/Config/DefaultEngine.ini"
+powershell.exe -NoProfile -NonInteractive -Command '
+  $path = $env:FAULTLANE_SAMPLE_ENGINE_INI
+  $url = $env:FAULTLANE_SAMPLE_DATA_ROUTER_URL
+  $text = [IO.File]::ReadAllText($path)
+  $text = $text.Replace("http://127.0.0.1:8081/u/<replace-with-write-key>", $url)
+  [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+'
+
+"$run_uat" BuildCookRun \
+  -project="$project_copy/FaultLaneCrasher.uproject" \
+  -noP4 \
+  -platform=Win64 \
+  -clientconfig=Shipping \
+  -build \
+  -cook \
+  -stage \
+  -pak \
+  -archive \
+  -archivedirectory="$package_root" \
+  -CrashReporter \
+  -utf8output
+
+package_windows="$package_root/Windows"
+if [[ ! -d "$package_windows" ]]; then
+  echo "Unreal packaging did not produce the Windows archive" >&2
+  exit 1
+fi
+
+probe_output="$package_windows/FaultLaneCrasher/Binaries/Win64"
+mkdir -p "$probe_output" "$symbols_root"
+export FAULTLANE_SAMPLE_PROBE_SOURCE="$project_copy/CrashProbe/FaultLaneCrashProbe.cpp"
+export FAULTLANE_SAMPLE_PROBE_OUTPUT="$probe_output"
+powershell.exe -NoProfile -NonInteractive -Command '
+  $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+  $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if (-not $installation) { throw "Visual C++ build tools were not found" }
+  $developerCommand = Join-Path $installation "Common7/Tools/VsDevCmd.bat"
+  $source = $env:FAULTLANE_SAMPLE_PROBE_SOURCE
+  $output = $env:FAULTLANE_SAMPLE_PROBE_OUTPUT
+  $object = Join-Path $output "FaultLaneCrashProbe.obj"
+  $dll = Join-Path $output "FaultLaneCrashProbe.dll"
+  $pdb = Join-Path $output "FaultLaneCrashProbe.pdb"
+  $command = "call `"$developerCommand`" -no_logo -arch=x64 >nul && cl.exe /nologo /c /Z7 /O2 /GS- /GR- /EHsc- /Fo:`"$object`" `"$source`" && link.exe /NOLOGO /DLL /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:REF /OPT:ICF /DEBUG:FULL /OUT:`"$dll`" /PDB:`"$pdb`" `"$object`""
+  & $env:ComSpec /d /s /c $command
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  Remove-Item -LiteralPath $object
+'
+cp "$probe_output/FaultLaneCrashProbe.dll" "$symbols_root/FaultLaneCrashProbe.dll"
+cp "$probe_output/FaultLaneCrashProbe.pdb" "$symbols_root/FaultLaneCrashProbe.pdb"
+
+cargo run --quiet --manifest-path "$repo_root/Cargo.toml" --package faultlane-cli -- \
+  unreal check "$project_copy" --package "$package_windows"
+
+printf '{"project":"%s","package":"%s","symbols":"%s"}\n' "$project_copy" "$package_windows" "$symbols_root"

@@ -1945,7 +1945,7 @@ async fn automatic_reprocessing_candidates(
     let batch = i64::try_from(AUTOMATIC_REPROCESSING_BATCH + 1).unwrap_or(i64::MAX);
     let rows = match request.scope_kind.as_str() {
         "artifact" => sqlx::query(
-            "SELECT e.id::text AS event_id FROM release_manifest_artifacts m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available' AND e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ($5::uuid IS NULL OR e.id > $5::uuid) AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) GROUP BY e.id ORDER BY e.id LIMIT $6",
+            "WITH artifact AS MATERIALIZED (SELECT m.id, m.organization_id, m.project_id, m.release_id, m.artifact_type, m.module_name, m.architecture, m.debug_id, m.code_id, r.version, r.platform, r.configuration FROM release_manifest_artifacts m JOIN releases r ON r.id = m.release_id AND r.organization_id = m.organization_id AND r.project_id = m.project_id WHERE m.id = $1::uuid AND m.organization_id = $2::uuid AND m.project_id = $3::uuid AND m.state = 'available'), candidates AS (SELECT e.id AS event_id FROM artifact m JOIN crash_symbol_waiters w ON w.organization_id = m.organization_id AND w.project_id = m.project_id AND w.release_id = m.release_id JOIN crash_events e ON e.id = w.event_id AND e.organization_id = w.organization_id AND e.project_id = w.project_id AND e.current_result_id = w.result_id WHERE e.processing_state = 'awaiting_symbols' AND w.created_at <= $4 AND ((m.artifact_type = 'pdb' AND w.required_artifact = 'pdb' AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = '') OR (m.artifact_type IN ('pe_executable', 'pe_dynamic_library') AND w.required_artifact = 'pe' AND w.module_name = lower(m.module_name) AND w.architecture = m.architecture AND w.debug_id = m.debug_id AND w.code_id = m.code_id)) UNION SELECT e.id AS event_id FROM artifact m JOIN crash_events e ON e.organization_id = m.organization_id AND e.project_id = m.project_id JOIN crash_processing_results result ON result.id = e.current_result_id AND result.organization_id = e.organization_id AND result.project_id = e.project_id AND result.event_id = e.id WHERE e.received_at <= $4 AND e.release_mapping_state IN ('missing', 'ambiguous') AND result.result #>> '{crash_context,build_version}' = m.version AND result.result #>> '{crash_context,platform,normalized}' = m.platform AND result.result #>> '{crash_context,architecture}' = m.architecture AND lower(result.result #>> '{crash_context,build_configuration}') = lower(m.configuration)) SELECT event_id::text AS event_id FROM candidates WHERE ($5::uuid IS NULL OR event_id > $5::uuid) GROUP BY event_id ORDER BY event_id LIMIT $6",
         )
         .bind(request.scope_value.as_deref().unwrap_or_default())
         .bind(&request.organization_id)
@@ -7370,10 +7370,50 @@ mod tests {
                 late_partial,
                 "awaiting_symbols",
                 "matching_symbols_missing",
-                &release,
+                &release_resolution("1.0.0", Vec::new()),
             )
             .await
             .unwrap_or_else(|error| panic!("late partial result must publish: {error:?}"));
+        let missing_release = sqlx::query(
+            "SELECT release_mapping_state, (SELECT count(*) FROM crash_symbol_waiters WHERE event_id = e.id) AS waiters FROM crash_events e WHERE e.id = $1::uuid",
+        )
+        .bind(&catchup_event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("missing release state must load: {error}"));
+        assert_eq!(
+            missing_release.get::<String, _>("release_mapping_state"),
+            "missing"
+        );
+        assert_eq!(missing_release.get::<i64, _>("waiters"), 0);
+        let catchup_manifest: String = sqlx::query_scalar(
+            "INSERT INTO release_manifest_artifacts (release_id, organization_id, project_id, uploaded_by_user_id, upload_token_id, checksum, byte_size, artifact_type, module_name, architecture, debug_id, source_path, cli_version, state, uploaded_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 12, 'pdb', 'Catchup.pdb', 'x86_64', 'DEBUG-CATCHUP', 'Catchup.pdb', '0.1.0', 'available', now()) RETURNING id::text",
+        )
+        .bind(&release_id)
+        .bind(&organization_id)
+        .bind(&project_id)
+        .bind(&user_id)
+        .bind(&token_id)
+        .bind(Sha256::digest(b"release-catchup-pdb").to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("catch-up manifest must insert: {error}"));
+        let mut transaction = pool
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("catch-up transaction must begin: {error}"));
+        crate::reprocessing::enqueue_artifact_request(
+            &mut transaction,
+            &organization_id,
+            &project_id,
+            &catchup_manifest,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("catch-up request must enqueue: {error}"));
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("catch-up transaction must commit: {error}"));
         assert!(
             worker
                 .schedule_reprocessing_request()
@@ -7384,7 +7424,7 @@ mod tests {
             "SELECT e.requested_reprocessing_generation, r.state, r.selected_count FROM crash_events e JOIN crash_reprocessing_request_events x ON x.event_id = e.id JOIN crash_reprocessing_requests r ON r.id = x.request_id WHERE e.id = $1::uuid AND r.scope_value = $2",
         )
         .bind(&catchup_event_id)
-        .bind(&manifest_id)
+        .bind(&catchup_manifest)
         .fetch_one(&pool)
         .await
         .unwrap_or_else(|error| panic!("catch-up state must load: {error}"));

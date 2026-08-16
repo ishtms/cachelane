@@ -22,6 +22,7 @@ use serde::Serialize;
 
 mod processor;
 mod symbol_upload;
+mod unreal_check;
 
 const MAX_CRASH_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CRASH_CONTEXT_READ_BYTES: u64 = 4 * 1024 * 1024 + 1;
@@ -42,6 +43,8 @@ enum Command {
     Crash(CrashCommand),
     #[command(subcommand)]
     Symbols(SymbolsCommand),
+    #[command(subcommand)]
+    Unreal(UnrealCommand),
     #[command(subcommand, hide = true)]
     Processor(processor::ProcessorCommand),
 }
@@ -74,6 +77,15 @@ enum CrashCommand {
 enum SymbolsCommand {
     Scan { path: PathBuf },
     Upload(Box<SymbolUploadArgs>),
+}
+
+#[derive(Subcommand)]
+enum UnrealCommand {
+    Check {
+        project_root: PathBuf,
+        #[arg(long)]
+        package: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -121,6 +133,8 @@ enum CliError {
     Serialize(serde_json::Error),
     Processor(processor::ProcessorError),
     Upload(symbol_upload::UploadError),
+    UnrealCheck(unreal_check::UnrealCheckError),
+    UnrealConfiguration,
     Write(io::Error),
 }
 
@@ -148,6 +162,8 @@ impl fmt::Display for CliError {
             Self::Serialize(error) => write!(formatter, "failed to serialize output: {error}"),
             Self::Processor(error) => error.fmt(formatter),
             Self::Upload(error) => error.fmt(formatter),
+            Self::UnrealCheck(error) => error.fmt(formatter),
+            Self::UnrealConfiguration => formatter.write_str("Unreal configuration check failed"),
             Self::Write(error) => write!(formatter, "failed to write output: {error}"),
         }
     }
@@ -160,6 +176,7 @@ fn main() -> ExitCode {
             eprintln!("{error}");
             ExitCode::from(match &error {
                 CliError::Upload(error) => error.exit_code(),
+                CliError::UnrealCheck(_) | CliError::UnrealConfiguration => 2,
                 _ => 1,
             })
         }
@@ -201,11 +218,26 @@ fn run(cli: Cli) -> Result<(), CliError> {
             })
             .map_err(CliError::Upload)
         }
+        Some(Command::Unreal(UnrealCommand::Check {
+            project_root,
+            package,
+        })) => check_unreal(&project_root, &package),
         Some(Command::Processor(command)) => processor::run(command).map_err(CliError::Processor),
         None => {
             println!("FaultLane CLI is ready");
             Ok(())
         }
+    }
+}
+
+fn check_unreal(project_root: &Path, package: &Path) -> Result<(), CliError> {
+    let report = unreal_check::check(project_root, package).map_err(CliError::UnrealCheck)?;
+    let valid = report.valid;
+    write_json(&report)?;
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::UnrealConfiguration)
     }
 }
 

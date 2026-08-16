@@ -1,6 +1,13 @@
 import type { CreatedSetup } from "../../lib/faultlane";
+import { OnboardingGuide } from "./onboarding-guide";
 
-export function CreatedSetupResult({ created }: { created: CreatedSetup }) {
+export function CreatedSetupResult({
+  created,
+  onboardingEnabled,
+}: {
+  created: CreatedSetup;
+  onboardingEnabled: boolean;
+}) {
   return (
     <section className="setup-result" aria-labelledby="key-title">
       <p className="setup-kicker">Project created</p>
@@ -13,10 +20,38 @@ export function CreatedSetupResult({ created }: { created: CreatedSetup }) {
         {created.ingest_key.value}
       </code>
 
+      <h3>Generated crash endpoint</h3>
+      <code className="secret-value" data-testid="data-router-url">
+        {created.data_router_url}
+      </code>
+
       <h3>{created.configuration.default_game_ini_path}</h3>
       <pre>{created.configuration.default_game_ini}</pre>
       <h3>{created.configuration.default_engine_ini_path}</h3>
       <pre>{created.configuration.default_engine_ini}</pre>
+
+      {onboardingEnabled ? (
+        <OnboardingGuide
+          projectId={created.setup.project.id}
+          initial={{
+            state: "waiting",
+            event: null,
+            release: null,
+            missing_symbols: [],
+            missing_symbols_truncated: false,
+            commands: {
+              check:
+                "faultlane unreal check '<project-root>' --package '<packaged-build-root>'",
+              scan: "faultlane symbols scan '<symbol-root>'",
+              token_environment:
+                "$env:FAULTLANE_TOKEN = '<one-time-upload-token>'",
+              upload: null,
+            },
+            issue_path: null,
+            diagnostic: null,
+          }}
+        />
+      ) : null}
 
       <div className="setup-panel-actions setup-link">
         <a
