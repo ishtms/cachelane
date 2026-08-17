@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+./scripts/check-fast
+./scripts/with-test-database cargo test --workspace --all-targets -- --ignored --test-threads=1 \
+  --skip dashboard_and_search_stay_bounded_at_documented_scale \
+  --skip default_retention_path_is_constant_at_one_million_raw_objects \
+  --skip concurrent_schedulers_drain_more_than_two_hundred_thousand_due_objects \
+  --skip hot_issue_publication_stays_bounded_at_one_hundred_thousand_events \
+  --skip concurrent_workers_drain_a_hot_project_without_starving_another
+./scripts/check-repository
+
+base_sha="${FAULTLANE_BASE_SHA:-}"
+if [[ -n "$base_sha" ]] && git rev-parse --verify "$base_sha^{commit}" >/dev/null 2>&1; then
+  changed_files="$(git diff --name-only "$base_sha"...HEAD)"
+else
+  changed_files="$({ git diff --name-only HEAD; git diff --cached --name-only; } | sort -u)"
+fi
+
+if grep -Eq '^(apps/web/|apps/server/|migrations/|openapi/|deploy/docker-compose/|scripts/(prove-browser|smoke)$)' <<<"$changed_files"; then
+  ./scripts/prove-browser
+else
+  echo "browser proof skipped: no browser-facing paths changed"
+fi
+
+if grep -Eq '^(apps/server/src/(crash_ingest|symbol_upload|worker)\.rs|crates/(processing|symbols|unreal)/|deploy/processor/|fuzz/)' <<<"$changed_files"; then
+  FAULTLANE_FUZZ_SECONDS=1 ./scripts/check-fuzz
+  ./scripts/prove-isolated-processing
+else
+  echo "processor proofs skipped: no parser, ingest, symbol, or processor paths changed"
+fi

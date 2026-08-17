@@ -1,113 +1,57 @@
 # Development workflow
 
-This is the delivery contract for the solo, pre-production phase of FaultLane. GitHub owns planning and status. Local work owns iteration. A milestone pull request is the normal review and CI unit.
-
-`AGENTS.md` safety rules still apply. Local skills are adapters for this contract and must not weaken it.
-
-## Delivery model
+FaultLane uses a small delivery loop for the solo, pre-production phase.
 
 ```text
-GitHub milestone and issues
-        -> one milestone branch and worktree
-        -> issue-sized commits and local proof
-        -> one milestone pull request closing every included issue
-        -> remote CI on the final head
-        -> fresh review and human rebase merge
+request
+  -> issue when useful
+  -> one branch
+  -> implementation and focused tests
+  -> ./scripts/check-fast
+  -> one pull request
+  -> required check
+  -> merge and automatic issue closure
 ```
 
-Do not open a pull request, wait for remote CI, close an issue, or merge after each normal milestone issue.
+`AGENTS.md` safety, identity, testing, and scope rules still apply.
 
-Use a separate pull request only for an urgent hotfix, a security emergency, the workflow itself, or work that cannot safely wait for the milestone. State the exception on its issue.
+## Issues and plans
 
-## GitHub authority
+Use an issue when the outcome needs acceptance criteria, coordination, or history. Small maintenance work may start from the request and use the pull request as its record.
 
-Fetch live state before milestone kickoff, before claiming an issue, before opening the milestone pull request, and after merge. Use `gh`, GitHub REST, or GitHub GraphQL.
+Keep the issue about the observable outcome. Put implementation evidence in the pull request. Do not add a proof comment or a repository plan file.
 
-GitHub is authoritative for:
+- R0 and R1 changes proceed with clear acceptance criteria.
+- R2 changes need a concise issue plan only when uncertainty or cross-component risk justifies it.
+- R3 changes need a human-approved issue plan, security analysis, staging strategy, and rollback.
+- R4 operations require explicit human execution.
 
-- milestones, included issues, dependencies, and priority;
-- issue acceptance criteria, risk, ownership, and proof comments;
-- Project status;
-- pull requests, checks, reviews, and merge state.
+## Branch and worktree
 
-Do not substitute a local task list for stale or missing GitHub state. Reconcile the GitHub state first.
+Fetch current GitHub state and branch from `origin/main`. Use the main checkout when it is available. Create one task worktree only when the main checkout contains unrelated work that cannot be moved safely.
 
-The normal Project state machine is:
+Never delete a branch or worktree until its change is merged and it contains no unique commits or uncommitted files.
 
-```text
-Backlog -> Ready -> In Progress -> Locally verified -> In review -> Done
-```
+## Implementation and local verification
 
-`Locally verified` means the issue has an issue-sized commit, behavior proof, and the required local issue gate. It does not mean the issue is closed or merged.
+Implement one coherent feature or fix per pull request. Add behavior or regression tests at the lowest useful boundary and exercise the real command, API, UI, or runtime entrypoint.
 
-## Milestone kickoff
+Run focused checks while iterating, then run `./scripts/check-fast`. Run additional local proofs when the changed boundary requires them. Use `./scripts/check` before a sensitive release or when the issue plan requires complete certification.
 
-1. Fetch `origin` and query the current milestone, its open issues, direct dependencies, Project items, open pull requests, branches, and worktrees.
-2. Confirm the GitHub account is `ishtms`, the Git author is `Ishtmeet Singh`, and the remote is `ishtms/faultlane`.
-3. Create or update one milestone plan for shared R2 and R3 decisions. Obtain human approval before any R3 implementation.
-4. Create one branch and isolated worktree from current `origin/main`, normally `milestone/<milestone-name>`.
-5. Configure unique ports, Compose project name, storage, and test data for that worktree when services are needed.
-6. Order issues by dependency and priority. Move only the next unblocked issue to Ready.
+Review the final diff for scope, secrets, generated files, compatibility, tenant isolation, untrusted input, failure handling, operations, and rollback.
 
-Keep one active milestone implementation worktree. Do not create a worktree per issue.
+## Pull request and CI
 
-## Issue loop
+Open one pull request with the issue, result, verification, risk, and rollback when relevant. Add `Closes #<number>` for every issue the pull request completes.
 
-For each issue:
+The only required status is `check`. It runs formatting, linting, type checking, Rust unit tests, PostgreSQL integration tests, repository checks, and browser or processor proofs when the changed paths require them.
 
-1. Requery the issue, milestone, dependencies, acceptance criteria, risk, assignment, and Project status.
-2. Confirm it is unblocked and belongs in the current milestone. Assign it to `ishtms` and move it to In Progress.
-3. Implement the smallest coherent behavior in the milestone worktree. Keep supporting maintenance inside the issue only when that behavior requires it.
-4. Add behavior tests at the lowest useful boundary and exercise the real command, API, UI, or runtime entrypoint.
-5. Run focused tests while iterating, then run `./scripts/check-fast` for the issue head.
-6. Review the issue diff for acceptance criteria, unrelated changes, secrets, generated files, compatibility, security, operations, and rollback.
-7. Create one or more small logical commits for the issue with short, lowercase, natural messages.
-8. Post the final local commit SHA, exact commands, proof, residual risk, and rollback on the issue.
-9. Check completed acceptance-criteria boxes and move the issue to Locally verified.
-10. Leave the issue open. Do not open a pull request, trigger remote CI, merge, or remove the milestone worktree.
-11. Requery GitHub and select the next unblocked Ready issue.
+The Windows job is advisory and covers Windows compilation plus focused behavior. Dependency review runs only when dependency manifests or lockfiles change.
 
-Pushing the milestone branch for backup is optional. A backup push must not open a pull request or replace the issue proof comment.
+Complete release builds, bounded fuzzing, full browser certification, and dependency audits run on a schedule or when a sensitive change requires them.
 
-## Verification layers
-
-Focused verification is selected from the changed behavior. It may be a Rust test target, web test, API request, CLI command, browser scenario, proof script, or runtime exercise. Record the exact command and result.
-
-`./scripts/check-fast` is the issue-level repository gate. It should catch formatting, lint, type, compile, and ordinary unit-test failures without performing the complete service and release certification.
-
-`./scripts/check` is the milestone certification command and the command CI calls. It must:
-
-- run all repository checks and release builds;
-- exercise PostgreSQL-backed tests without silent skips;
-- compile tracked fuzz targets and run the bounded configured fuzz proof;
-- run required local services, smoke checks, browser behavior, and milestone proof;
-- use disposable test data and no production credentials;
-- leave a previously clean worktree clean.
-
-Do not claim local certification when a required service, database, browser, fixture, or tool was skipped. Fix the environment or report the blocker.
-
-## Finish a milestone
-
-1. Requery the milestone and confirm every included issue is Locally verified, assigned, open, and supported by checked acceptance criteria plus a proof comment.
-2. Review the commit sequence and diff from the milestone base. Keep issue boundaries understandable and remove unrelated work.
-3. Start from a clean tree and run `./scripts/doctor`, `./scripts/check`, and any milestone-specific UE 5.8.1 proof required by the plan.
-4. Confirm the complete check leaves the tree clean. Record the verified head SHA and all evidence.
-5. Obtain a fresh review from a separate session or a human. The implementing session must not call its own review independent.
-6. Fix findings and rerun every invalidated check. If the base changes, rebase and recertify the exact final head.
-7. Push the milestone branch and open one draft pull request with a short natural title, proof, risk, security and operational effects, rollback, and one `Closes #<issue>` line for every included issue.
-8. Move every included issue to In review.
-9. Run remote CI on the exact reviewed head. Do not merge a different head or bypass a required check.
-10. Mark the pull request ready only after local certification, remote checks, and review evidence agree.
-11. Stop for human review and human rebase merge. Do not squash a milestone pull request.
+Obtain a fresh review for R3 changes and unusually large changes. Smaller changes may merge after the required check passes and all review threads are resolved.
 
 ## After merge
 
-1. Verify every closing issue is closed and Done, every acceptance criterion is checked, and the milestone shows the expected completion state.
-2. Verify the pull request used rebase merge and the issue-sized commits remain understandable in `main` history.
-3. Archive completed plans and record final outcomes.
-4. Delete only the merged milestone branch and disposable worktree after confirming they contain no unique or uncommitted work.
-5. Reconcile any failed closure, stale Project state, or missing proof immediately.
-
-## Current M1 transition
-
-Do not rewrite the ten M1 issues already merged. The remaining milestone branch started from current `main`. After the database audit scope change, the final M1 pull request should close #301, #303, #313, and #358 through #363 unless GitHub milestone scope changes again.
+Confirm closing issues closed automatically. Remove the merged task branch and optional worktree only after checking for unique or uncommitted work. No manual Project transition or proof comment is required.

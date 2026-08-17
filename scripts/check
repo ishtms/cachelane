@@ -42,13 +42,23 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-./scripts/check-fast
+FAULTLANE_BASE_SHA="${FAULTLANE_BASE_SHA:-HEAD}" ./scripts/check-pr
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/with-test-database cargo test --workspace --all-targets -- --ignored
 cargo build --workspace --release
 corepack pnpm --filter @faultlane/web build
+./scripts/with-test-database bash -c '
+  set -euo pipefail
+  for test in \
+    dashboard_and_search_stay_bounded_at_documented_scale \
+    default_retention_path_is_constant_at_one_million_raw_objects \
+    concurrent_schedulers_drain_more_than_two_hundred_thousand_due_objects \
+    hot_issue_publication_stays_bounded_at_one_hundred_thousand_events \
+    concurrent_workers_drain_a_hot_project_without_starving_another
+  do
+    cargo test --package faultlane-server "$test" -- --ignored --test-threads=1
+  done
+'
 ./scripts/check-fuzz
-./scripts/check-repository
 FAULTLANE_BROWSER_USE_RELEASE=true \
   FAULTLANE_BROWSER_SKIP_BUILD=true \
   ./scripts/prove-browser

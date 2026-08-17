@@ -2,13 +2,27 @@
 
 FaultLane is an Unreal-native crash analytics and symbolication platform. It receives Unreal Engine crash reports, stores their original artifacts, matches exact debug information, produces readable stacks, and groups repeated failures into issues.
 
-The current target is packaged Unreal Engine 5.8 games on Windows, validated against the installed UE 5.8.1 build. Basic desktop reporting uses Unreal's built-in Crash Report Client, so a runtime SDK is not required. Earlier engine versions will be tested during the late pre-launch compatibility pass.
+The current target is packaged Unreal Engine 5.8 games on Windows, validated against the installed UE 5.8.1 build. Basic desktop reporting uses Unreal's built-in Crash Report Client, so a runtime SDK is not required.
+
+The product promise is a readable, symbolicated test crash within ten minutes of account creation, excluding Unreal packaging time.
 
 ## Current status
 
-The repository includes first-project setup, durable Windows crash ingest, Windows symbol upload, crash-processing feasibility work, local PostgreSQL and MinIO services, and deterministic verification. Local bootstrap setup creates an owner, organization, project, and write-only environment key. A bounded UE 5.8 crash request is stored in the private local bucket before FaultLane acknowledges it and queues processing. The CLI scans PE and PDB artifacts locally, negotiates only missing artifacts, resumes multipart uploads, and returns release coverage.
+The repository includes project setup, durable Windows crash ingest, isolated processing, Windows symbol upload, grouping, issue views, missing-symbol recovery, alerts, usage enforcement, and an interactive first-crash flow. Local bootstrap setup creates an owner, organization, project, and write-only environment key. A bounded UE 5.8 crash request is stored in the private local bucket before FaultLane acknowledges it and queues processing.
 
 No production deployment is configured.
+
+The current goal is to prove the ten-minute readable crash flow with a real design partner. Self-hosting, wider Unreal compatibility, other platforms, and studio controls stay in a short future roadmap until that workflow is validated.
+
+FaultLane does not currently include generic observability, gameplay analytics, session replay, console support, automated fixes, Kubernetes, Kafka, Redis, Elasticsearch, ClickHouse, or a service per subsystem.
+
+## Architecture
+
+FaultLane is a modular Rust monolith backed by PostgreSQL and S3-compatible object storage, with a Next.js dashboard. API, ingest, worker, scheduler, and migration roles share one codebase. Crash bundles, dumps, logs, comments, and symbols are sensitive untrusted input and cross an isolated processor boundary.
+
+PostgreSQL owns tenant and product state. Object storage owns large binary artifacts. Every row and object access stays tenant-scoped, jobs are idempotent and leased, and database changes remain backward compatible across a deployment window. Durable decisions live under `docs/decisions`, while security and operational boundaries stay close to the affected code.
+
+The current product scope is in [`docs/product/README.md`](docs/product/README.md). Durable system boundaries are in [`docs/architecture/README.md`](docs/architecture/README.md).
 
 ## Repository layout
 
@@ -88,17 +102,18 @@ export FAULTLANE_TOKEN=<one-time-artifact-upload-token>
 cargo run -p faultlane-cli -- symbols upload <artifact-path> --project <project-slug> --release <version> --configuration shipping --channel playtest --build-timestamp <RFC3339-time>
 ```
 
-Hosted deployments will use a private Cloudflare R2 bucket with `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`, `OBJECT_STORE_REGION=auto`, `OBJECT_STORE_ACCESS_KEY`, and `OBJECT_STORE_SECRET_KEY`. Local and self-hosted deployments use MinIO through the same S3-compatible API. Artifact upload remains limited to a loopback API until issue #311 moves final PE and PDB verification into the isolated worker boundary.
+Hosted deployments will use a private Cloudflare R2 bucket with `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`, `OBJECT_STORE_REGION=auto`, `OBJECT_STORE_ACCESS_KEY`, and `OBJECT_STORE_SECRET_KEY`. Local and self-hosted deployments use MinIO through the same S3-compatible API. Final PE and PDB verification runs inside the isolated processor boundary.
 
 ## Verification
 
 ```bash
 ./scripts/check-fast
+./scripts/check-pr
 ./scripts/check
 ./scripts/smoke
 ```
 
-`./scripts/check` is the canonical pre-PR command and is also used by CI. `./scripts/smoke` expects the local application or a target environment to be running.
+`./scripts/check-fast` is the normal local gate. `./scripts/check-pr` is the required pull request gate and needs PostgreSQL. Set `FAULTLANE_BASE_SHA` to the base commit when running it locally so changed-path proofs are selected. `./scripts/check` adds release builds, bounded fuzzing, and full browser certification for nightly, release, and sensitive-change use. `./scripts/smoke` expects the local application or a target environment to be running.
 Set `FAULTLANE_SMOKE_DURABLE=true` for an empty isolated target to include one real crash upload, duplicate retry, and state read.
 Set `FAULTLANE_SMOKE_SYMBOL_UPLOAD=true` for an empty isolated target to upload the checked-in Windows artifacts twice and verify that the second run transfers zero bytes.
 

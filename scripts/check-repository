@@ -21,6 +21,7 @@ required_files=(
   scripts/prove-browser
   scripts/test-browser-proof-cleanup
   scripts/check-fast
+  scripts/check-pr
   scripts/check
   scripts/smoke
 )
@@ -122,8 +123,8 @@ if [[ "$database_test_count" -eq 0 || "$database_test_count" -ne "$database_url_
   exit 1
 fi
 
-if ! grep -Fq './scripts/with-test-database cargo test --workspace --all-targets -- --ignored' scripts/check; then
-  echo "complete check must run the explicitly ignored PostgreSQL tests" >&2
+if ! grep -Fq './scripts/with-test-database cargo test --workspace --all-targets -- --ignored --test-threads=1' scripts/check-pr; then
+  echo "pull request check must run the explicitly ignored PostgreSQL tests" >&2
   exit 1
 fi
 

@@ -1611,15 +1611,29 @@ mod tests {
         .await?;
 
         let mut limited = state.crash_ingest().clone();
-        limited.project_limit = 6;
-        limited.ip_limit = 6;
+        limited.project_limit = 1;
+        limited.ip_limit = 1;
         let limited_state = ServerState::ingest_test(pool.clone(), limited, SECRET);
-        let limited_response = submit(
-            &limited_state,
-            &key,
-            crash_request("UECC-Windows-Limited", b"<FGenericCrashContext />")?,
-        )
-        .await?;
+        sqlx::query("DELETE FROM ingest_rate_limits WHERE project_id = $1::uuid")
+            .bind(&project_id)
+            .execute(&pool)
+            .await?;
+        let malformed_request = b"not a crash request".to_vec();
+        let (limited_first, limited_second, limited_third) = tokio::join!(
+            submit(&limited_state, &key, malformed_request.clone()),
+            submit(&limited_state, &key, malformed_request.clone()),
+            submit(&limited_state, &key, malformed_request)
+        );
+        let limited_responses = [limited_first?, limited_second?, limited_third?];
+        assert!(
+            limited_responses
+                .iter()
+                .any(|response| response.status() == StatusCode::BAD_REQUEST)
+        );
+        let limited_response = limited_responses
+            .into_iter()
+            .find(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .ok_or("one concurrent request must be rate limited")?;
         assert_eq!(limited_response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             limited_response
