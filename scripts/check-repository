@@ -73,6 +73,8 @@ done
 set +e
 missing_database_command_output="$(./scripts/with-test-database 2>&1)"
 missing_database_command_status="$?"
+missing_base_output="$(FAULTLANE_BASE_SHA=faultlane-missing-base ./scripts/check-pr 2>&1)"
+missing_base_status="$?"
 invalid_fuzz_seconds_output="$(FAULTLANE_FUZZ_SECONDS=0 ./scripts/check-fuzz 2>&1)"
 invalid_fuzz_seconds_status="$?"
 missing_package_output="$(
@@ -90,6 +92,12 @@ set -e
 if [[ "$missing_database_command_status" -ne 2 \
   || "$missing_database_command_output" != "usage: ./scripts/with-test-database <command> [args...]" ]]; then
   echo "test database wrapper did not reject a missing command" >&2
+  exit 1
+fi
+
+if [[ "$missing_base_status" -ne 2 \
+  || "$missing_base_output" != "FAULTLANE_BASE_SHA must identify an available commit" ]]; then
+  echo "pull request check did not reject an unavailable base commit" >&2
   exit 1
 fi
 
@@ -125,6 +133,12 @@ fi
 
 if ! grep -Fq './scripts/with-test-database cargo test --workspace --all-targets -- --ignored --test-threads=1' scripts/check-pr; then
   echo "pull request check must run the explicitly ignored PostgreSQL tests" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'apps/cli/src/(processor|symbol_upload)\.rs' scripts/check-pr \
+  || ! grep -Fq 'apps/server/src/(crash_ingest|processor_runner|symbol_upload|worker)\.rs' scripts/check-pr; then
+  echo "pull request check must select every processor-sensitive entrypoint" >&2
   exit 1
 fi
 
