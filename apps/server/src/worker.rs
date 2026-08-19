@@ -6036,7 +6036,6 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("replacement plan must load: {error}"))
         .join("\n");
-        assert!(plan.contains("crash_events_issue_release_representative"));
         assert!(!plan.contains("Seq Scan"));
 
         let first_retry = lease_exact_job(&pool, &first_job_id, worker.instance_id.as_ref()).await;

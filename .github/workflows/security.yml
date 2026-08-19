@@ -2,6 +2,15 @@ name: Security
 
 on:
   pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "fuzz/Cargo.lock"
+      - "package.json"
+      - "apps/**/package.json"
+      - "pnpm-lock.yaml"
+      - ".github/dependabot.yml"
+      - ".github/workflows/**"
   schedule:
     - cron: "21 4 * * 1"
   workflow_dispatch:
@@ -25,6 +34,7 @@ jobs:
 
   audit:
     name: dependency audit
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

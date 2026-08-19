@@ -12,13 +12,6 @@ body:
     validations:
       required: true
   - type: textarea
-    id: expected
-    attributes:
-      label: Expected behavior
-      description: What should have happened?
-    validations:
-      required: true
-  - type: textarea
     id: reproduction
     attributes:
       label: Reproduction
@@ -26,27 +19,14 @@ body:
     validations:
       required: true
   - type: textarea
-    id: environment
+    id: expected
     attributes:
-      label: Environment
-      description: Include the FaultLane version, Unreal version, platform, architecture, and build configuration when relevant.
-  - type: dropdown
-    id: risk
-    attributes:
-      label: Proposed risk
-      description: Classify by blast radius and reversibility.
-      options:
-        - R0: trivial
-        - R1: normal
-        - R2: systemic
-        - R3: critical
-        - R4: exceptional
+      label: Expected behavior
+      description: What should have happened?
     validations:
       required: true
   - type: textarea
-    id: sensitive_data
+    id: verification
     attributes:
-      label: Sensitive data check
-      description: Confirm that no customer dump, symbol, credential, personal data, or licensed private fixture is attached.
-    validations:
-      required: true
+      label: Context and verification
+      description: Include relevant versions, safe test data, and the check that should prove the fix. Do not attach customer dumps, symbols, credentials, or private fixtures.

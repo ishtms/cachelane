@@ -1,5 +1,5 @@
 name: Feature
-description: Propose executable FaultLane product behavior
+description: Propose a focused FaultLane outcome
 title: ""
 labels:
   - feature
@@ -8,47 +8,18 @@ body:
     id: outcome
     attributes:
       label: Executable outcome
-      description: Complete this sentence with a real command, API, UI, or runtime entrypoint.
+      description: State the result through a real command, API, UI, or runtime entrypoint.
       placeholder: When <actor or input> uses <entrypoint>, FaultLane now <new observable result>.
-    validations:
-      required: true
-  - type: textarea
-    id: code
-    attributes:
-      label: Product code
-      description: Name the executable logic, state, API, command, or UI path that must change. Documentation, research, tests, fixtures, CI, dependencies, and refactors do not qualify alone.
-    validations:
-      required: true
-  - type: input
-    id: prd
-    attributes:
-      label: PRD coverage
-      description: Name the requirement IDs or milestone deliverable this feature implements.
-      placeholder: SYM-02 or M2 admin health view
     validations:
       required: true
   - type: textarea
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: List measurable behaviors, including important failure cases.
+      description: List measurable behavior and important failure cases.
       placeholder: |
         - [ ] ...
         - [ ] ...
-    validations:
-      required: true
-  - type: textarea
-    id: proof
-    attributes:
-      label: Behavior proof
-      description: Give the exact command, request, or interaction that proves the result through its product entrypoint.
-    validations:
-      required: true
-  - type: textarea
-    id: tests
-    attributes:
-      label: Behavior tests
-      description: Name the lowest useful tests that fail without the implementation and pass with it.
     validations:
       required: true
   - type: dropdown
@@ -65,12 +36,7 @@ body:
     validations:
       required: true
   - type: textarea
-    id: effects
+    id: risk_plan
     attributes:
-      label: Data, security, and operations
-      description: Note affected data, tenant boundaries, untrusted inputs, integrations, deployment, or rollback.
-  - type: textarea
-    id: scope
-    attributes:
-      label: Out of scope
-      description: State nearby work that this issue should not include.
+      label: Risk and rollback
+      description: Note affected data, tenant boundaries, untrusted inputs, integrations, deployment, and how to reverse the change when relevant.
